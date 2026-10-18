@@ -455,7 +455,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return exc.exit_code
     except SystemExit as exc:  # --help / --version
         return int(exc.code or 0)
-    args.home = Path(args.home) if args.home else default_home()
+    # Absolute from here on: the keeper runs with another working directory.
+    args.home = Path(os.path.abspath(os.path.expanduser(str(args.home or default_home()))))
     try:
         return int(args.func(args) or 0)
     except RelayError as exc:

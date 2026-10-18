@@ -19,7 +19,7 @@ class SpawnFailed(RelayError):
 
 
 def spawn_keeper(home: Path, task_id: str, attempt_id: str) -> None:
-    home = Path(home)
+    home = Path(os.path.abspath(home))  # the keeper changes into it, so a relative path would not resolve
     log_dir = home / "runs" / task_id
     log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     log_path = log_dir / f"keeper-{attempt_id}.log"
