@@ -3,16 +3,17 @@
 A bare pid can be recycled, so every liveness answer here is three-valued:
 True (same process, alive), False (gone or recycled), None (cannot verify).
 Callers must treat None conservatively (as "may still be running").
+
+Start times come from the kernel only (macOS: kinfo_proc, Linux: /proc). There is no
+fallback to another source: a token of a different source or precision cannot be compared,
+so a failed query answers None rather than "recycled".
 """
 
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 from typing import Optional, Tuple
-
-_PS_ENV = {"LC_ALL": "C", "PATH": "/bin:/usr/bin:/usr/sbin:/sbin"}
 
 
 def _linux_boot_id() -> str:
@@ -59,7 +60,7 @@ def _darwin_proc_info(pid: int) -> Optional[Tuple[str, str]]:
     except (OSError, AttributeError, ValueError, struct.error):
         return None
     if p_pid != pid:
-        return None  # unexpected layout: let the caller fall back to ps
+        return None  # unexpected layout: unverifiable
     return ("Z" if p_stat == 5 else "R", f"darwin:{tv_sec}.{tv_usec:06d}")  # 5 == SZOMB
 
 
@@ -69,10 +70,7 @@ def _proc_info(pid: int) -> Optional[Tuple[str, str]]:
         return None
     if sys.platform == "darwin":
         info = _darwin_proc_info(pid)
-        if info == ("", ""):
-            return None
-        if info is not None:
-            return info
+        return None if info == ("", "") else info
     if sys.platform.startswith("linux"):
         try:
             with open(f"/proc/{pid}/stat", "rb") as f:
@@ -83,23 +81,22 @@ def _proc_info(pid: int) -> Optional[Tuple[str, str]]:
         except (OSError, ValueError, IndexError):
             return None
         return state, f"linux:{_linux_boot_id()}:{starttime}"
-    try:
-        out = subprocess.run(
-            ["ps", "-o", "stat=,lstart=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            env=_PS_ENV,
-            timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError):
+    return None  # other platforms: no kernel start time, so identities stay unverifiable
+
+
+def _compare_tokens(recorded: str, current: str) -> Optional[bool]:
+    """Same process? None when the two tokens do not come from the same source and precision."""
+    source, _, rest = recorded.partition(":")
+    cur_source, _, cur_rest = current.partition(":")
+    if source != cur_source:
         return None
-    line = out.stdout.strip()
-    if out.returncode != 0 or not line:
-        return None
-    parts = line.split()
-    if len(parts) < 2:
-        return None
-    return parts[0], "ps:" + " ".join(parts[1:])
+    if source == "linux":
+        boot, _, start = rest.rpartition(":")
+        cur_boot, _, cur_start = cur_rest.rpartition(":")
+        if boot != cur_boot:
+            return False if boot and cur_boot else None  # a different boot means the process is gone
+        return start == cur_start
+    return rest == cur_rest
 
 
 def start_token(pid: int) -> Optional[str]:
@@ -124,7 +121,8 @@ def pid_exists(pid: Optional[int]) -> Optional[bool]:
 
 def same_process_alive(pid: Optional[int], token: Optional[str]) -> Optional[bool]:
     """True: pid is alive and is the recorded process. False: gone, zombie or recycled.
-    None: cannot verify (no pid/token recorded, or the OS query failed)."""
+    None: cannot verify (no pid/token recorded, the OS query failed, or the recorded token
+    is not comparable with what the OS reports now)."""
     if not pid:
         return None
     exists = pid_exists(pid)
@@ -139,7 +137,7 @@ def same_process_alive(pid: Optional[int], token: Optional[str]) -> Optional[boo
         return False
     if token is None:
         return None
-    return current == token
+    return _compare_tokens(token, current)
 
 
 def group_alive(pgid: Optional[int]) -> Optional[bool]:
