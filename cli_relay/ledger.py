@@ -10,6 +10,7 @@ Rules enforced here:
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -163,15 +164,26 @@ def task_state_for(attempt_state: str, outcome: Optional[str]) -> str:
 
 
 def atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
-    """Write via temp file + fsync + rename + directory fsync."""
+    """Write via temp file + fsync + rename + directory fsync. ``os.write`` may write fewer bytes
+    than asked (quota, nearly full disk, signals), so it is repeated until everything is written;
+    only a complete temp file is renamed into place."""
     path = Path(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
-        os.write(fd, text.encode("utf-8"))
+        data = memoryview(text.encode("utf-8"))
+        while data:
+            written = os.write(fd, data)
+            if written <= 0:
+                raise OSError(errno.EIO, "write made no progress", str(tmp))
+            data = data[written:]
         os.fsync(fd)
-    finally:
+    except BaseException:
         os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(str(tmp))
+        raise
+    os.close(fd)
     os.replace(str(tmp), str(path))
     dfd = os.open(str(path.parent), os.O_RDONLY)
     try:
