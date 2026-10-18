@@ -48,7 +48,7 @@ _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
     "claude": {"model": (str,)},
     "codex": {"model": (str,), "sandbox": (str,), "skip_git_repo_check": (bool,)},
     "fixture": {"duration_s": (int, float), "exit_code": (int,), "result": (str,), "side_effect_file": (str,),
-                "no_result": (bool,), "api_key_source": (str,)},
+                "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,)},
 }
 
 CODEX_SANDBOXES = ("read-only", "workspace-write")
@@ -231,6 +231,9 @@ def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None) -> 
             problems.append(f"{layer}:forceLoginMethod")
         settings_env = data.get("env") if isinstance(data.get("env"), dict) else {}
         problems += [f"{layer}:env.{name}" for name in BILLING_ENV["claude"] if settings_env.get(name)]
+        permissions = data.get("permissions") if isinstance(data.get("permissions"), dict) else {}
+        if permissions.get("defaultMode") == "bypassPermissions":  # nothing would ever be denied
+            problems.append(f"{layer}:permissions.defaultMode")
     return problems, read
 
 
@@ -326,19 +329,16 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
     elif engine == "codex":
         binary = resolve_bin(engine, env)
         last_message = str(run_dir / "last_message.txt")
-        sandbox = opts.get("sandbox")
+        # Always explicit, so neither the first run nor a resume takes the sandbox from whatever
+        # the configuration says at that moment.
+        sandbox = opts.get("sandbox") or "read-only"
         if resume:
-            # `codex exec resume` has no --sandbox of its own and otherwise takes the sandbox from the
-            # current configuration, which may be wider than what the task was submitted with. Pin it
-            # both as the exec-level option and as a config override for the resumed thread.
-            argv = [binary, "exec"] + (["--sandbox", sandbox] if sandbox else []) + ["resume"]
-            if sandbox:
-                argv += ["-c", f'sandbox_mode="{sandbox}"']
-            argv += ["--json", "-o", last_message]
+            # `codex exec resume` has no --sandbox of its own: pin it both as the exec-level option
+            # and as a config override for the resumed thread.
+            argv = [binary, "exec", "--sandbox", sandbox, "resume", "-c", f'sandbox_mode="{sandbox}"',
+                    "--json", "-o", last_message]
         else:
-            argv = [binary, "exec", "--json", "-C", cwd, "-o", last_message]
-            if sandbox:
-                argv += ["--sandbox", sandbox]
+            argv = [binary, "exec", "--json", "-C", cwd, "-o", last_message, "--sandbox", sandbox]
         if opts.get("skip_git_repo_check"):
             argv.append("--skip-git-repo-check")
         if opts.get("model"):
@@ -356,6 +356,8 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
             argv.append("--no-result")
         if opts.get("api_key_source"):
             argv += ["--api-key-source", opts["api_key_source"]]
+        if opts.get("permission_mode"):
+            argv += ["--permission-mode-reported", opts["permission_mode"]]
         pkg_parent = str(Path(__file__).resolve().parent.parent)
         cenv["PYTHONPATH"] = pkg_parent + (os.pathsep + cenv["PYTHONPATH"] if cenv.get("PYTHONPATH") else "")
         cenv["CLI_RELAY_ATTEMPT_ID"] = attempt["attempt_id"]
@@ -433,11 +435,14 @@ def session_id_from_event(engine: str, ev: Dict[str, Any]) -> Optional[str]:
 
 
 def billing_violation(engine: str, ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """A Claude-format init event that reports an API-key source means the run is not on the subscription."""
+    """A Claude-format init event that reports an API-key source means the run is not on the
+    subscription; one that reports bypassPermissions means nothing would be denied."""
     if engine in ("claude", "fixture") and ev.get("type") == "system" and ev.get("subtype") == "init":
         source = ev.get("apiKeySource")
         if source not in (None, "none"):
             return {"reason": "api_key_source_detected", "apiKeySource": source}
+        if ev.get("permissionMode") == "bypassPermissions":
+            return {"reason": "bypass_permissions_mode", "permissionMode": ev["permissionMode"]}
     return None
 
 

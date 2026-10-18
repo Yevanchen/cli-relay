@@ -52,6 +52,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--side-effect-file")
     p.add_argument("--no-result", action="store_true")
     p.add_argument("--api-key-source", default="none")
+    p.add_argument("--permission-mode-reported", default="default")
     a = p.parse_args(argv)
 
     prompt = sys.stdin.read()
@@ -72,7 +73,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     _emit({"type": "system", "subtype": "init", "session_id": sid, "apiKeySource": a.api_key_source,
-           "permissionMode": "default", "model": "fixture"})
+           "permissionMode": a.permission_mode_reported, "model": "fixture"})
     deadline = time.monotonic() + max(0.0, a.duration)
     while True:
         left = deadline - time.monotonic()

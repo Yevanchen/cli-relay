@@ -57,7 +57,7 @@ class ArgvSafety(unittest.TestCase):
         self.assertEqual(new[-1], "-")
         self.assertEqual(new[new.index("--sandbox") + 1], "read-only")
         res = self.build("codex", resume="33333333-3333-4333-8333-333333333333").argv
-        self.assertEqual(res[1:4], ["exec", "resume", "--json"])
+        self.assertEqual(res[1:5], ["exec", "--sandbox", "read-only", "resume"])
         self.assertEqual(res[-2:], ["33333333-3333-4333-8333-333333333333", "-"])
         for flag in ("--last", "--dangerously-bypass-approvals-and-sandbox", "--approve-for-me", "--full-auto"):
             self.assertNotIn(flag, new + res)
