@@ -119,8 +119,11 @@ Requirements:
 | **SQLite via Python `sqlite3`** | transactions, unique constraints, `BEGIN IMMEDIATE`, integrity check; ships with Python (target machine: Python 3.14.3 / SQLite 3.52.0) |
 | Go / Rust binary | toolchain and release pipeline for ~1–2k lines of logic; no benefit for v0.1 |
 
-Constraints we accept: the ledger must live on a local filesystem (WAL is not safe
-on network filesystems), and Windows is unsupported in v0.1.
+Constraints we accept:
+- The ledger must live on a local filesystem. WAL is not safe on network filesystems.
+- Windows is unsupported in v0.1.
+- Python ≥ 3.11 is required, because Codex configuration is TOML and `tomllib` ships with
+  3.11. Python 3.10 reaches end of life in October 2026.
 
 ## D6. One execution backend per engine
 
@@ -128,7 +131,9 @@ on network filesystems), and Windows is unsupported in v0.1.
   - *Not* `--bg`: background sessions do not hand back the CLI exit code or the final `result` event to the caller.
   - The native supervisor may restart sessions on its own, so relay-level submit counts would not bound native executions.
   - `claude agents --help` needed interactive approval on the target machine, so that interface could not be verified there.
-- **Codex:** `codex exec --json -o <file> [--sandbox read-only|workspace-write] -`, with the prompt on stdin. Resume uses `codex exec resume <exact uuid> -`; never `--last`.
+- **Codex:** `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, with the prompt on stdin. `<s>` is `read-only` unless the task asks for `workspace-write`.
+  - Resume uses `codex exec --sandbox <s> resume -c sandbox_mode="<s>" --json -o <file> <exact uuid> -`; never `--last`.
+  - `codex exec resume` has no sandbox option of its own. Without the pin it takes the sandbox from the configuration of the moment (Codex 0.163.0; audit #2). The exec-level `--sandbox` before `resume` is accepted by the installed CLI.
   - *Not* the app-server: it would need a resident server, which is the Agenvo route.
 - **Fixture:** a deterministic local program speaking the same event format, used by tests, CI and the soak run.
 
@@ -149,7 +154,8 @@ The keeper is double-forked into its own session, so it survives the caller's
 SSH/terminal disconnect. The CLI stays in the keeper's process group, so the group
 reveals an orphaned CLI even if its pid was never recorded. There is no resident
 service. Reconciliation runs inside the short `reconcile`/`status`/`wait`/`events`
-commands.
+commands. Each of them, including plain polling, starts a keeper for an attempt that
+provably never started, once that attempt has been pending for 5 s.
 
 ## D8. Permissions and billing
 
@@ -160,23 +166,36 @@ cli-relay never adds a permission-relaxing flag:
 - `--sandbox danger-full-access` is rejected.
 
 Permission prompts that no host can answer are denied (`--permission-prompts none`).
-A run with denials ends as `needs_input`, never auto-approved.
+A Claude run with structured denials ends as `needs_input`, even if it also reports an
+error, and is never auto-approved. A Claude configuration or init event in
+`bypassPermissions` mode is blocked, because then nothing would be denied. Codex reports
+no structured denial in `exec --json`, so a Codex outcome follows its own result. The
+Codex sandbox is always explicit (`read-only` by default).
 
 Before spawning, the keeper refuses (`blocked`) when it sees:
 - API-key or gateway environment variables (names are reported, values never);
+- a configuration layer that applies to the task directory and routes away from the
+  subscription, or that cannot be read (layers and keys: [`reliability.md`](reliability.md));
 - a non-subscription login (`claude auth status` must report `claude.ai` /
   `firstParty`; `codex login status` must report ChatGPT).
 
-The keeper also stops the CLI if the Claude init event reports an API-key source.
-`--bare` is never used because it bypasses the subscription login.
+A login check alone is not enough. A Codex custom provider can take its key from any
+environment variable while the ChatGPT login stays in place (audit #3).
+
+The keeper also stops the CLI if the Claude init event reports an API-key source. After a
+Codex run, the thread's own rollout must name the `openai` provider. Keeper and
+reconciliation share one outcome function, so the result is the same when the keeper
+died before committing (audit #8). `--bare` is never used because it bypasses the
+subscription login.
 
 ## D9. Delivery and retention semantics
 
 - Event ids are stored and stable across re-reads.
 - ACK binds `(task, attempt, event, consumer)`. It is idempotent and rejects mismatches.
 - Nothing is deleted automatically. There is no TTL and no GC.
-- "Delivered", "the CLI exited", "the consumer ACKed" and "the user saw it" are different
-  levels. The relay only promises the first three, in that order.
+- "The CLI exited", "stored and re-delivered on every read", "the consumer ACKed" and "the
+  user saw it" are different levels. The relay records the first three. It cannot know the
+  fourth.
 
 ## D10. What v0.1 does not promise
 
@@ -187,3 +206,59 @@ The keeper also stops the CLI if the Claude init event reports an API-key source
   - After the machine comes back, the ledger is readable and sessions can be resumed explicitly.
 - Cross-machine or cross-engine migration.
 - Protection against a malicious local user with the same UID.
+
+## D11. External audit of v0.1 (2026-10-19): handling and deviations
+
+An adversarial review of commit `6c8d2f3` (product code `b72618d`) listed 9 must-fix, 6
+should-fix and 2 clean-up items. All 17 were addressed, one commit each. Each fix has a
+regression test that failed on the code before the fix ([`acceptance.md`](acceptance.md)).
+No finding was rejected. Where the implementation differs from the suggested fix, the
+reason and evidence are recorded here.
+
+1. **Cancel without a verifiable target (#1).** The review asked to refuse when identity is
+   insufficient. We refuse to *signal*, not to record the request:
+   - `cancel` still stores the request, sends nothing, and says why (`not_signalled_reason`).
+   - A keeper that is alive but unverifiable (for example, the kernel query failed) polls
+     the ledger and honours the request within about 2 s.
+   - If everything is gone, reconciliation closes the attempt as `cancelled`.
+   - Refusing the command would drop the caller's intent without making anything safer.
+
+   Evidence: `test_cancel_does_not_signal_a_recycled_process_group`,
+   `test_cancel_still_stops_a_verified_orphan_cli`.
+2. **"Verify the final provider, endpoint and auth source" (#3).** The CLIs do not hand a
+   caller their resolved configuration, so cli-relay reads the files itself:
+   - Known routing keys block.
+   - Unreadable layers block.
+   - Project layers are read even where Codex would ignore an untrusted project (fail closed).
+
+   As a second, independent check, the Codex thread's own rollout must name `openai`. Two
+   things stay open and are documented as limits, not claimed as covered: a routing setting
+   cli-relay does not know about, and a resumed Codex turn (the rollout records the provider
+   at thread creation).
+3. **Real-CLI evidence for #2.** On the target machine Codex's default sandbox is already
+   `read-only`. A real resumed turn running `read-only` is therefore consistent with both the
+   fixed and the unfixed code.
+   - The fix is shown by the argv tests.
+   - The real loop records the resumed turn's sandbox from the rollout as supporting evidence
+     only.
+   - We did not run a wider sandbox just to make the difference visible.
+4. **Beyond the review: the same root cause as #2, and G1.**
+   - Tasks without a sandbox option took the sandbox from the configuration of the moment on
+     both runs. Codex now always gets an explicit sandbox.
+   - A Claude `permissions.defaultMode: bypassPermissions` would have made "never
+     auto-approved" untrue. It now blocks.
+5. **Soak thresholds (#9).** "Ran its full duration" means at least 95% of the configured
+   long-task duration. The run must also last at least 99% of the planned time.
+   - The fixture sleeps on a monotonic clock that does not advance during system sleep, so a
+     real run only ever lasts longer.
+   - The margin covers timestamp granularity and scheduling. A truncated run (1 s of 24.5 h
+     in the review's counterexample) fails.
+6. **Events query (#13).** The unacknowledged filter is a `NOT EXISTS` on the acks primary
+   key, as suggested. No index was added:
+   - an index changes the schema (version 2, with a migration);
+   - the remaining cost is a scan inside SQLite, not rows moved into Python.
+7. **Process-identity fallback (#4).** Agreed and removed. Consequence: on platforms other
+   than macOS and Linux every identity is "cannot verify", so reconciliation there never
+   closes an attempt as lost. Those platforms were already unsupported.
+8. **Python floor.** `tomllib` needs 3.11 (D5). CI moved from 3.10/3.12/3.14 to
+   3.11/3.12/3.14.

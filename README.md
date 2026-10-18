@@ -66,25 +66,38 @@ plain text. Exit codes:
 | Engine | Runs | Resume |
 |---|---|---|
 | `claude` | `claude -p --output-format stream-json --verbose --session-id <uuid> --permission-prompts none` (prompt on stdin) | `--resume <exact uuid>` |
-| `codex` | `codex exec --json -C <cwd> -o <file> [--sandbox read-only\|workspace-write] -` | `codex exec resume <exact id> -` |
+| `codex` | `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, where `<s>` is `read-only` unless the task asks for `workspace-write` | `codex exec --sandbox <s> resume -c sandbox_mode="<s>" --json -o <file> <exact id> -` (same `<s>`) |
 | `fixture` | a deterministic local stand-in used by tests and the soak run | same, against its own state |
 
 Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--sandbox
 danger-full-access`, `--continue`, `--last`, `--bare`.
+- The Codex sandbox is always passed explicitly, so neither the first run nor a resume takes it
+  from the configuration of the moment.
+- A Claude settings layer or init event reporting `bypassPermissions` blocks the run.
 - Claude: permission prompts that nobody can answer are denied by the CLI. A result that lists
   permission denials ends as `needs_input`, even if the CLI also reports an error.
 - Codex: the `codex exec --json` events that cli-relay reads carry no structured permission
   denial. A command refused by the sandbox reaches the model as a failed command, and the
   outcome follows Codex's own result, so `needs_input` is never reported for Codex. Read the
   result text.
-- The keeper refuses a run (`blocked`) if API-key or gateway variables are present (only their names are reported) or if the login is not a subscription.
+- The keeper refuses a run (`blocked`) before the CLI starts if it finds any of these:
+  - API-key or gateway variables (only their names are reported);
+  - a configuration layer that applies to the task directory and routes away from the
+    subscription (e.g. a Codex custom provider or base URL, a Claude `apiKeyHelper`);
+  - a configuration layer it cannot read;
+  - a login that is not a subscription.
 - It also stops the run if the CLI itself reports an API-key source.
+- After a Codex run, the thread's own record must name the built-in `openai` provider.
+- These outcomes do not depend on whether the keeper survived: reconciliation applies the same
+  checks. See [`docs/reliability.md`](docs/reliability.md) for the exact layers and limits.
 
 ## How a consumer (e.g. a chat bot calling over SSH) should use it
 
 1. Submit with a key derived from the request. If the reply is lost or uncertain, submit the
    same key again: you get the same task, and nothing runs twice.
-2. Wait with a bounded `wait`, or poll `status`. A timeout is not a failure.
+2. Wait with a bounded `wait`, or poll `status`. A timeout is not a failure. Polling is also
+   the recovery path: a task whose keeper never started is started by `status`, `events` or
+   `wait` once it has been pending for 5 s.
 3. Read `events --consumer <you>`. After the result has reached its destination, `ack` the event.
    Until then the event is delivered again on every read, with the same id.
 4. If a task is `unknown` (the relay could not prove what happened), a human decides:
@@ -108,15 +121,24 @@ again or on a separate wake-up mechanism.
   after spawn) cannot be seen after a crash; see [`docs/reliability.md`](docs/reliability.md).
 - Results are never deleted automatically. Disk usage grows with history. Clean-up is a
   deliberate, manual decision.
+- The subscription check reads the CLIs' configuration files itself, not through their own
+  resolvers. A routing setting it does not know about is not detected before the run.
+- The run's own provider record is checked for Codex only. It is written when a thread is
+  created, so a resumed Codex turn relies on the preflight check.
 
 ## Tests and acceptance
 
 ```sh
-python3 -m unittest discover -s tests -t tests -v   # fixture engine, real OS processes, ~1 min
+python3 -m unittest discover -s tests -t tests -v   # fixture engine, real OS processes, ~2 min
 python3 scripts/soak.py run --dir /tmp/soak --hours 0.03                   # scaled-down soak
 python3 scripts/soak.py start --dir ~/soak-cli-relay --hours 25            # the real 25 h soak
+python3 scripts/soak.py verdict --dir ~/soak-cli-relay                     # re-check a finished soak
 python3 scripts/real_cli_acceptance.py --engine claude --home DIR --workdir DIR --out result.json
 ```
+
+`soak.py run`, `soak.py verdict` and `real_cli_acceptance.py` exit with status 0 only on PASS.
+`real_cli_acceptance.py --engine fixture` runs the same loop without a model; the test suite
+uses it.
 
 The fault-injection tests kill real processes (`SIGKILL`) at each crash window. They also
 simulate SSH session teardown, check concurrent duplicate submits, and exercise lost, repeated
