@@ -62,7 +62,12 @@ found, `5` ledger or storage error, `6` refused (a precondition does not hold).
 
 Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--sandbox
 danger-full-access`, `--continue`, `--last`, `--bare`.
-- Permission prompts that nobody can answer are denied by the CLI, and the task ends as `needs_input`.
+- Claude: permission prompts that nobody can answer are denied by the CLI. A result that lists
+  permission denials ends as `needs_input`, even if the CLI also reports an error.
+- Codex: the `codex exec --json` events that cli-relay reads carry no structured permission
+  denial. A command refused by the sandbox reaches the model as a failed command, and the
+  outcome follows Codex's own result, so `needs_input` is never reported for Codex. Read the
+  result text.
 - The keeper refuses a run (`blocked`) if API-key or gateway variables are present (only their names are reported) or if the login is not a subscription.
 - It also stops the run if the CLI itself reports an API-key source.
 
