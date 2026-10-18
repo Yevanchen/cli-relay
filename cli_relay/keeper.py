@@ -14,6 +14,7 @@ SIGKILL itself at that point; CLI_RELAY_TEST_PAUSE=<point>:<seconds> sleeps ther
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
@@ -109,7 +110,12 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         close("blocked", {"preflight": {"reason": "unsafe_or_missing_cli", "error": str(exc)}})
         return 0
     prompt_path = run_dir / "prompt.txt"
-    atomic_write_text(prompt_path, att["prompt"])
+    try:
+        atomic_write_text(prompt_path, att["prompt"])
+    except OSError as exc:  # never start the CLI on a prompt that is not stored in full
+        log(f"cannot store the prompt: {exc!r}")
+        close("blocked", {"preflight": {"reason": "prompt_write_failed", "errno": errno.errorcode.get(exc.errno)}})
+        return 0
     stdout_path, stderr_path = run_dir / "stdout.jsonl", run_dir / "stderr.log"
 
     if cancel["set"] or not ledger.mark_spawning(attempt_id, keeper_pid=me):
