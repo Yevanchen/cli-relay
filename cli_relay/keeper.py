@@ -32,9 +32,6 @@ POLL_S = 0.2
 CANCEL_DB_POLL_S = 2.0
 LOG_CAP_BYTES = 1 << 20
 
-POINTS = ("after_claim", "before_spawn", "after_spawn_before_record", "after_record",
-          "after_exit_before_commit", "after_commit")
-
 
 def _hook(point: str) -> None:
     crash = [p.strip() for p in os.environ.get("CLI_RELAY_TEST_CRASH", "").split(",") if p.strip()]

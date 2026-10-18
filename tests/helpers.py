@@ -117,9 +117,5 @@ class RelayTestCase(unittest.TestCase):
         args = ["status", task_id] + ([] if reconcile else ["--no-reconcile"])
         return self.cli(*args)
 
-    def wait_state(self, task_id: str, states: Tuple[str, ...], timeout: float = 30.0) -> Dict[str, Any]:
-        return wait_until(lambda: (lambda s: s if s["task"]["state"] in states else None)(self.status(task_id)),
-                          timeout=timeout, interval=0.2)
-
     def attempt_row(self, task_id: str, attempt_no: int = 1) -> sqlite3.Row:
         return db_rows(self.home, "SELECT * FROM attempts WHERE task_id=? AND attempt_no=?", (task_id, attempt_no))[0]

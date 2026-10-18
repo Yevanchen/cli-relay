@@ -381,11 +381,6 @@ class Ledger:
             out.append(ev)
         return out
 
-    def submissions(self, scope: str, key: str) -> List[Dict[str, Any]]:
-        rows = self.conn.execute("SELECT * FROM submissions WHERE scope=? AND request_key=? ORDER BY id",
-                                 (scope, key))
-        return [dict(r) for r in rows.fetchall()]
-
     # ------------------------------------------------------------------ submit
     def submit(self, *, scope: str, key: str, payload: Dict[str, Any], prompt: str,
                native_session_id: Optional[str]) -> Tuple[str, Dict[str, Any], str]:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
 
 from helpers import REPO, RelayTestCase, db_rows
 

@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import os
-import sys
-import time
 import unittest
 
-from helpers import REPO, RelayTestCase, base_env, run_cli, side_effects
+from helpers import REPO, RelayTestCase, run_cli, side_effects
 
 
 class BasicRoundTrip(RelayTestCase):
