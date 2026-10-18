@@ -19,7 +19,11 @@ class ProcessIdentity(unittest.TestCase):
         self.assertIs(procs.same_process_alive(os.getpid(), tok), True)
 
     def test_processes_started_back_to_back_have_distinct_tokens(self) -> None:
+        # Resolution: microseconds on macOS (kinfo_proc), clock ticks (typically 10 ms) on Linux.
+        # Either is far below the time it takes the OS to recycle a pid; 50 ms apart must differ.
+        import time
         a = subprocess.Popen(["/bin/sleep", "5"])
+        time.sleep(0.05)
         b = subprocess.Popen(["/bin/sleep", "5"])
         try:
             ta, tb = procs.start_token(a.pid), procs.start_token(b.pid)

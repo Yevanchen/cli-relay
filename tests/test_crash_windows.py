@@ -90,7 +90,7 @@ class CrashWindows(RelayTestCase):
         self.assertEqual(len(side_effects(self.effects)), 1)
 
     def test_keeper_crash_after_spawn_before_pid_record(self) -> None:
-        sub = self.submit("k-w4", duration=2.0, env=self.crash_env("after_spawn_before_record"))
+        sub = self.submit("k-w4", duration=4.0, env=self.crash_env("after_spawn_before_record"))
         wait_until(lambda: self.keeper_dead(sub["task_id"]))
         st = self.status(sub["task_id"])
         self.assertEqual(st["reconcile"][0]["action"], "observing_cli_without_keeper")
@@ -106,7 +106,7 @@ class CrashWindows(RelayTestCase):
         self.assertEqual(len(side_effects(self.effects)), 1)
 
     def test_keeper_killed_while_cli_keeps_running(self) -> None:
-        sub = self.submit("k-w5", duration=2.5)
+        sub = self.submit("k-w5", duration=4.0)
         row = wait_until(lambda: (lambda r: r if r["cli_pid"] else None)(self.attempt_row(sub["task_id"])))
         self.assertTrue(procs.same_process_alive(row["keeper_pid"], row["keeper_token"]))
         os.kill(row["keeper_pid"], signal.SIGKILL)

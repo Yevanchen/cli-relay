@@ -82,8 +82,11 @@ them observable rather than pretending it does not exist.
 | W9 | consumer loses the ACK reply / ACKs twice | ack row | ACK is idempotent per `(event, consumer)` and rejects mismatched task/attempt/event | `test_lost_or_repeated_ack_is_idempotent`, `test_mismatched_ack_is_rejected` |
 
 Process identity is always pid + OS-reported start time:
-- Linux: `/proc/<pid>/stat` field 22 plus the boot id;
-- macOS: `ps -o lstart`.
+- Linux: `/proc/<pid>/stat` field 22 (clock ticks, typically 10 ms) plus the boot id;
+- macOS: the kernel's `kinfo_proc.p_starttime` (microseconds), validated against the pid stored in the struct, with `ps -o lstart` only as a fallback.
+
+`ps -o lstart` has one-second resolution, which was too coarse: the suite caught a pid
+pointed at a process started within the same second.
 
 A recycled pid is treated as "gone" (`test_recycled_pid_is_not_mistaken_for_the_keeper`). An
 unverifiable answer is treated as "may be alive" and blocks closing and resuming. A lock, a pid
