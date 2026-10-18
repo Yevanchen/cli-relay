@@ -157,6 +157,11 @@ def assert_safe(engine: str, argv: Iterable[str]) -> None:
     for i, arg in enumerate(args):
         if arg in ("--sandbox", "-s") and i + 1 < len(args) and args[i + 1] not in CODEX_SANDBOXES:
             raise RuntimeError("refusing to run codex with a sandbox other than read-only/workspace-write")
+        if engine == "codex" and arg in ("-c", "--config") and i + 1 < len(args):
+            override = args[i + 1].replace(" ", "")
+            allowed = {f'sandbox_mode="{s}"' for s in CODEX_SANDBOXES}
+            if override not in allowed:
+                raise RuntimeError("refusing a codex config override other than a read-only/workspace-write sandbox")
 
 
 def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_dir: Path,
@@ -176,12 +181,19 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
     elif engine == "codex":
         binary = resolve_bin(engine, env)
         last_message = str(run_dir / "last_message.txt")
+        sandbox = opts.get("sandbox")
         if resume:
-            argv = [binary, "exec", "resume", "--json", "-o", last_message]
+            # `codex exec resume` has no --sandbox of its own and otherwise takes the sandbox from the
+            # current configuration, which may be wider than what the task was submitted with. Pin it
+            # both as the exec-level option and as a config override for the resumed thread.
+            argv = [binary, "exec"] + (["--sandbox", sandbox] if sandbox else []) + ["resume"]
+            if sandbox:
+                argv += ["-c", f'sandbox_mode="{sandbox}"']
+            argv += ["--json", "-o", last_message]
         else:
             argv = [binary, "exec", "--json", "-C", cwd, "-o", last_message]
-            if opts.get("sandbox"):
-                argv += ["--sandbox", opts["sandbox"]]
+            if sandbox:
+                argv += ["--sandbox", sandbox]
         if opts.get("skip_git_repo_check"):
             argv.append("--skip-git-repo-check")
         if opts.get("model"):
