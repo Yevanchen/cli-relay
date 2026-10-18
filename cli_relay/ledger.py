@@ -613,12 +613,14 @@ class Ledger:
                    include_acked: bool = False) -> List[Dict[str, Any]]:
         sql = ("SELECT e.*, t.current_attempt AS current_attempt, "
                "(SELECT acked_at FROM acks a WHERE a.event_id=e.event_id AND a.consumer=?) AS acked_at "
-               "FROM events e JOIN tasks t ON t.task_id=e.task_id WHERE (? IS NULL OR e.task_id=?) "
-               "ORDER BY e.created_at, e.event_id")
-        rows = [dict(r) for r in self.conn.execute(sql, (consumer, task_id, task_id)).fetchall()]
+               "FROM events e JOIN tasks t ON t.task_id=e.task_id WHERE (? IS NULL OR e.task_id=?) ")
+        params: List[Any] = [consumer, task_id, task_id]
         if not include_acked:
-            rows = [r for r in rows if r["acked_at"] is None]
-        return rows
+            # Filtered in SQL (primary-key lookup in acks): an empty poll reads no acknowledged history.
+            sql += "AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.event_id=e.event_id AND a.consumer=?) "
+            params.append(consumer)
+        sql += "ORDER BY e.created_at, e.event_id"
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
 
     def record_deliveries(self, consumer: str, event_ids: Sequence[str]) -> Dict[str, int]:
         counts: Dict[str, int] = {}
