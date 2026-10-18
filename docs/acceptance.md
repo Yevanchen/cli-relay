@@ -10,11 +10,13 @@ Status words: **PASS**, **FAIL**, **NOT RUN** (with the reason), **RUNNING**.
 
 ## Environment of the recorded run
 
-- Code under test: commit `b72618d9ad98afab48d47c3a2f9c7834d709c706`.
+- Product code under test: `cli_relay/` at commit `b72618d9ad98afab48d47c3a2f9c7834d709c706`, unchanged through `f14f2bb39c537879523e4042aced64da3537445f`.
+  - `f14f2bb` only widens two test timing margins, spaces the identity test for Linux tick resolution, and updates CI and docs.
+  - The fault-injection suite was re-run on `f14f2bb`.
 - macOS (Darwin 25.2.0, arm64), Python 3.14.3, SQLite 3.52.0.
 - Claude Code 2.1.301 (subscription login).
 - Codex CLI 0.163.0 (ChatGPT login).
-- Linux and Python 3.9/3.12/3.13 are covered by CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml), free `ubuntu-latest`); results appear once the repository is published.
+- Linux and Python 3.10/3.12/3.14 are covered by CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml), free `ubuntu-latest`); results appear once the repository is published.
 
 ## How to reproduce
 
@@ -74,11 +76,12 @@ confirms a subscription login.
 | I1 | Scaled-down soak (0.03 h): every soak mechanism exercised end to end | `scripts/soak.py run --hours 0.03` | PASS (9/9 verdicts); a short test, **not** the 25 h result |
 | I2 | Real 25-hour soak | `scripts/soak.py start --hours 25` | RUNNING (started 2026-10-19 03:28 UTC+8; planned end 2026-10-20 ≈04:30 UTC+8) |
 | J1 | Execution across machine sleep, power loss or reboot | — | NOT RUN (out of scope by design; sleep settings are not changed and the machine is not restarted) |
-| J2 | CI on `ubuntu-latest` with Python 3.9 / 3.12 / 3.13 | workflow in this repository | NOT RUN (runs after publishing) |
+| J2 | CI on `ubuntu-latest` with Python 3.10 / 3.12 / 3.14 | workflow in this repository | NOT RUN (runs after publishing) |
 
 ## Recorded results
 
-- **Fault-injection suite.** 58 tests, 58 passed, in each of four consecutive runs (61–64 s per run).
+- **Fault-injection suite.** 58 tests, 58 passed, in each of four consecutive runs on `b72618d`
+  (61–64 s per run) and two runs on `f14f2bb` (63–67 s).
   - An earlier run exposed a real defect: on macOS, `ps -o lstart` has only one-second
     resolution, so a pid recycled within the same second looked like the original process.
   - The fix reads the kernel's microsecond start time. A regression test now checks that two
