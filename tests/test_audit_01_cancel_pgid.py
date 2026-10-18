@@ -32,6 +32,7 @@ class CancelProcessGroupSafety(RelayTestCase):
             time.sleep(0.5)
             self.assertIsNone(stranger.poll(), "an unrelated process group must never be signalled")
             self.assertEqual(out["signalled"], "none")
+            self.assertIn("no verified CLI process", out["not_signalled_reason"])
         finally:
             stranger.kill()
             stranger.wait(timeout=10)

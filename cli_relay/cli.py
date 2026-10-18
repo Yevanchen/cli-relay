@@ -249,8 +249,9 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     ledger = Ledger(args.home)
     task_id = _resolve_task(ledger, args)
     result, att, event_id = ledger.request_cancel(task_id)
-    signalled = "none"
+    signalled, why_not = "none", None
     if result == "cancel_requested":
+        # The request is in the ledger either way; a signal is only sent to a verified process.
         att = ledger.get_attempt(att["attempt_id"])
         keeper_alive = procs.same_process_alive(att["keeper_pid"], att["keeper_token"])
         if keeper_alive is True:
@@ -258,11 +259,18 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             signalled = "keeper"
         elif keeper_alive is False:
             signalled = _signal_verified_orphan(att)
+            if signalled == "none":
+                why_not = "keeper gone and no verified CLI process; reconcile settles the attempt"
+        else:
+            why_not = "keeper identity unverifiable; a live keeper reads the request from the ledger"
     elif result == "not_cancellable":
         raise Refused("not_cancellable", "the current attempt is not running", state=att["state"],
                       outcome=att["outcome"])
-    emit({"ok": True, "result": result, "signalled": signalled, "task_id": task_id,
-          "attempt_no": att["attempt_no"], "event_id": event_id})
+    out = {"ok": True, "result": result, "signalled": signalled, "task_id": task_id,
+           "attempt_no": att["attempt_no"], "event_id": event_id}
+    if why_not:
+        out["not_signalled_reason"] = why_not
+    emit(out)
     return 0
 
 
