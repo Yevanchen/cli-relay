@@ -150,12 +150,17 @@ def cmd_submit(args: argparse.Namespace) -> int:
     key = _check_key(args.key)
     prompt = _read_prompt(args)
     cwd = os.path.realpath(args.cwd)
-    if not os.path.isdir(cwd):
-        raise UsageError("--cwd must be an existing directory")
     options = engines.validate_options(engine, _parse_options(args.option))
     payload = {"engine": engine, "cwd": cwd, "prompt": prompt, "options": options}
     ledger = Ledger(args.home, integrity=True)
-    ledger.check_disk()
+    try:
+        ledger.find_task(scope, key)
+    except NotFound:
+        # Preconditions for new work only: a caller re-sending a known key (e.g. after a lost
+        # reply) must get its task back even if the directory is gone or the disk is nearly full.
+        if not os.path.isdir(cwd):
+            raise UsageError("--cwd must be an existing directory")
+        ledger.check_disk()
     native_sid = str(uuid.uuid4()) if engine in ("claude", "fixture") else None
     status, task, sha = ledger.submit(scope=scope, key=key, payload=payload, prompt=prompt,
                                       native_session_id=native_sid)
