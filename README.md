@@ -22,7 +22,7 @@ ledger rather than a fork.
 
 ## Requirements
 
-- macOS or Linux, Python ≥ 3.10 (standard library only), a local filesystem for the ledger.
+- macOS or Linux, Python ≥ 3.11 (standard library only), a local filesystem for the ledger.
 - For real runs: `claude` and/or `codex` installed and logged in **with a subscription**
   (`claude auth status` → `claude.ai`; `codex login status` → ChatGPT). API-key routes are refused.
 

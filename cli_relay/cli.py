@@ -351,7 +351,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         out["ok"] = False
         out["ledger"] = {"home": str(args.home), "error": exc.code, "message": exc.message}
     if args.engine:
-        pf = engines.preflight(engines.validate_engine(args.engine), dict(os.environ))
+        pf = engines.preflight(engines.validate_engine(args.engine), dict(os.environ), cwd=args.cwd or os.getcwd())
         out["engine"] = {"name": args.engine, "ok": pf.ok, "reason": pf.reason, **pf.detail}
         out["ok"] = out["ok"] and pf.ok
     emit(out)
@@ -435,6 +435,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("doctor", help="check the ledger, disk space and (optionally) an engine's auth path")
     d.add_argument("--engine", choices=engines.ENGINES)
+    d.add_argument("--cwd", help="task directory whose project configuration is checked (default: current)")
     d.set_defaults(func=cmd_doctor)
 
     k = sub.add_parser("_keeper", help="(internal) supervise one attempt")

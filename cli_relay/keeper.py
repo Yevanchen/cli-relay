@@ -98,7 +98,7 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         log(f"refusing to start: {exc.code}")
         close("blocked", {"preflight": {"reason": exc.code, **exc.detail}})
         return 0
-    pf = engines.preflight(engine, env)
+    pf = engines.preflight(engine, env, cwd=payload["cwd"])
     if not pf.ok:
         log(f"preflight blocked: {pf.reason}")
         close("blocked", {"preflight": {"reason": pf.reason, **pf.detail}})
@@ -196,9 +196,13 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     if parsed["session_id"] and parsed["session_id"] != recorded_sid:
         ledger.set_native_session(attempt_id, parsed["session_id"])
     evidence: Dict[str, Any] = {"exit_source": "keeper_waitpid"}
+    provider = engines.provider_violation(engine, env, parsed["session_id"] or recorded_sid)
     if violation is not None:
         outcome = "blocked"
         evidence["terminated"] = violation
+    elif provider is not None:
+        outcome = "blocked"
+        evidence["provider_check"] = provider
     else:
         cancel_requested = cancel["set"] or ledger.cancel_requested(attempt_id)
         outcome = engines.classify(parsed["native"], exit_code=exit_info["exit_code"],

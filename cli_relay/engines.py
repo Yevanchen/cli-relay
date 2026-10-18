@@ -13,9 +13,10 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .errors import UsageError
 
@@ -51,6 +52,14 @@ _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
 }
 
 CODEX_SANDBOXES = ("read-only", "workspace-write")
+
+# Configuration layers outside the user's own files that the CLIs also read.
+CODEX_SYSTEM_CONFIG = (Path("/etc/codex/config.toml"),)
+CODEX_MANAGED_CONFIG = (Path("/etc/codex/managed_config.toml"),)
+CLAUDE_MANAGED_SETTINGS = (Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+                           Path("/etc/claude-code/managed-settings.json"))
+# Claude settings keys that obtain credentials other than the claude.ai login.
+CLAUDE_CREDENTIAL_SETTINGS = ("apiKeyHelper", "awsAuthRefresh", "awsCredentialExport")
 
 
 @dataclass
@@ -119,12 +128,124 @@ def _first_json_object(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def preflight(engine: str, env: Dict[str, str]) -> Preflight:
+# ------------------------------------------------------------------- provider configuration
+def _home(env: Dict[str, str]) -> Path:
+    return Path(env["HOME"]) if env.get("HOME") else Path.home()
+
+
+def codex_home(env: Dict[str, str]) -> Path:
+    return Path(env["CODEX_HOME"]) if env.get("CODEX_HOME") else _home(env) / ".codex"
+
+
+def claude_config_dir(env: Dict[str, str]) -> Path:
+    return Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else _home(env) / ".claude"
+
+
+def _dirs_up(cwd: Optional[str]) -> List[Path]:
+    """The task directory and all of its parents, outermost first."""
+    if not cwd:
+        return []
+    start = Path(os.path.abspath(cwd))
+    return [*reversed(start.parents), start]
+
+
+def _existing_once(layers: Iterable[Tuple[str, Path]]) -> List[Tuple[str, Path]]:
+    seen, out = set(), []
+    for layer, path in layers:
+        real = os.path.realpath(path)
+        if real not in seen and os.path.isfile(path):
+            seen.add(real)
+            out.append((layer, path))
+    return out
+
+
+def _merge(base: Dict[str, Any], top: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for key, value in top.items():
+        out[key] = _merge(out[key], value) if isinstance(value, dict) and isinstance(out.get(key), dict) else value
+    return out
+
+
+def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tuple[List[str], List[str]]:
+    """Merge the Codex configuration layers (system, user, every ``.codex/config.toml`` from the
+    filesystem root down to the task directory, managed) and name every setting that could serve the
+    run from anything but the built-in OpenAI provider with the ChatGPT sign-in. Project layers are
+    read whether or not Codex trusts the project, and an unreadable layer is a problem: when the
+    configuration cannot be confirmed, the run is blocked. Only key names are reported."""
+    layers = [("system", p) for p in CODEX_SYSTEM_CONFIG] + [("user", codex_home(env) / "config.toml")]
+    layers += [("project", d / ".codex" / "config.toml") for d in _dirs_up(cwd)]
+    layers += [("managed", p) for p in CODEX_MANAGED_CONFIG]
+    merged: Dict[str, Any] = {}
+    problems: List[str] = []
+    read: List[str] = []
+    for layer, path in _existing_once(layers):
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            problems.append(f"{layer}:unreadable")
+            continue
+        read.append(layer)
+        merged = _merge(merged, data)
+    tables: List[Tuple[str, Dict[str, Any]]] = [("", merged)]
+    if "profile" in merged:
+        profile = (merged.get("profiles") or {}).get(merged["profile"])
+        if isinstance(profile, dict):
+            tables.append(("profiles.<active>.", profile))
+        else:
+            problems.append("profile")
+    provider = "openai"
+    for prefix, table in tables:
+        provider = table.get("model_provider", provider)
+        problems += [prefix + key for key in sorted(table) if key.endswith("base_url")]
+        for key in ("forced_login_method", "preferred_auth_method"):
+            if table.get(key) not in (None, "chatgpt"):
+                problems.append(prefix + key)
+    if provider != "openai":
+        problems.append("model_provider")
+    if "openai" in (merged.get("model_providers") or {}):
+        problems.append("model_providers.openai")
+    return problems, read
+
+
+def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tuple[List[str], List[str]]:
+    """Name every Claude settings layer (user, ``.claude/settings[.local].json`` of the task directory
+    and its parents, managed) that sets a credential helper, a non-claude.ai login or a billing
+    variable in its ``env``. Only key and variable names are reported."""
+    layers = [("user", claude_config_dir(env) / "settings.json")]
+    for d in _dirs_up(cwd):
+        layers += [("project", d / ".claude" / "settings.json"), ("project", d / ".claude" / "settings.local.json")]
+    layers += [("managed", p) for p in CLAUDE_MANAGED_SETTINGS]
+    problems: List[str] = []
+    read: List[str] = []
+    for layer, path in _existing_once(layers):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        if not isinstance(data, dict):
+            problems.append(f"{layer}:unreadable")
+            continue
+        read.append(layer)
+        problems += [f"{layer}:{key}" for key in CLAUDE_CREDENTIAL_SETTINGS if data.get(key)]
+        if data.get("forceLoginMethod") not in (None, "claudeai"):
+            problems.append(f"{layer}:forceLoginMethod")
+        settings_env = data.get("env") if isinstance(data.get("env"), dict) else {}
+        problems += [f"{layer}:env.{name}" for name in BILLING_ENV["claude"] if settings_env.get(name)]
+    return problems, read
+
+
+def preflight(engine: str, env: Dict[str, str], cwd: Optional[str] = None) -> Preflight:
+    """Everything that decides which account serves the run is checked before the CLI starts:
+    billing variables, the CLI's configuration layers that apply to ``cwd``, and the login."""
     present = [name for name in BILLING_ENV[engine] if env.get(name)]
     if present:
         return Preflight(False, "billing_env_present", {"names": present})
     if engine == "fixture":
         return Preflight(True)
+    check = codex_config_problems if engine == "codex" else claude_settings_problems
+    problems, layers = check(env, cwd)
+    if problems:
+        return Preflight(False, "config_not_subscription", {"settings": problems})
     binary = resolve_bin(engine, env)
     if not binary:
         return Preflight(False, "cli_not_found", {"engine": engine})
@@ -139,14 +260,38 @@ def preflight(engine: str, env: Dict[str, str]) -> Preflight:
         auth = {k: info.get(k) for k in ("loggedIn", "authMethod", "apiProvider", "subscriptionType")}
         if (info.get("loggedIn") is True and info.get("authMethod") == "claude.ai"
                 and info.get("apiProvider") in (None, "firstParty")):
-            return Preflight(True, None, {"auth": auth})
+            return Preflight(True, None, {"auth": auth, "config_layers": layers})
         return Preflight(False, "auth_not_subscription", {"auth": auth, "returncode": out.returncode})
     text = (out.stdout + "\n" + out.stderr).lower()
     if "api key" in text:
         return Preflight(False, "auth_not_subscription", {"auth": "api_key"})
     if out.returncode == 0 and "chatgpt" in text:
-        return Preflight(True, None, {"auth": "chatgpt"})
+        return Preflight(True, None, {"auth": "chatgpt", "config_layers": layers})
     return Preflight(False, "auth_unverified", {"auth": "unknown", "returncode": out.returncode})
+
+
+def codex_rollout(env: Dict[str, str], thread_id: str) -> Optional[Path]:
+    matches = glob.glob(str(codex_home(env) / "sessions" / "*" / "*" / "*" / f"rollout-*{glob.escape(thread_id)}.jsonl"))
+    return Path(sorted(matches)[0]) if matches else None
+
+
+def provider_violation(engine: str, env: Dict[str, str], session_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """After a run: Codex records the provider that served a thread in the thread's own rollout
+    (``session_meta.model_provider``). Anything but the built-in ``openai`` provider, or a thread
+    without that record, means the run is not shown to have been served by the subscription.
+    The record is written when the thread is created, so a resumed turn relies on the preflight."""
+    if engine != "codex" or not session_id:
+        return None
+    path = codex_rollout(env, session_id)
+    if path is None:
+        return {"reason": "provider_unverified", "missing": "rollout"}
+    for ev in iter_json_lines(path):
+        if ev.get("type") == "session_meta":
+            provider = (ev.get("payload") or {}).get("model_provider")
+            if provider == "openai":
+                return None
+            return {"reason": "provider_not_subscription", "model_provider": provider}
+    return {"reason": "provider_unverified", "missing": "session_meta"}
 
 
 def assert_safe(engine: str, argv: Iterable[str]) -> None:
@@ -377,11 +522,11 @@ def native_trace_exists(engine: str, session_id: Optional[str]) -> Optional[bool
     """Best-effort evidence that the CLI created its own session record (never used to decide a re-run)."""
     if not session_id or engine == "fixture":
         return None
-    home = Path.home()
+    env = dict(os.environ)
     if engine == "claude":
-        pattern = str(home / ".claude" / "projects" / "*" / f"{glob.escape(session_id)}.jsonl")
+        pattern = str(claude_config_dir(env) / "projects" / "*" / f"{glob.escape(session_id)}.jsonl")
     else:
-        pattern = str(home / ".codex" / "sessions" / "**" / f"*{glob.escape(session_id)}*.jsonl")
+        pattern = str(codex_home(env) / "sessions" / "**" / f"*{glob.escape(session_id)}*.jsonl")
     try:
         return bool(glob.glob(pattern, recursive=True))
     except OSError:
