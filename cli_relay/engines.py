@@ -518,6 +518,27 @@ def classify(native: Optional[Dict[str, Any]], *, exit_code: Optional[int], exit
     return "succeeded"
 
 
+def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_id: Optional[str],
+           exit_code: Optional[int], exit_signal: Optional[int], exit_known: bool, cancel_requested: bool,
+           guard: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any]]:
+    """Name an attempt's outcome from what the run left behind; returns (outcome, evidence).
+
+    The keeper and reconciliation both call this, so the outcome does not depend on which of
+    them closes the attempt. A run shown not to be served by the subscription is ``blocked``
+    whatever else happened: ``guard`` is what the keeper saw while the run was live (also
+    persisted in exit.json); the init event of the saved output and the Codex thread record
+    are re-read here, so the fact survives a keeper that died before committing."""
+    if guard is None and engine in ("claude", "fixture") and parsed.get("init"):
+        guard = billing_violation(engine, {"type": "system", "subtype": "init", **parsed["init"]})
+    if guard is not None:
+        return "blocked", {"billing_guard": guard}
+    provider = provider_violation(engine, env, session_id)
+    if provider is not None:
+        return "blocked", {"provider_check": provider}
+    return classify(parsed.get("native"), exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,
+                    cancel_requested=cancel_requested), {}
+
+
 def native_trace_exists(engine: str, session_id: Optional[str]) -> Optional[bool]:
     """Best-effort evidence that the CLI created its own session record (never used to decide a re-run)."""
     if not session_id or engine == "fixture":

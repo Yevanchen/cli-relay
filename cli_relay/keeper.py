@@ -103,6 +103,8 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         log(f"preflight blocked: {pf.reason}")
         close("blocked", {"preflight": {"reason": pf.reason, **pf.detail}})
         return 0
+    if engine == "codex":  # reconciliation must look for the thread record where this run writes it
+        ledger.add_evidence(attempt_id, {"codex_home": str(engines.codex_home(env))})
     try:
         spec = engines.build(engine, payload=payload, attempt=att, run_dir=run_dir,
                              fixture_state_dir=str(Path(home) / "fixture-sessions"), env=env)
@@ -186,8 +188,10 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
             killed = True
     inspect(watcher.poll())
 
-    exit_info = {"exit_code": rc if rc >= 0 else None, "signal": -rc if rc < 0 else None,
-                 "ended_at": now_iso(), "cli_pid": child.pid}
+    exit_info: Dict[str, Any] = {"exit_code": rc if rc >= 0 else None, "signal": -rc if rc < 0 else None,
+                                 "ended_at": now_iso(), "cli_pid": child.pid}
+    if violation is not None:
+        exit_info["billing_guard"] = violation  # survives a keeper that dies before the commit below
     atomic_write_text(run_dir / "exit.json", canonical_json(exit_info) + "\n")
     _hook("after_exit_before_commit")
 
@@ -195,21 +199,15 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     parsed = engines.parse_output(engine, stdout_path, last_message)
     if parsed["session_id"] and parsed["session_id"] != recorded_sid:
         ledger.set_native_session(attempt_id, parsed["session_id"])
-    evidence: Dict[str, Any] = {"exit_source": "keeper_waitpid"}
-    provider = engines.provider_violation(engine, env, parsed["session_id"] or recorded_sid)
+    cancel_requested = cancel["set"] or ledger.cancel_requested(attempt_id)
+    outcome, decided = engines.decide(engine, parsed, env=env, session_id=parsed["session_id"] or recorded_sid,
+                                      exit_code=exit_info["exit_code"], exit_signal=exit_info["signal"],
+                                      exit_known=True, cancel_requested=cancel_requested, guard=violation)
+    evidence: Dict[str, Any] = {"exit_source": "keeper_waitpid", **decided}
     if violation is not None:
-        outcome = "blocked"
         evidence["terminated"] = violation
-    elif provider is not None:
-        outcome = "blocked"
-        evidence["provider_check"] = provider
-    else:
-        cancel_requested = cancel["set"] or ledger.cancel_requested(attempt_id)
-        outcome = engines.classify(parsed["native"], exit_code=exit_info["exit_code"],
-                                   exit_signal=exit_info["signal"], exit_known=True,
-                                   cancel_requested=cancel_requested)
-        if cancel_requested and outcome != "cancelled":
-            evidence["cancel_lost_race"] = True
+    elif cancel_requested and outcome != "cancelled":
+        evidence["cancel_lost_race"] = True
     if parsed["init"]:
         evidence["init"] = parsed["init"]
     ledger.finish(attempt_id, from_states=("running", "claimed", "unknown"), outcome=outcome,

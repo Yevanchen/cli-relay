@@ -71,24 +71,33 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
         ledger.set_native_session(att["attempt_id"], parsed["session_id"])
     native = parsed["native"]
     cancel_requested = bool(att.get("cancel_requested_at"))
+    env = dict(os.environ)
+    if _evidence(att).get("codex_home"):
+        env["CODEX_HOME"] = _evidence(att)["codex_home"]  # where the keeper's run wrote its thread record
+
+    def decide(exit_code: Optional[int] = None, exit_signal: Optional[int] = None, exit_known: bool = False):
+        # The same decision the keeper makes, including the billing guard it may have tripped.
+        return engines.decide(engine, parsed, env=env, session_id=parsed["session_id"] or att["native_session_id"],
+                              exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,
+                              cancel_requested=cancel_requested, guard=(exit_info or {}).get("billing_guard"))
 
     if exit_info is not None:
         # The keeper died after recording the exit status but before committing it.
-        outcome = engines.classify(native, exit_code=exit_info.get("exit_code"), exit_signal=exit_info.get("signal"),
-                                   exit_known=True, cancel_requested=cancel_requested)
+        outcome, decided = decide(exit_info.get("exit_code"), exit_info.get("signal"), True)
         eid = ledger.finish(att["attempt_id"], from_states=(state,), outcome=outcome,
                             exit_code=exit_info.get("exit_code"), exit_signal=exit_info.get("signal"),
                             exit_known=True, native=native,
-                            evidence={"exit_source": "exit.json", "reconciled_at": now_iso()}, source="reconcile")
+                            evidence={"exit_source": "exit.json", "reconciled_at": now_iso(), **decided},
+                            source="reconcile")
         action.update(action="finished_from_exit_record", event_id=eid)
         return action
 
     if state == "unknown":
         if native is not None:  # late evidence
-            outcome = engines.classify(native, exit_code=None, exit_signal=None, exit_known=False,
-                                       cancel_requested=cancel_requested)
+            outcome, decided = decide()
             eid = ledger.finish(att["attempt_id"], from_states=("unknown",), outcome=outcome, exit_known=False,
-                                native=native, evidence={"late_native_result_at": now_iso()}, source="reconcile")
+                                native=native, evidence={"late_native_result_at": now_iso(), **decided},
+                                source="reconcile")
             action.update(action="finished_from_late_native_result", event_id=eid)
         return action
 
@@ -114,14 +123,21 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
         action["action"] = "observing_cli_without_keeper"
         return action
 
+    outcome, decided = decide()
     if native is not None:
-        outcome = engines.classify(native, exit_code=None, exit_signal=None, exit_known=False,
-                                   cancel_requested=cancel_requested)
         eid = ledger.finish(att["attempt_id"], from_states=(state,), outcome=outcome, exit_known=False,
                             native=native,
-                            evidence={"exit_source": "unavailable_keeper_lost", "reconciled_at": now_iso()},
+                            evidence={"exit_source": "unavailable_keeper_lost", "reconciled_at": now_iso(), **decided},
                             source="reconcile")
         action.update(action="finished_from_native_result_exit_unknown", event_id=eid)
+        return action
+
+    if outcome == "blocked":
+        # No result, but the run's own output shows it was not served by the subscription.
+        eid = ledger.finish(att["attempt_id"], from_states=(state,), outcome="blocked", exit_known=False,
+                            evidence={"exit_source": "unavailable_keeper_lost", "reconciled_at": now_iso(), **decided},
+                            source="reconcile")
+        action.update(action="finished_blocked_without_result", event_id=eid)
         return action
 
     if cancel_requested:
