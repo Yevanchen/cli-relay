@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Long-run soak driver for cli-relay (cheap deterministic fixture tasks only).
 
-  soak.py start  --dir DIR [--hours 25]   detach and run in the background; prints the pid
-  soak.py run    --dir DIR [--hours 25]   run in the foreground
-  soak.py status --dir DIR                print the latest checkpoint, and the summary once finished
+  soak.py start   --dir DIR [--hours 25]  detach and run in the background; prints the pid
+  soak.py run     --dir DIR [--hours 25]  run in the foreground; exit status 0 only on PASS
+  soak.py status  --dir DIR               print the latest checkpoint, and the summary once finished
+  soak.py verdict --dir DIR               re-evaluate a finished soak with this version's verdict rules
+                                          (reads only; exit status 0 only on PASS)
 
 Scenario (all times scale with --hours; numbers below are for 25 h):
   * L: a long task whose fixture sleeps for ~98% of the run - no implicit deadline may cut it;
@@ -26,13 +28,21 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from cli_relay import procs  # noqa: E402
+
+
+def _seconds_between(start: Optional[str], end: Optional[str]) -> Optional[float]:
+    if not start or not end:
+        return None
+    fmt = "%Y-%m-%dT%H:%M:%S.%fZ"
+    return (datetime.strptime(end, fmt) - datetime.strptime(start, fmt)).total_seconds()
 
 
 def relay(home: Path, *args: str, env_extra: Dict[str, str] = None) -> Tuple[int, Dict[str, Any]]:
@@ -202,35 +212,54 @@ class Soak:
             time.sleep(5)
         self.consume()
         c = self.checkpoint(final=True)
-        long_task = self.s["keys"]["soak-long"]
-        long_row = self.rows("SELECT * FROM attempts WHERE task_id=? AND attempt_no=1", (long_task["task_id"],))[0]
-        kill_row = self.rows("SELECT * FROM attempts WHERE task_id=? AND attempt_no=1",
-                             (self.s["keys"]["soak-keeper-kill"]["task_id"],))[0]
+        (self.root / "summary.json").write_text(json.dumps(self.evaluate(c), indent=2, sort_keys=True))
+
+    def evaluate(self, c: Dict[str, Any], elapsed_s: Optional[float] = None) -> Dict[str, Any]:
+        """The verdict, from facts only (reads, no writes). PASS needs every submitted key to reach
+        `succeeded` with exactly its expected number of executions, the run to have lasted its
+        planned time and the long task to have run for its full configured duration."""
+        keys = self.s["keys"]
+        state = {k: (self.rows("SELECT state FROM tasks WHERE task_id=?", (v["task_id"],)) or [[None]])[0][0]
+                 for k, v in keys.items()}
+        effects = {k: self.effects_of(k) for k in keys}
+
+        def attempt(key: str, no: int = 1) -> Dict[str, Any]:
+            rows = self.rows("SELECT * FROM attempts WHERE task_id=? AND attempt_no=?", (keys[key]["task_id"], no))
+            return dict(rows[0]) if rows else {}
+
+        long_row, kill_row, unknown_first = attempt("soak-long"), attempt("soak-keeper-kill"), attempt("soak-unknown")
+        long_ran_s = _seconds_between(long_row.get("started_at"), long_row.get("ended_at"))
+        elapsed_s = self.rel() if elapsed_s is None else elapsed_s
+        shorts = [k for k in keys if k.startswith("soak-short-")]
         violations = [n for n in self.s["notes"] if n["msg"].startswith("VIOLATION")]
         verdicts = {
             "no_lost_or_changed_events": not c["events_lost"] and not c["event_bodies_changed"],
-            "no_key_over_executed": not c["keys_over_executed"],
-            "long_task_completed_without_implicit_deadline": c["states"].get("soak-long") == "succeeded"
-            and self.effects_of("soak-long") == 1,
-            "keeper_killed_task_reconciled_once": c["states"].get("soak-keeper-kill") == "succeeded"
-            and kill_row["exit_known"] == 0 and self.effects_of("soak-keeper-kill") == 1,
-            "unknown_task_rerun_only_explicitly": c["states"].get("soak-unknown") == "succeeded"
-            and c["unknown_task_attempts"] == 2 and self.effects_of("soak-unknown") == 1,
+            "every_key_executed_exactly_as_expected": all(effects[k] == v["expected_effects"] for k, v in keys.items()),
+            "every_task_succeeded": all(s == "succeeded" for s in state.values()),
+            "ran_for_the_planned_time": elapsed_s >= 0.99 * self.total,
+            "long_task_ran_its_full_duration": state.get("soak-long") == "succeeded" and long_ran_s is not None
+            and long_ran_s >= 0.95 * keys["soak-long"]["duration_s"],
+            "short_tasks_submitted_and_tracked": len(shorts) >= 1 and len(shorts) == self.s["short_index"],
+            "keeper_killed_task_reconciled_once": state.get("soak-keeper-kill") == "succeeded"
+            and kill_row.get("exit_known") == 0 and effects.get("soak-keeper-kill") == 1,
+            "unknown_task_rerun_only_explicitly": unknown_first.get("state") == "unknown"
+            and c["unknown_task_attempts"] == 2 and state.get("soak-unknown") == "succeeded"
+            and effects.get("soak-unknown") == 1,
             "all_events_acked_at_end": c["unacked_by_consumer"] == 0,
             "control_restart_exercised": self.s["restarts"] >= 1,
             "repeated_ack_reported_duplicate": self.s["ack_duplicates"] >= 1,
             "no_violation_notes": not violations,
         }
-        summary = {"verdict": "PASS" if all(verdicts.values()) else "FAIL", "verdicts": verdicts,
-                   "planned_hours": self.total / 3600.0, "elapsed_hours": round(self.rel() / 3600.0, 3),
-                   "long_task_ran_hours": None, "gaps": self.s["gaps"], "final_checkpoint": c,
-                   "notes": self.s["notes"][-50:]}
-        if long_row["started_at"] and long_row["ended_at"]:
-            from datetime import datetime
-            fmt = "%Y-%m-%dT%H:%M:%S.%fZ"
-            dt = datetime.strptime(long_row["ended_at"], fmt) - datetime.strptime(long_row["started_at"], fmt)
-            summary["long_task_ran_hours"] = round(dt.total_seconds() / 3600.0, 3)
-        (self.root / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
+        return {"verdict": "PASS" if all(verdicts.values()) else "FAIL", "verdicts": verdicts,
+                "planned_hours": self.total / 3600.0, "elapsed_hours": round(elapsed_s / 3600.0, 3),
+                "long_task_planned_hours": round(keys["soak-long"]["duration_s"] / 3600.0, 3),
+                "long_task_ran_hours": None if long_ran_s is None else round(long_ran_s / 3600.0, 3),
+                "short_tasks": len(shorts),
+                "keys_not_as_expected": {k: {"state": state[k], "executions": effects[k],
+                                             "expected_executions": v["expected_effects"]}
+                                         for k, v in keys.items()
+                                         if state[k] != "succeeded" or effects[k] != v["expected_effects"]},
+                "gaps": self.s["gaps"], "final_checkpoint": c, "notes": self.s["notes"][-50:]}
 
     def run(self) -> None:
         if not self.s["done"].get("setup"):
@@ -277,11 +306,23 @@ class Soak:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", choices=("start", "run", "status"))
+    ap.add_argument("action", choices=("start", "run", "status", "verdict"))
     ap.add_argument("--dir", required=True, type=Path)
     ap.add_argument("--hours", type=float, default=25.0)
     a = ap.parse_args()
     root = a.dir.resolve()
+    if a.action == "verdict":
+        try:
+            lines = root.joinpath("checkpoints.jsonl").read_text().splitlines()
+            final = [c for c in (json.loads(ln) for ln in lines if ln.strip()) if c.get("final")]
+        except (OSError, ValueError):
+            final = []
+        if not final or not (root / "state.json").exists():
+            print(json.dumps({"ok": False, "error": "no finished soak in this directory"}))
+            return 1
+        result = Soak(root, a.hours).evaluate(final[-1], elapsed_s=final[-1]["at_s"])
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result["verdict"] == "PASS" else 1
     if a.action == "status":
         out: Dict[str, Any] = {"dir": str(root)}
         pid_file = root / "soak.pid"
@@ -324,7 +365,8 @@ def main() -> int:
     me = os.getpid()  # unchanged across the driver's own exec-restart
     (root / "soak.pid").write_text(json.dumps({"pid": me, "start_token": procs.start_token(me)}))
     Soak(root, a.hours).run()
-    return 0
+    summary = json.loads((root / "summary.json").read_text())
+    return 0 if summary["verdict"] == "PASS" else 1
 
 
 if __name__ == "__main__":
