@@ -183,7 +183,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     ledger = Ledger(args.home)
     task_id = _resolve_task(ledger, args)
-    actions = [] if args.no_reconcile else reconcile_task(ledger, task_id, kick=False, spawn=None)
+    actions = [] if args.no_reconcile else reconcile_task(ledger, task_id, kick=True, spawn=_spawner(args.home))
     emit({"ok": True, **task_view(ledger, task_id), "reconcile": actions})
     return 0
 
@@ -209,10 +209,11 @@ def cmd_events(args: argparse.Namespace) -> int:
     consumer = _check_name("consumer", args.consumer)
     ledger = Ledger(args.home)
     if not args.no_reconcile:
+        # Polling is the recovery path too: an attempt that provably never started is kicked here.
         if args.task:
-            reconcile_task(ledger, args.task, kick=False, spawn=None)
+            reconcile_task(ledger, args.task, kick=True, spawn=_spawner(args.home))
         else:
-            reconcile_all(ledger, kick=False, spawn=None)
+            reconcile_all(ledger, kick=True, spawn=_spawner(args.home))
     rows = ledger.events_for(consumer, task_id=args.task, include_acked=args.include_acked)
     warning = None
     try:
