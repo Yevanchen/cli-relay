@@ -247,18 +247,35 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         att = ledger.get_attempt(att["attempt_id"])
         keeper_alive = procs.same_process_alive(att["keeper_pid"], att["keeper_token"])
         if keeper_alive is True:
-            os.kill(att["keeper_pid"], signal.SIGUSR1)
+            os.kill(att["keeper_pid"], signal.SIGUSR1)  # the keeper stops the CLI and records the outcome
             signalled = "keeper"
-        elif keeper_alive is False and att["keeper_pgid"] and procs.group_alive(att["keeper_pgid"]):
-            # The keeper is gone but its process group (the CLI) is still there.
-            os.killpg(att["keeper_pgid"], signal.SIGTERM)
-            signalled = "orphan_process_group"
+        elif keeper_alive is False:
+            signalled = _signal_verified_orphan(att)
     elif result == "not_cancellable":
         raise Refused("not_cancellable", "the current attempt is not running", state=att["state"],
                       outcome=att["outcome"])
     emit({"ok": True, "result": result, "signalled": signalled, "task_id": task_id,
           "attempt_no": att["attempt_no"], "event_id": event_id})
     return 0
+
+
+def _signal_verified_orphan(att: Dict[str, Any]) -> str:
+    """SIGTERM a CLI whose keeper is gone, but only after proving it is still the recorded process.
+
+    The whole process group is signalled only while the verified CLI is still a member of the
+    recorded group: a group id cannot be reused while a member exists, so the group is ours.
+    Without a verified CLI nothing is signalled (a stale pid or pgid may belong to anyone now).
+    """
+    if not att["cli_pid"] or procs.same_process_alive(att["cli_pid"], att["cli_token"]) is not True:
+        return "none"
+    try:
+        if att["keeper_pgid"] and os.getpgid(att["cli_pid"]) == att["keeper_pgid"]:
+            os.killpg(att["keeper_pgid"], signal.SIGTERM)
+            return "orphan_process_group"
+        os.kill(att["cli_pid"], signal.SIGTERM)
+        return "orphan_cli"
+    except (ProcessLookupError, PermissionError):
+        return "none"
 
 
 def cmd_resume(args: argparse.Namespace) -> int:

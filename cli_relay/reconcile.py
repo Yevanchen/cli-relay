@@ -124,6 +124,15 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
         action.update(action="finished_from_native_result_exit_unknown", event_id=eid)
         return action
 
+    if cancel_requested:
+        # A cancel was requested and the run has stopped without producing a result.
+        eid = ledger.finish(att["attempt_id"], from_states=(state,), outcome="cancelled", exit_known=False,
+                            evidence={"exit_source": "unavailable_keeper_lost",
+                                      "stopped_after_cancel_without_result": True, "reconciled_at": now_iso()},
+                            source="reconcile")
+        action.update(action="finished_cancelled_without_result", event_id=eid)
+        return action
+
     try:
         stdout_bytes = (run_dir / "stdout.jsonl").stat().st_size
     except OSError:
