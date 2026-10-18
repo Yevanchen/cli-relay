@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cli-relay"
+version = "0.1.0"
+description = "Thin local ledger that keeps official coding-CLI task results until a consumer acknowledges them"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "Yevanchen" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+]
+
+[project.scripts]
+cli-relay = "cli_relay.cli:main"
+
+[tool.setuptools]
+packages = ["cli_relay"]

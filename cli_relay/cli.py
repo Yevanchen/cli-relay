@@ -1,0 +1,450 @@
+"""JSON command line: init, submit, status, wait, events, ack, cancel, resume, reconcile, doctor.
+
+Every command prints exactly one JSON object on stdout. Exit codes: 0 ok, 1 internal error,
+2 usage, 3 conflict, 4 not found, 5 ledger/storage error, 6 refused (precondition not met).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from . import __version__, engines, procs
+from .errors import NotFound, Refused, RelayError, UsageError
+from .keeper import _hook
+from .ledger import Ledger, init_ledger
+from .reconcile import old_run_stopped, reconcile_all, reconcile_task
+from .spawn import SpawnFailed, spawn_keeper
+
+MAX_PROMPT_BYTES = 1 << 20
+_NAME_RE = re.compile(r"^[A-Za-z0-9._:@/+-]{1,64}$")
+
+
+def default_home() -> Path:
+    return Path(os.environ.get("CLI_RELAY_HOME") or (Path.home() / ".cli-relay"))
+
+
+def emit(obj: Dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False, sort_keys=True) + "\n")
+    sys.stdout.flush()
+
+
+def _check_name(kind: str, value: str) -> str:
+    if not _NAME_RE.match(value or ""):
+        raise UsageError(f"invalid {kind}: use 1-64 chars of [A-Za-z0-9._:@/+-]")
+    return value
+
+
+def _check_key(value: str) -> str:
+    if not value or len(value) > 256 or any(ord(ch) < 32 for ch in value):
+        raise UsageError("invalid key: 1-256 printable characters")
+    return value
+
+
+def _read_prompt(args: argparse.Namespace) -> str:
+    if (args.prompt is None) == (args.prompt_file is None):
+        raise UsageError("give exactly one of --prompt or --prompt-file")
+    if args.prompt_file is not None:
+        try:
+            data = Path(args.prompt_file).read_bytes()
+        except OSError as exc:
+            raise UsageError("cannot read --prompt-file", error=str(exc)) from exc
+    else:
+        data = args.prompt.encode("utf-8")
+    if not data.strip():
+        raise UsageError("prompt is empty")
+    if len(data) > MAX_PROMPT_BYTES:
+        raise UsageError("prompt is larger than 1 MiB")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise UsageError("prompt must be UTF-8") from exc
+
+
+def _parse_options(items: List[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for item in items or []:
+        key, sep, raw = item.partition("=")
+        if not sep or not key:
+            raise UsageError(f"--option expects key=value, got {item!r}")
+        try:
+            value: Any = json.loads(raw)
+        except ValueError:
+            value = raw
+        out[key] = value
+    return out
+
+
+def _loads(text: Optional[str]) -> Any:
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return {"unparsable": text[:200]}
+
+
+def attempt_view(a: Dict[str, Any], probe: bool = True) -> Dict[str, Any]:
+    active = a["state"] in ("claimed", "running")
+    keeper_alive = procs.same_process_alive(a["keeper_pid"], a["keeper_token"]) if probe and active else None
+    cli_alive = procs.same_process_alive(a["cli_pid"], a["cli_token"]) if probe and active and a["cli_pid"] else None
+    return {
+        "attempt_no": a["attempt_no"], "attempt_id": a["attempt_id"], "reason": a["reason"], "state": a["state"],
+        "outcome": a["outcome"], "host": a["host"], "cwd": a["cwd"],
+        "native_session_id": a["native_session_id"], "resume_session_id": a["resume_session_id"],
+        "keeper": {"pid": a["keeper_pid"], "pgid": a["keeper_pgid"], "alive": keeper_alive},
+        "cli": {"pid": a["cli_pid"], "alive": cli_alive},
+        "exit": {"code": a["exit_code"], "signal": a["exit_signal"], "known": bool(a["exit_known"])},
+        "native": _loads(a["native_result_json"]), "evidence": _loads(a["evidence_json"]),
+        "cancel_requested_at": a["cancel_requested_at"], "created_at": a["created_at"],
+        "claimed_at": a["claimed_at"], "spawn_started_at": a["spawn_started_at"],
+        "started_at": a["started_at"], "ended_at": a["ended_at"],
+    }
+
+
+def task_view(ledger: Ledger, task_id: str, probe: bool = True) -> Dict[str, Any]:
+    t = ledger.get_task(task_id)
+    return {
+        "task": {k: t[k] for k in ("task_id", "scope", "engine", "cwd", "state", "current_attempt", "submit_count",
+                                   "payload_sha256", "created_at", "updated_at")} | {"key": t["request_key"]},
+        "attempts": [attempt_view(a, probe) for a in ledger.attempts(task_id)],
+        "events": [{"event_id": e["event_id"], "attempt_no": e["attempt_no"], "kind": e["kind"],
+                    "created_at": e["created_at"], "acked_by": e["acked_by"], "body": _loads(e["body_json"])}
+                   for e in ledger.events_of_task(task_id)],
+    }
+
+
+def _spawner(home: Path):
+    def spawn(task_id: str, attempt_id: str) -> None:
+        spawn_keeper(home, task_id, attempt_id)
+    return spawn
+
+
+def _resolve_task(ledger: Ledger, args: argparse.Namespace) -> str:
+    if getattr(args, "task_id", None):
+        return ledger.get_task(args.task_id)["task_id"]
+    if getattr(args, "key", None):
+        return ledger.find_task(args.scope, args.key)["task_id"]
+    raise UsageError("give a task id or --key")
+
+
+# ------------------------------------------------------------------------------- commands
+def cmd_init(args: argparse.Namespace) -> int:
+    emit({"ok": True, **init_ledger(args.home)})
+    return 0
+
+
+def cmd_submit(args: argparse.Namespace) -> int:
+    engine = engines.validate_engine(args.engine)
+    scope = _check_name("scope", args.scope)
+    key = _check_key(args.key)
+    prompt = _read_prompt(args)
+    cwd = os.path.realpath(args.cwd)
+    if not os.path.isdir(cwd):
+        raise UsageError("--cwd must be an existing directory")
+    options = engines.validate_options(engine, _parse_options(args.option))
+    payload = {"engine": engine, "cwd": cwd, "prompt": prompt, "options": options}
+    ledger = Ledger(args.home, integrity=True)
+    ledger.check_disk()
+    native_sid = str(uuid.uuid4()) if engine in ("claude", "fixture") else None
+    status, task, sha = ledger.submit(scope=scope, key=key, payload=payload, prompt=prompt,
+                                      native_session_id=native_sid)
+    _hook("submit_after_commit")  # fault injection: committed, keeper not yet started, no response sent
+    keeper = "already_started"
+    att = ledger.current_attempt(task["task_id"])
+    if status == "created":
+        try:
+            spawn_keeper(args.home, task["task_id"], att["attempt_id"])
+            keeper = "spawned"
+        except SpawnFailed:
+            keeper = "spawn_failed_retry_with_same_key"
+    else:
+        actions = reconcile_task(ledger, task["task_id"], kick=True, spawn=_spawner(args.home))
+        if any(a["action"] in ("kicked_keeper", "released_claim_and_kicked") for a in actions):
+            keeper = "kicked"
+        task = ledger.get_task(task["task_id"])
+        att = ledger.current_attempt(task["task_id"])
+    emit({"ok": True, "accepted": True, "status": status, "task_id": task["task_id"], "state": task["state"],
+          "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
+          "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper})
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    ledger = Ledger(args.home)
+    task_id = _resolve_task(ledger, args)
+    actions = [] if args.no_reconcile else reconcile_task(ledger, task_id, kick=False, spawn=None)
+    emit({"ok": True, **task_view(ledger, task_id), "reconcile": actions})
+    return 0
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    ledger = Ledger(args.home)
+    task_id = _resolve_task(ledger, args)
+    deadline = time.monotonic() + max(0.0, args.timeout)
+    while True:
+        reconcile_task(ledger, task_id, kick=True, spawn=_spawner(args.home))
+        state = ledger.get_task(task_id)["state"]
+        if state not in ("accepted", "running"):
+            emit({"ok": True, "timed_out": False, **task_view(ledger, task_id)})
+            return 0
+        if time.monotonic() >= deadline:
+            # Waiting stops here; the task itself keeps running.
+            emit({"ok": True, "timed_out": True, **task_view(ledger, task_id)})
+            return 0
+        time.sleep(max(0.05, min(args.interval, deadline - time.monotonic())))
+
+
+def cmd_events(args: argparse.Namespace) -> int:
+    consumer = _check_name("consumer", args.consumer)
+    ledger = Ledger(args.home)
+    if not args.no_reconcile:
+        if args.task:
+            reconcile_task(ledger, args.task, kick=False, spawn=None)
+        else:
+            reconcile_all(ledger, kick=False, spawn=None)
+    rows = ledger.events_for(consumer, task_id=args.task, include_acked=args.include_acked)
+    warning = None
+    try:
+        counts = ledger.record_deliveries(consumer, [r["event_id"] for r in rows])
+    except RelayError as exc:  # delivery bookkeeping is best effort; never hide events because of it
+        counts, warning = {}, exc.code
+    events = [{"event_id": r["event_id"], "task_id": r["task_id"], "attempt_no": r["attempt_no"], "kind": r["kind"],
+               "created_at": r["created_at"], "acked_at": r["acked_at"],
+               "superseded": r["attempt_no"] < r["current_attempt"], "delivery_count": counts.get(r["event_id"]),
+               "body": _loads(r["body_json"])} for r in rows]
+    out: Dict[str, Any] = {"ok": True, "consumer": consumer, "events": events}
+    if warning:
+        out["warning"] = warning
+    emit(out)
+    return 0
+
+
+def cmd_ack(args: argparse.Namespace) -> int:
+    consumer = _check_name("consumer", args.consumer)
+    ledger = Ledger(args.home)
+    res = ledger.ack(task_id=args.task, attempt_no=args.attempt, event_id=args.event, consumer=consumer)
+    emit({"ok": True, "acked": True, **res})
+    return 0
+
+
+def cmd_cancel(args: argparse.Namespace) -> int:
+    ledger = Ledger(args.home)
+    task_id = _resolve_task(ledger, args)
+    result, att, event_id = ledger.request_cancel(task_id)
+    signalled = "none"
+    if result == "cancel_requested":
+        att = ledger.get_attempt(att["attempt_id"])
+        keeper_alive = procs.same_process_alive(att["keeper_pid"], att["keeper_token"])
+        if keeper_alive is True:
+            os.kill(att["keeper_pid"], signal.SIGUSR1)
+            signalled = "keeper"
+        elif keeper_alive is False and att["keeper_pgid"] and procs.group_alive(att["keeper_pgid"]):
+            # The keeper is gone but its process group (the CLI) is still there.
+            os.killpg(att["keeper_pgid"], signal.SIGTERM)
+            signalled = "orphan_process_group"
+    elif result == "not_cancellable":
+        raise Refused("not_cancellable", "the current attempt is not running", state=att["state"],
+                      outcome=att["outcome"])
+    emit({"ok": True, "result": result, "signalled": signalled, "task_id": task_id,
+          "attempt_no": att["attempt_no"], "event_id": event_id})
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    ledger = Ledger(args.home, integrity=True)
+    ledger.check_disk()
+    task_id = _resolve_task(ledger, args)
+    task = ledger.get_task(task_id)
+    att = ledger.current_attempt(task_id)
+    if att["state"] in ("pending", "claimed", "running"):
+        raise Refused("attempt_active", "the current attempt is still active; wait or cancel first",
+                      state=att["state"])
+    proof = old_run_stopped(att)
+    deadline = time.monotonic() + 10.0
+    while not proof["stopped"] and att["state"] == "finished" and time.monotonic() < deadline:
+        time.sleep(0.2)  # a keeper that just committed its result is still exiting
+        proof = old_run_stopped(att)
+    if not proof["stopped"]:
+        raise Refused("old_run_may_be_alive", "cannot prove the previous run stopped; refusing to resume", **proof)
+    if args.fresh:
+        if not args.confirm_rerun:
+            raise Refused("rerun_not_confirmed",
+                          "--fresh starts a new native session from the original prompt and may repeat side "
+                          "effects; add --confirm-rerun to proceed")
+        payload = json.loads(task["payload_json"])
+        prompt = payload["prompt"]
+        resume_sid = None
+        native_sid = str(uuid.uuid4()) if task["engine"] in ("claude", "fixture") else None
+        reason = "rerun"
+    else:
+        prompt = _read_prompt(args)
+        resume_sid = att["native_session_id"]
+        if not resume_sid:
+            raise Refused("no_native_session", "the previous attempt has no recorded native session id; "
+                          "exact resume is impossible (use --fresh --confirm-rerun to start over)")
+        native_sid = resume_sid
+        reason = "resume"
+    new = ledger.new_attempt(task_id, expect_attempt_no=att["attempt_no"], reason=reason, prompt=prompt,
+                             resume_session_id=resume_sid, native_session_id=native_sid)
+    try:
+        spawn_keeper(args.home, task_id, new["attempt_id"])
+        keeper = "spawned"
+    except SpawnFailed:
+        keeper = "spawn_failed_run_reconcile"
+    emit({"ok": True, "task_id": task_id, "attempt_no": new["attempt_no"], "attempt_id": new["attempt_id"],
+          "reason": reason, "resume_session_id": resume_sid, "previous_attempt_stopped": proof, "keeper": keeper})
+    return 0
+
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    ledger = Ledger(args.home)
+    spawn = _spawner(args.home)
+    if args.task_id:
+        actions = reconcile_task(ledger, ledger.get_task(args.task_id)["task_id"], kick=True, spawn=spawn)
+    else:
+        actions = reconcile_all(ledger, kick=True, spawn=spawn)
+    emit({"ok": True, "actions": actions})
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    out: Dict[str, Any] = {"ok": True, "version": __version__, "python": platform.python_version(),
+                           "platform": platform.system()}
+    try:
+        ledger = Ledger(args.home, integrity=True)
+        out["ledger"] = {"home": str(args.home), "integrity": "ok"}
+        try:
+            ledger.check_disk()
+            out["disk"] = {"ok": True, "free_bytes": shutil.disk_usage(str(args.home)).free}
+        except RelayError as exc:
+            out["ok"] = False
+            out["disk"] = {"ok": False, **exc.detail}
+    except RelayError as exc:
+        out["ok"] = False
+        out["ledger"] = {"home": str(args.home), "error": exc.code, "message": exc.message}
+    if args.engine:
+        pf = engines.preflight(engines.validate_engine(args.engine), dict(os.environ))
+        out["engine"] = {"name": args.engine, "ok": pf.ok, "reason": pf.reason, **pf.detail}
+        out["ok"] = out["ok"] and pf.ok
+    emit(out)
+    return 0 if out["ok"] else 6
+
+
+def cmd_keeper(args: argparse.Namespace) -> int:
+    from .keeper import run
+    return run(args.home, args.task_id, args.attempt_id)
+
+
+# ------------------------------------------------------------------------------- parser
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:  # type: ignore[override]
+        raise UsageError(message)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = _Parser(prog="cli-relay", description=__doc__.splitlines()[0])
+    p.add_argument("--home", type=Path, default=None, help="ledger directory (default $CLI_RELAY_HOME or ~/.cli-relay)")
+    p.add_argument("--version", action="version", version=__version__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init", help="create the ledger").set_defaults(func=cmd_init)
+
+    s = sub.add_parser("submit", help="submit a task under an idempotency key")
+    s.add_argument("--key", required=True)
+    s.add_argument("--scope", default="default")
+    s.add_argument("--engine", required=True, choices=engines.ENGINES)
+    s.add_argument("--cwd", required=True)
+    s.add_argument("--prompt")
+    s.add_argument("--prompt-file")
+    s.add_argument("--option", action="append", default=[], metavar="KEY=VALUE")
+    s.set_defaults(func=cmd_submit)
+
+    for name, func, helptext in (("status", cmd_status, "show a task (reconciles first)"),
+                                 ("cancel", cmd_cancel, "cancel the current attempt")):
+        c = sub.add_parser(name, help=helptext)
+        c.add_argument("task_id", nargs="?")
+        c.add_argument("--key")
+        c.add_argument("--scope", default="default")
+        if name == "status":
+            c.add_argument("--no-reconcile", action="store_true")
+        c.set_defaults(func=func)
+
+    w = sub.add_parser("wait", help="wait for a terminal state; a timeout never stops the task")
+    w.add_argument("task_id", nargs="?")
+    w.add_argument("--key")
+    w.add_argument("--scope", default="default")
+    w.add_argument("--timeout", type=float, default=600.0)
+    w.add_argument("--interval", type=float, default=1.0)
+    w.set_defaults(func=cmd_wait)
+
+    e = sub.add_parser("events", help="list events not yet acknowledged by a consumer")
+    e.add_argument("--consumer", required=True)
+    e.add_argument("--task")
+    e.add_argument("--include-acked", action="store_true")
+    e.add_argument("--no-reconcile", action="store_true")
+    e.set_defaults(func=cmd_events)
+
+    a = sub.add_parser("ack", help="acknowledge an event (idempotent)")
+    a.add_argument("--consumer", required=True)
+    a.add_argument("--task", required=True)
+    a.add_argument("--attempt", required=True, type=int)
+    a.add_argument("--event", required=True)
+    a.set_defaults(func=cmd_ack)
+
+    r = sub.add_parser("resume", help="explicitly continue the exact native session in a new attempt")
+    r.add_argument("task_id", nargs="?")
+    r.add_argument("--key")
+    r.add_argument("--scope", default="default")
+    r.add_argument("--prompt")
+    r.add_argument("--prompt-file")
+    r.add_argument("--fresh", action="store_true", help="start a new native session from the original prompt")
+    r.add_argument("--confirm-rerun", action="store_true")
+    r.set_defaults(func=cmd_resume)
+
+    rc = sub.add_parser("reconcile", help="settle attempts whose keeper is gone; never re-runs")
+    rc.add_argument("task_id", nargs="?")
+    rc.set_defaults(func=cmd_reconcile)
+
+    d = sub.add_parser("doctor", help="check the ledger, disk space and (optionally) an engine's auth path")
+    d.add_argument("--engine", choices=engines.ENGINES)
+    d.set_defaults(func=cmd_doctor)
+
+    k = sub.add_parser("_keeper", help="(internal) supervise one attempt")
+    k.add_argument("task_id")
+    k.add_argument("attempt_id")
+    k.set_defaults(func=cmd_keeper)
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except UsageError as exc:
+        emit(exc.to_json())
+        return exc.exit_code
+    except SystemExit as exc:  # --help / --version
+        return int(exc.code or 0)
+    args.home = Path(args.home) if args.home else default_home()
+    try:
+        return int(args.func(args) or 0)
+    except RelayError as exc:
+        emit(exc.to_json())
+        return exc.exit_code
+    except KeyboardInterrupt:
+        emit({"ok": False, "error": "interrupted"})
+        return 130
+    except Exception as exc:  # pragma: no cover - last resort, still JSON
+        emit({"ok": False, "error": "internal", "message": f"{type(exc).__name__}: {exc}"})
+        return 1

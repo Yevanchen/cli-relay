@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Free GitHub-hosted runner only; no secrets, no network services, no model or API calls.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit and fault-injection tests (fixture engine, real OS processes)
+        run: python -m unittest discover -s tests -t tests -v
+      - name: Scaled-down soak smoke (about two minutes; not the 25 h soak)
+        run: |
+          python scripts/soak.py run --dir "$RUNNER_TEMP/soak" --hours 0.03
+          python scripts/soak.py status --dir "$RUNNER_TEMP/soak"
+          python -c "import json,sys; s=json.load(open(sys.argv[1])); sys.exit(0 if s['verdict']=='PASS' else 1)" "$RUNNER_TEMP/soak/summary.json"

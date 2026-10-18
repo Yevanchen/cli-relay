@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.cli-relay/
+# local run artifacts (ledgers, transcripts, soak output) never belong in the repository
+*.db
+*.db-wal
+*.db-shm
+soak-*/
