@@ -499,6 +499,11 @@ class Ledger:
                      exit_known: bool, native: Optional[Dict[str, Any]], evidence: Optional[Dict[str, Any]],
                      source: str) -> str:
         now = now_iso()
+        if kind == "terminal" and att["cancel_requested_at"] and outcome != "cancelled":
+            # Decided inside the closing transaction: a cancel committed after the closer chose its
+            # outcome (but before this commit) is still visible here, and one committed after this
+            # commit finds the attempt finished and is refused as not cancellable.
+            evidence = dict(evidence or {}, cancel_lost_race=True)
         cur = c.execute(
             "UPDATE attempts SET state=?, outcome=?, exit_code=?, exit_signal=?, exit_known=?, "
             "native_result_json=COALESCE(?, native_result_json), evidence_json=?, "

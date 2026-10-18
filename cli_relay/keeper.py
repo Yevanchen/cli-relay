@@ -210,6 +210,7 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         evidence["cancel_lost_race"] = True
     if parsed["init"]:
         evidence["init"] = parsed["init"]
+    _hook("before_finish_commit")
     ledger.finish(attempt_id, from_states=("running", "claimed", "unknown"), outcome=outcome,
                   exit_code=exit_info["exit_code"], exit_signal=exit_info["signal"], exit_known=True,
                   native=parsed["native"], evidence=evidence, source="keeper")
