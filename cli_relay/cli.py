@@ -1,7 +1,8 @@
 """JSON command line: init, submit, status, wait, events, ack, cancel, resume, reconcile, doctor.
 
-Every command prints exactly one JSON object on stdout. Exit codes: 0 ok, 1 internal error,
-2 usage, 3 conflict, 4 not found, 5 ledger/storage error, 6 refused (precondition not met).
+Every command prints exactly one JSON object on stdout (only --help and --version print text).
+Exit codes: 0 ok, 1 internal error, 2 usage, 3 conflict, 4 not found, 5 ledger/storage error,
+6 refused (precondition not met), 130 interrupted.
 """
 
 from __future__ import annotations

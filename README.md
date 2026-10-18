@@ -49,8 +49,17 @@ cli-relay resume t-… --prompt "Continue with the next failing test."   # exact
 cli-relay cancel t-…
 ```
 
-Every command prints one JSON object. Exit codes: `0` ok, `2` usage, `3` key conflict, `4` not
-found, `5` ledger or storage error, `6` refused (a precondition does not hold).
+Every command prints exactly one JSON object on stdout. Only `--help` and `--version` print
+plain text. Exit codes:
+
+- `0` ok
+- `1` internal error (`"error": "internal"`)
+- `2` usage
+- `3` key conflict
+- `4` not found
+- `5` ledger or storage error
+- `6` refused (a precondition does not hold)
+- `130` interrupted
 
 ## Engines
 
