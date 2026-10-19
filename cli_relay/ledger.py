@@ -551,6 +551,13 @@ class Ledger:
             att = c.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
             if att is None or att["state"] not in from_states:
                 return None
+            if att["cancel_requested_at"]:
+                # The caller decided from an earlier snapshot; a cancel committed since then is seen
+                # here. A run that stopped without a result after a cancel is `cancelled`.
+                return self._close_in_tx(c, att, new_state="finished", kind="terminal", outcome="cancelled",
+                                         exit_code=None, exit_signal=None, exit_known=False, native=None,
+                                         evidence={**evidence, "stopped_after_cancel_without_result": True},
+                                         source="reconcile")
             return self._close_in_tx(c, att, new_state="unknown", kind="unknown", outcome=None,
                                      exit_code=None, exit_signal=None, exit_known=False, native=None,
                                      evidence=evidence, source="reconcile")

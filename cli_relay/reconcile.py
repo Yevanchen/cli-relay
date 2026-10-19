@@ -36,6 +36,15 @@ def _evidence(att: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
 
+def _may_still_run(att: Dict[str, Any], cli_alive: Optional[bool] = None, group_alive: Optional[bool] = None,
+                   probe: bool = True) -> bool:
+    """Whether the attempt's CLI may still be running (its keeper is known to be gone)."""
+    if probe:
+        cli_alive = procs.same_process_alive(att["cli_pid"], att["cli_token"]) if att["cli_pid"] else None
+        group_alive = procs.group_alive(att["keeper_pgid"])
+    return cli_alive is True or (cli_alive is None and group_alive is not False)
+
+
 def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
                       spawn: Optional[Spawner]) -> Dict[str, Any]:
     action: Dict[str, Any] = {"task_id": att["task_id"], "attempt_no": att["attempt_no"],
@@ -99,6 +108,13 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
                                 native=native, evidence={"late_native_result_at": now_iso(), **decided},
                                 source="reconcile")
             action.update(action="finished_from_late_native_result", event_id=eid)
+        elif cancel_requested and not _may_still_run(att):
+            # Left `unknown` with a cancel recorded (a race in earlier versions): the run stopped
+            # without a result after a cancel.
+            eid = ledger.finish(att["attempt_id"], from_states=("unknown",), outcome="cancelled", exit_known=False,
+                                evidence={"stopped_after_cancel_without_result": True,
+                                          "converged_from_unknown_at": now_iso()}, source="reconcile")
+            action.update(action="finished_cancelled_after_unknown", event_id=eid)
         return action
 
     if state == "claimed" and not att["spawn_started_at"]:
@@ -115,9 +131,7 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
     cli_alive = procs.same_process_alive(att["cli_pid"], att["cli_token"]) if att["cli_pid"] else None
     group_alive = procs.group_alive(att["keeper_pgid"])
     action.update(cli_alive=cli_alive, group_alive=group_alive)
-    maybe_running = (cli_alive is True
-                     or (cli_alive is None and group_alive is not False))
-    if maybe_running:
+    if _may_still_run(att, cli_alive, group_alive, probe=False):
         if "keeper_lost_at" not in _evidence(att):
             ledger.add_evidence(att["attempt_id"], {"keeper_lost_at": now_iso(), "cli_running_without_keeper": True})
         action["action"] = "observing_cli_without_keeper"
