@@ -41,6 +41,60 @@ DB_NAME = "ledger.db"
 DEFAULT_MIN_FREE_BYTES = 64 * 1024 * 1024
 RESULT_EXCERPT_CHARS = 2000
 
+# The notifier extension (v0.2) is additive: new tables, new indexes and one nullable column.
+# schema_version stays 1 because v0.1.0 checks exactly that and ignores what it does not know,
+# so v0.1.0 can still open a migrated ledger. That is the rollback path.
+NOTIFIER_SCHEMA = "1"
+NOTIFIER_DDL = (
+    """CREATE TABLE IF NOT EXISTS notifications (
+  event_id TEXT NOT NULL REFERENCES events(event_id),
+  route TEXT NOT NULL,
+  state TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  wakes INTEGER NOT NULL DEFAULT 0,
+  reminder INTEGER NOT NULL DEFAULT 0,
+  next_at TEXT,
+  claimed_by INTEGER,
+  claimed_token TEXT,
+  claim_id TEXT,
+  claimed_at TEXT,
+  last_result_json TEXT,
+  first_sent_at TEXT,
+  last_sent_at TEXT,
+  accepted_at TEXT,
+  acked_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (event_id, route)
+)""",
+    "CREATE INDEX IF NOT EXISTS notifications_due ON notifications (state, next_at)",
+    "CREATE INDEX IF NOT EXISTS notifications_by_claim ON notifications (claim_id)",
+    """CREATE TABLE IF NOT EXISTS notification_sends (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL,
+  route TEXT NOT NULL,
+  claim_id TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  outcome TEXT,
+  detail_json TEXT
+)""",
+    "CREATE INDEX IF NOT EXISTS events_by_created ON events (created_at)",
+)
+
+
+def _apply_notifier_extension(c: sqlite3.Connection, cutoff: str) -> None:
+    """Inside an open transaction: idempotent."""
+    for stmt in NOTIFIER_DDL:
+        c.execute(stmt)
+    columns = {r[1] for r in c.execute("PRAGMA table_info(tasks)").fetchall()}
+    if "notify_route" not in columns:
+        c.execute("ALTER TABLE tasks ADD COLUMN notify_route TEXT")
+    c.execute("INSERT OR IGNORE INTO meta (k, v) VALUES ('notifier_schema', ?)", (NOTIFIER_SCHEMA,))
+    c.execute("INSERT OR IGNORE INTO meta (k, v) VALUES ('notifier_cutoff', ?)", (cutoff,))
+    c.execute("INSERT OR IGNORE INTO meta (k, v) VALUES ('notifier_migrated_at', ?)", (now_iso(),))
+
+
 ACTIVE_STATES = ("pending", "claimed", "running")
 _TASK_STATE = {"pending": "accepted", "claimed": "running", "running": "running", "unknown": "unknown"}
 
@@ -246,6 +300,9 @@ def init_ledger(home: Path) -> Dict[str, Any]:
             "BEGIN IMMEDIATE;\n" + SCHEMA
             + f"\nINSERT INTO meta (k, v) VALUES ('schema_version', '{SCHEMA_VERSION}');"
             + f"\nINSERT INTO meta (k, v) VALUES ('created_at', '{now_iso()}');\nCOMMIT;\n")
+        conn.execute("BEGIN IMMEDIATE")
+        _apply_notifier_extension(conn, cutoff="")  # a new ledger notifies from its first event
+        conn.execute("COMMIT")
     except sqlite3.Error as exc:
         _rollback(conn)
         raise _mapped(exc) from exc
@@ -269,6 +326,7 @@ class Ledger:
             raise LedgerCorrupt("ledger marker is unreadable", error=str(exc)) from exc
         if meta.get("format") != FORMAT:
             raise LedgerCorrupt("ledger marker has an unexpected format")
+        self.ledger_id = str(meta.get("ledger_id") or "")
         self.db_path = self.home / DB_NAME
         if not self.db_path.exists():
             raise LedgerMissing("ledger database is missing; refusing to create an empty one", home=str(self.home))
@@ -334,6 +392,54 @@ class Ledger:
     def run_dir(self, task_id: str, attempt_no: int) -> Path:
         return self.home / "runs" / task_id / str(attempt_no)
 
+    # ------------------------------------------------------------------ notifier extension
+    def _meta(self, key: str) -> Optional[str]:
+        row = self.conn.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+        return None if row is None else str(row[0])
+
+    def has_notifier(self) -> bool:
+        return self._meta("notifier_schema") == NOTIFIER_SCHEMA
+
+    def require_notifier(self) -> None:
+        if not self.has_notifier():
+            raise Refused("not_migrated", "this ledger has no notifier tables yet; run `cli-relay migrate` first")
+
+    def notifier_cutoff(self) -> str:
+        return self._meta("notifier_cutoff") or ""
+
+    def task_routes(self, task_ids: Sequence[str]) -> Dict[str, Optional[str]]:
+        ids = sorted(set(task_ids))
+        if not ids or not self.has_notifier():
+            return {}
+        rows = self.conn.execute(f"SELECT task_id, notify_route FROM tasks WHERE task_id IN ({','.join('?' * len(ids))})",
+                                 tuple(ids)).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def migrate(self, *, backfill: bool = False) -> Dict[str, Any]:
+        """Add the notifier extension to a v0.1 ledger. A consistent copy (SQLite backup API, not a
+        file copy of the live WAL database) is written first. Events created before the
+        migration are not notified unless ``backfill``. Idempotent."""
+        if self.has_notifier():
+            return {"migrated": False, "already": True, "cutoff": self.notifier_cutoff()}
+        self.check_disk()
+        backups = self.home / "backups"
+        backups.mkdir(mode=0o700, exist_ok=True)
+        stamp = now_iso().replace(":", "").replace("-", "").replace(".", "")
+        dest_path = backups / f"ledger-{stamp}-before-notifier.db"
+        dest = sqlite3.connect(str(dest_path))
+        try:
+            self.conn.backup(dest)
+        except sqlite3.Error as exc:
+            raise _mapped(exc) from exc
+        finally:
+            dest.close()
+        os.chmod(str(dest_path), 0o600)
+        cutoff = "" if backfill else now_iso()
+        with self.tx() as c:
+            _apply_notifier_extension(c, cutoff=cutoff)
+        return {"migrated": True, "backup": str(dest_path), "cutoff": cutoff, "schema_version": SCHEMA_VERSION,
+                "notifier_schema": NOTIFIER_SCHEMA}
+
     # ------------------------------------------------------------------ reads
     def get_task(self, task_id: str) -> Dict[str, Any]:
         row = _row(self.conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())
@@ -383,9 +489,12 @@ class Ledger:
 
     # ------------------------------------------------------------------ submit
     def submit(self, *, scope: str, key: str, payload: Dict[str, Any], prompt: str,
-               native_session_id: Optional[str]) -> Tuple[str, Dict[str, Any], str]:
+               native_session_id: Optional[str], notify_route: Optional[str] = None) -> Tuple[str, Dict[str, Any], str]:
         """Returns (status, task, payload_sha256) with status in created|duplicate|conflict.
-        The caller may only report "accepted" after this returns (i.e. after COMMIT)."""
+        The caller may only report "accepted" after this returns (i.e. after COMMIT).
+        ``notify_route`` is routing metadata, not payload: a duplicate keeps the first one."""
+        if notify_route is not None:
+            self.require_notifier()
         sha = payload_hash(payload)
         now = now_iso()
         with self.tx() as c:
@@ -406,6 +515,8 @@ class Ledger:
                     "state, current_attempt, submit_count, created_at, updated_at) "
                     "VALUES (?,?,?,?,?,?,?,'accepted',1,1,?,?)",
                     (task_id, scope, key, sha, canonical_json(payload), payload["engine"], payload["cwd"], now, now))
+                if notify_route is not None:
+                    c.execute("UPDATE tasks SET notify_route=? WHERE task_id=?", (notify_route, task_id))
                 c.execute(
                     "INSERT INTO attempts (attempt_id, task_id, attempt_no, reason, state, prompt, native_session_id, "
                     "cwd, created_at, updated_at) VALUES (?,?,1,'initial','pending',?,?,?,?,?)",

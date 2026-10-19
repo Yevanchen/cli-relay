@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 from . import engines, procs
 from .errors import RelayError
 from .ledger import Ledger, atomic_write_text, canonical_json, now_iso
+from .spawn import spawn_notifier_pass
 
 CANCEL_GRACE_S = 10.0
 POLL_S = 0.2
@@ -104,8 +105,14 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     log = _Log(run_dir / "keeper.log")
     env = dict(os.environ)
 
+    def notify_pass() -> None:
+        # A terminal event was committed: wake the consumer now rather than at the next periodic pass.
+        if (Path(home) / "notifier.json").is_file():
+            spawn_notifier_pass(home)
+
     def close(outcome: str, evidence: Dict[str, Any]) -> None:
         ledger.finish(attempt_id, from_states=("claimed",), outcome=outcome, evidence=evidence, source="keeper")
+        notify_pass()
 
     try:
         ledger.check_integrity()
@@ -295,4 +302,5 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
                   native=parsed["native"], evidence=evidence, source="keeper")
     log(f"finished outcome={outcome} exit={exit_info}")
     _hook("after_commit")
+    notify_pass()
     return 0
