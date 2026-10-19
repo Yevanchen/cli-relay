@@ -85,16 +85,20 @@ def _proc_info(pid: int) -> Optional[Tuple[str, str]]:
 
 
 def _compare_tokens(recorded: str, current: str) -> Optional[bool]:
-    """Same process? None when the two tokens do not come from the same source and precision."""
+    """Same process? None when the two tokens do not come from the same source and precision, or
+    when either lacks a part: an identity with a missing part proves nothing, even if both sides
+    are missing the same part."""
     source, _, rest = recorded.partition(":")
     cur_source, _, cur_rest = current.partition(":")
-    if source != cur_source:
+    if source != cur_source or not rest or not cur_rest:
         return None
     if source == "linux":
         boot, _, start = rest.rpartition(":")
         cur_boot, _, cur_start = cur_rest.rpartition(":")
+        if not (boot and cur_boot and start and cur_start):
+            return None  # e.g. the boot id could not be read
         if boot != cur_boot:
-            return False if boot and cur_boot else None  # a different boot means the process is gone
+            return False  # a different boot means the recorded process is gone
         return start == cur_start
     return rest == cur_rest
 
