@@ -162,8 +162,14 @@ Permission posture does not depend on the CLIs' configuration of the moment:
 - Codex always gets an explicit sandbox: `read-only` unless the task asks for
   `workspace-write`. The same sandbox is passed on resume, both as the exec-level option and
   as a `sandbox_mode` override, because `codex exec resume` has no sandbox option of its own.
-- A Claude settings layer whose `permissions.defaultMode` is `bypassPermissions`, or an init
-  event reporting that mode, blocks the run. In that mode nothing would ever be denied.
+- Claude always gets `--permission-mode dontAsk --permission-prompts none`, including resume.
+  Preflight only accepts a user/project bypass default because that fixed CLI override replaces
+  it. A conflicting managed mode, a stricter `plan` default, and malformed checked settings
+  still block. User/project settings
+  and their allow/ask/deny rules remain loaded; the relay does not isolate HOME, copy credentials,
+  skip setting sources, or bypass approvals. Existing allowed tools can still run.
+  Every Claude run must report `permissionMode: dontAsk` in its init event; a mismatch or missing
+  init blocks, including when reconciliation closes the attempt after a keeper crash.
 - `danger-full-access` and every permission-bypass flag are rejected in argv.
 - `--sandbox` is not the only thing that decides a Codex run's permissions: named permission
   profiles and requirements can take precedence. Codex runs are checked on both sides:
@@ -198,7 +204,7 @@ away from the subscription login. It checks:
      - An unreadable layer or an invalid checked routing/permission value blocks. This is
        not a complete validator for every value accepted by the vendor configuration format.
    - the login (`claude auth status` → claude.ai / firstParty; `codex login status` → ChatGPT).
-2. **While it runs:** a Claude init event that reports an API-key source (or bypass mode)
+2. **While it runs:** a Claude init event that reports an API-key source or a different permission mode
    stops the CLI.
 3. **After it ran:** the Codex thread's own record must name `openai`
    (`session_meta.model_provider` in its rollout) and show the requested sandbox for every turn.
@@ -208,6 +214,18 @@ The keeper and reconciliation name the outcome through one function. The guard r
 therefore the same even when the keeper died before committing: the init event is re-read
 from the saved output, the guard the keeper tripped is kept in `exit.json`, and the Codex
 record is looked up where the keeper's run wrote it.
+
+Task-local `model` and `effort` options are reused on exact resume. For Claude, the effort flag
+is paired with a generated CLI settings layer containing only `env.CLAUDE_CODE_EFFORT_LEVEL`;
+it takes precedence over user/project environment defaults while leaving credentials and rules
+alone. A conflicting managed environment override or a lower `maxEffortLevel` from any checked
+settings layer blocks at preflight: the lowest cap applies, even below managed scope.
+Codex accepts only enumerated effort and safe sandbox config overrides.
+These settings express the requested model/effort; provider availability and server-delivered
+limits need real-run evidence. In particular, Claude may silently clamp effort under organization
+policy in stream-json output. See the official [settings precedence](https://code.claude.com/docs/en/settings),
+[effort environment variable](https://code.claude.com/docs/en/env-vars), and
+[effort limits](https://code.claude.com/docs/en/model-config#organization-effort-limits).
 
 Limits:
 - cli-relay reads the configuration files itself; it does not run the CLIs' own config

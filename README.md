@@ -104,7 +104,7 @@ plain text. Exit codes:
 
 | Engine | Runs | Resume |
 |---|---|---|
-| `claude` | `claude -p --output-format stream-json --verbose --session-id <uuid> --permission-prompts none` (prompt on stdin) | `--resume <exact uuid>` |
+| `claude` | `claude -p --output-format stream-json --verbose --session-id <uuid> --permission-mode dontAsk --permission-prompts none` (prompt on stdin) | `--resume <exact uuid>` (same permission mode) |
 | `codex` | `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, where `<s>` is `read-only` unless the task asks for `workspace-write` | `codex exec --sandbox <s> resume -c sandbox_mode="<s>" --json -o <file> <exact id> -` (same `<s>`) |
 | `fixture` | a deterministic local stand-in used by tests and the soak run | same, against its own state |
 
@@ -112,7 +112,11 @@ Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--sandb
 danger-full-access`, `--continue`, `--last`, `--bare`.
 - The Codex sandbox is always passed explicitly, so neither the first run nor a resume takes it
   from the configuration of the moment.
-- A Claude settings layer or init event reporting `bypassPermissions` blocks the run.
+- Claude always pins `dontAsk` for the task, including resume. This overrides a user/project
+  bypass default while retaining their settings, permission rules and subscription login.
+  A conflicting managed mode, a stricter `plan` default, malformed checked settings, and a
+  missing/mismatched runtime mode still block the run. `dontAsk` permits tools already allowed
+  by the existing rules; it is not a no-tools mode or a filesystem sandbox.
 - Claude: permission prompts that nobody can answer are denied by the CLI. A result that lists
   permission denials ends as `needs_input`, even if the CLI also reports an error.
 - Codex: the `codex exec --json` events that cli-relay reads carry no structured permission
@@ -132,6 +136,25 @@ danger-full-access`, `--continue`, `--last`, `--bare`.
   cannot verify that attempt. Before the run, a Codex permission setting, requirements layer, or an unsafe or unreadable selected profile blocks it.
 - These outcomes do not depend on whether the keeper survived: reconciliation applies the same
   checks. See [`docs/reliability.md`](docs/reliability.md) for the exact layers and limits.
+
+Model and effort can be pinned per task, without changing either CLI's global configuration:
+
+```sh
+cli-relay submit --key review-claude-1 --engine claude --cwd ~/code/app --prompt "Review the change" \
+  --option 'model="claude-opus-5-5"' --option 'effort="max"'
+cli-relay submit --key review-codex-1 --engine codex --cwd ~/code/app --prompt "Review the change" \
+  --option 'model="gpt-6-astra"' --option 'effort="max"'
+```
+
+`effort` accepts `low`, `medium`, `high`, `xhigh`, or `max`; the chosen model and installed CLI
+must support it. Omit it to retain the CLI's default. Exact resume reuses the task's model and
+effort. Claude gets `--effort` plus a generated one-key `--settings` environment override, since
+`CLAUDE_CODE_EFFORT_LEVEL` takes precedence over `--effort`; Codex gets the allowlisted
+`model_reasoning_effort` config override. No arbitrary settings or flags are accepted. Managed
+effort constraints remain in force: a conflicting managed environment value or a lower
+`maxEffortLevel` in any checked settings layer blocks before spawn;
+server-delivered caps and the actual served model still require real-CLI acceptance evidence.
+These options record requested configuration, not proof of the provider's effective effort.
 
 ## How a consumer (e.g. a chat bot calling over SSH) should use it
 

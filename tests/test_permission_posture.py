@@ -1,8 +1,8 @@
 """Permission posture does not depend on the CLIs' current configuration.
 
 Codex always gets an explicit sandbox (read-only unless the task asks for workspace-write), on
-the first run and on resume. A Claude configuration or init event that reports
-bypassPermissions blocks the run, since nothing would ever be denied.
+the first run and on resume. Claude pins dontAsk for every run; managed bypass policy and
+an init event that does not confirm the requested mode still block the run.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ class CodexSandboxIsAlwaysExplicit(unittest.TestCase):
 
 
 @needs_clean_cli_config
-class ClaudeBypassModeIsBlocked(unittest.TestCase):
+class ClaudeDefaultModeIsTightened(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="cli-relay-perm-"))
         (self.tmp / "claude-config").mkdir()
@@ -55,13 +55,17 @@ class ClaudeBypassModeIsBlocked(unittest.TestCase):
     def test_user_settings(self) -> None:
         (self.tmp / "claude-config" / "settings.json").write_text(
             json.dumps({"permissions": {"defaultMode": "bypassPermissions"}}))
-        self.assertFalse(engines.preflight("claude", self.env).ok)
+        self.assertTrue(engines.preflight("claude", self.env).ok)
+        self.assertIn("user:permissions.defaultMode", engines.claude_settings_problems(self.env)[0],
+                      "a raw settings check must still reject bypass without a known CLI override")
 
     def test_project_settings_of_the_task_directory(self) -> None:
         (self.tmp / "work" / ".claude" / "settings.local.json").write_text(
             json.dumps({"permissions": {"defaultMode": "bypassPermissions"}}))
         self.assertTrue(engines.preflight("claude", self.env).ok, "not visible without the task directory")
-        self.assertFalse(engines.preflight("claude", self.env, cwd=str(self.tmp / "work")).ok)
+        self.assertTrue(engines.preflight("claude", self.env, cwd=str(self.tmp / "work")).ok)
+        self.assertIn("project:permissions.defaultMode",
+                      engines.claude_settings_problems(self.env, str(self.tmp / "work"))[0])
 
 
 class BypassModeReportedByTheCli(RelayTestCase):
