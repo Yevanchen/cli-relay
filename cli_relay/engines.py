@@ -188,14 +188,20 @@ def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tup
             continue
         read.append(layer)
         merged = _merge(merged, data)
+    # Every value is type-checked: a structure this check does not expect is itself a problem, so
+    # an unusual file blocks the run instead of making the check fail (independent audit 6).
     tables: List[Tuple[str, Dict[str, Any]]] = [("", merged)]
+    profiles = merged.get("profiles", {})
+    if not isinstance(profiles, dict):
+        problems.append("profiles")
+        profiles = {}
     if "profile" in merged:
-        profile = (merged.get("profiles") or {}).get(merged["profile"])
+        profile = profiles.get(merged["profile"]) if isinstance(merged["profile"], str) else None
         if isinstance(profile, dict):
             tables.append(("profiles.<active>.", profile))
         else:
             problems.append("profile")
-    provider = "openai"
+    provider: Any = "openai"
     for prefix, table in tables:
         provider = table.get("model_provider", provider)
         problems += [prefix + key for key in sorted(table) if key.endswith("base_url")]
@@ -204,7 +210,10 @@ def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tup
                 problems.append(prefix + key)
     if provider != "openai":
         problems.append("model_provider")
-    if "openai" in (merged.get("model_providers") or {}):
+    providers = merged.get("model_providers", {})
+    if not isinstance(providers, dict):
+        problems.append("model_providers")
+    elif "openai" in providers:
         problems.append("model_providers.openai")
     return problems, read
 
@@ -231,10 +240,18 @@ def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None) -> 
         problems += [f"{layer}:{key}" for key in CLAUDE_CREDENTIAL_SETTINGS if data.get(key)]
         if data.get("forceLoginMethod") not in (None, "claudeai"):
             problems.append(f"{layer}:forceLoginMethod")
-        settings_env = data.get("env") if isinstance(data.get("env"), dict) else {}
+        # A section of an unexpected type cannot be checked, so it is a problem itself.
+        settings_env = data.get("env", {})
+        if not isinstance(settings_env, dict):
+            problems.append(f"{layer}:env")
+            settings_env = {}
         problems += [f"{layer}:env.{name}" for name in BILLING_ENV["claude"] if settings_env.get(name)]
-        permissions = data.get("permissions") if isinstance(data.get("permissions"), dict) else {}
-        if permissions.get("defaultMode") == "bypassPermissions":  # nothing would ever be denied
+        permissions = data.get("permissions", {})
+        if not isinstance(permissions, dict):
+            problems.append(f"{layer}:permissions")
+            permissions = {}
+        mode = permissions.get("defaultMode")
+        if mode == "bypassPermissions" or not isinstance(mode, (str, type(None))):  # nothing would be denied
             problems.append(f"{layer}:permissions.defaultMode")
     return problems, read
 

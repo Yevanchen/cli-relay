@@ -96,7 +96,12 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         log(f"refusing to start: {exc.code}")
         close("blocked", {"preflight": {"reason": exc.code, **exc.detail}})
         return 0
-    pf = engines.preflight(engine, env, cwd=payload["cwd"])
+    try:
+        pf = engines.preflight(engine, env, cwd=payload["cwd"])
+    except Exception as exc:  # an unexpected failure must end the attempt, not crash-loop the keeper
+        log(f"preflight failed: {exc!r}")
+        close("blocked", {"preflight": {"reason": "preflight_error", "error": type(exc).__name__}})
+        return 0
     if not pf.ok:
         log(f"preflight blocked: {pf.reason}")
         close("blocked", {"preflight": {"reason": pf.reason, **pf.detail}})
@@ -106,8 +111,10 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     try:
         spec = engines.build(engine, payload=payload, attempt=att, run_dir=run_dir,
                              fixture_state_dir=str(Path(home) / "fixture-sessions"), env=env)
-    except RuntimeError as exc:
-        close("blocked", {"preflight": {"reason": "unsafe_or_missing_cli", "error": str(exc)}})
+    except Exception as exc:
+        reason = "unsafe_or_missing_cli" if isinstance(exc, RuntimeError) else "build_error"
+        close("blocked", {"preflight": {"reason": reason, "error": str(exc) if isinstance(exc, RuntimeError)
+                                        else type(exc).__name__}})
         return 0
     prompt_path = run_dir / "prompt.txt"
     try:
