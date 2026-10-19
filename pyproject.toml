@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cli-relay"
-version = "0.1.0"
+version = "0.2.0"
 description = "Thin local ledger that keeps official coding-CLI task results until a consumer acknowledges them"
 readme = "README.md"
 license = { text = "MIT" }
