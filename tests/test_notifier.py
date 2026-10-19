@@ -259,6 +259,24 @@ class DuplicatesAndAcks(NotifierCase):
         self.flush()
         self.assertEqual(len(hook.requests), 2)
 
+    def test_an_ack_during_a_send_keeps_the_send_on_record(self) -> None:
+        t = self.finish_task("k-n12b")
+        hook = self.webhook()
+        write_config(self.home, http_config(self.tmp, hook.url))
+        sender = subprocess.Popen([sys.executable, "-m", "cli_relay", "--home", str(self.home), "notify", "flush"],
+                                  env=base_env({"CLI_RELAY_TEST_PAUSE": "notify_before_send:2"}),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        wait_until(lambda: any(r["state"] == "sending" for r in self.rows()), timeout=10)
+        self.assertEqual(self.ack(t["task_id"], t["event"])[0], 0)
+        self.flush()  # a concurrent pass leaves the in-flight row to its sender
+        self.assertEqual(self.rows()[0]["state"], "sending")
+        sender.wait(timeout=30)
+        row = self.rows()[0]
+        self.assertEqual((row["state"], row["attempts"]), ("accepted", 1), "the send itself is recorded")
+        self.flush()
+        self.assertEqual(self.rows()[0]["state"], "acked")
+        self.assertEqual(len(hook.requests), 1)
+
     def test_unacknowledged_events_are_never_cleared(self) -> None:
         t = self.finish_task("k-n13")
         hook = self.webhook()

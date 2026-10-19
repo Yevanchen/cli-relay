@@ -317,15 +317,17 @@ def enqueue(ledger: Ledger, cfg: Dict[str, Any]) -> int:
 
 
 def sync_acks(ledger: Ledger, cfg: Dict[str, Any]) -> int:
-    """A consumer ACK (in ``acks``) closes the transport record of its route."""
+    """A consumer ACK (in ``acks``) closes the transport record of its route. Rows a sender holds
+    ('claimed', 'sending') are left to it, so its send is recorded; the next pass closes them."""
     changed = 0
     with ledger.tx() as c:
         for name, route in cfg["routes"].items():
             cur = c.execute(
                 "UPDATE notifications SET state='acked', next_at=NULL, updated_at=?, acked_at=(SELECT acked_at FROM "
                 "acks a WHERE a.event_id=notifications.event_id AND a.consumer=?) WHERE route=? AND state NOT IN "
-                "('acked','skipped') AND EXISTS (SELECT 1 FROM acks a WHERE a.event_id=notifications.event_id "
-                "AND a.consumer=?)", (now_iso(), route["consumer"], name, route["consumer"]))
+                "('acked','skipped','claimed','sending') AND EXISTS (SELECT 1 FROM acks a WHERE "
+                "a.event_id=notifications.event_id AND a.consumer=?)", (now_iso(), route["consumer"], name,
+                                                                        route["consumer"]))
             changed += cur.rowcount
     return changed
 
