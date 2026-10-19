@@ -26,7 +26,8 @@ from cli_relay import engines, procs  # noqa: E402
 # caller bypass them in production too), so tests that need a clean configuration skip on a host
 # that has any of them.
 HOST_SYSTEM_CLI_CONFIG = [str(p) for p in (*engines.CODEX_SYSTEM_CONFIG, *engines.CODEX_MANAGED_CONFIG,
-                                           *engines.CLAUDE_MANAGED_SETTINGS) if p.exists()]
+                                           *engines.CODEX_REQUIREMENTS, *engines.CLAUDE_MANAGED_SETTINGS)
+                          if p.exists()]
 needs_clean_cli_config = unittest.skipIf(bool(HOST_SYSTEM_CLI_CONFIG),
                                          f"host has system-level CLI configuration: {HOST_SYSTEM_CLI_CONFIG}")
 

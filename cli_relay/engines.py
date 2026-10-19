@@ -57,6 +57,10 @@ CODEX_SANDBOXES = ("read-only", "workspace-write")
 # Configuration layers outside the user's own files that the CLIs also read.
 CODEX_SYSTEM_CONFIG = (Path("/etc/codex/config.toml"),)
 CODEX_MANAGED_CONFIG = (Path("/etc/codex/managed_config.toml"),)
+# Layers that can constrain or replace permissions in ways the legacy --sandbox flag does not
+# override; cli-relay cannot evaluate them, so their presence blocks a Codex run.
+CODEX_REQUIREMENTS = (Path("/etc/codex/requirements.toml"),
+                      Path("/Library/Managed Preferences/com.openai.codex.plist"))
 CLAUDE_MANAGED_SETTINGS = (Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
                            Path("/etc/claude-code/managed-settings.json"))
 # Claude settings keys that obtain credentials other than the claude.ai login.
@@ -174,20 +178,39 @@ def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tup
     run from anything but the built-in OpenAI provider with the ChatGPT sign-in. Project layers are
     read whether or not Codex trusts the project, and an unreadable layer is a problem: when the
     configuration cannot be confirmed, the run is blocked. Only key names are reported."""
-    layers = [("system", p) for p in CODEX_SYSTEM_CONFIG] + [("user", codex_home(env) / "config.toml")]
-    layers += [("project", d / ".codex" / "config.toml") for d in _dirs_up(cwd)]
-    layers += [("managed", p) for p in CODEX_MANAGED_CONFIG]
-    merged: Dict[str, Any] = {}
+    home = codex_home(env)
     problems: List[str] = []
-    read: List[str] = []
-    for layer, path in _existing_once(layers):
-        try:
-            data = tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-            problems.append(f"{layer}:unreadable")
-            continue
-        read.append(layer)
-        merged = _merge(merged, data)
+    user_name = env.get("USER") or os.environ.get("USER") or ""
+    requirements = [*CODEX_REQUIREMENTS, home / "requirements.toml",
+                    Path("/Library/Managed Preferences") / user_name / "com.openai.codex.plist"]
+    if any(p.exists() for p in requirements):
+        problems.append("requirements")
+
+    def load(profile_file: Optional[Path]) -> Tuple[Dict[str, Any], List[str], List[str]]:
+        layers = [("system", p) for p in CODEX_SYSTEM_CONFIG] + [("user", home / "config.toml")]
+        if profile_file is not None:  # Codex 0.163: `profile = X` layers $CODEX_HOME/X.config.toml on the user config
+            layers.append(("profile_file", profile_file))
+        layers += [("project", d / ".codex" / "config.toml") for d in _dirs_up(cwd)]
+        layers += [("managed", p) for p in CODEX_MANAGED_CONFIG]
+        merged: Dict[str, Any] = {}
+        bad: List[str] = []
+        read: List[str] = []
+        for layer, path in _existing_once(layers):
+            try:
+                data = tomllib.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+                bad.append(f"{layer}:unreadable")
+                continue
+            read.append(layer)
+            merged = _merge(merged, data)
+        return merged, bad, read
+
+    merged, bad, read = load(None)
+    profile_file = None
+    if isinstance(merged.get("profile"), str) and (home / f"{merged['profile']}.config.toml").is_file():
+        profile_file = home / f"{merged['profile']}.config.toml"
+        merged, bad, read = load(profile_file)
+    problems += bad
     # Every value is type-checked: a structure this check does not expect is itself a problem, so
     # an unusual file blocks the run instead of making the check fail (independent audit 6).
     tables: List[Tuple[str, Dict[str, Any]]] = [("", merged)]
@@ -199,10 +222,13 @@ def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tup
         profile = profiles.get(merged["profile"]) if isinstance(merged["profile"], str) else None
         if isinstance(profile, dict):
             tables.append(("profiles.<active>.", profile))
-        else:
+        elif profile_file is None:
             problems.append("profile")
     provider: Any = "openai"
     for prefix, table in tables:
+        # Named permission profiles and permission overrides can take precedence over --sandbox
+        # (independent audit 2), so any permission setting blocks the run rather than being trusted.
+        problems += [prefix + key for key in sorted(table) if "permission" in key.lower()]
         provider = table.get("model_provider", provider)
         problems += [prefix + key for key in sorted(table) if key.endswith("base_url")]
         for key in ("forced_login_method", "preferred_auth_method"):
@@ -314,6 +340,41 @@ def provider_violation(engine: str, env: Dict[str, str], session_id: Optional[st
                 return None
             return {"reason": "provider_not_subscription", "model_provider": provider}
     return {"reason": "provider_unverified", "missing": "session_meta"}
+
+
+def requested_sandbox(engine: str, payload: Dict[str, Any]) -> Optional[str]:
+    if engine != "codex":
+        return None
+    return (payload.get("options") or {}).get("sandbox") or "read-only"
+
+
+def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[str],
+                         sandbox: Optional[str]) -> Optional[Dict[str, Any]]:
+    """After a run: Codex records each turn's effective sandbox and any active named permission
+    profile in the thread's rollout (``turn_context``). Every turn must have run in the requested
+    sandbox or a narrower one, with no named profile; a thread without that record is not shown
+    to have kept the requested permissions."""
+    if engine != "codex" or not session_id:
+        return None
+    path = codex_rollout(env, session_id)
+    if path is None:
+        return {"reason": "permissions_unverified", "missing": "rollout"}
+    turns = []
+    for ev in iter_json_lines(path):
+        if ev.get("type") == "turn_context":
+            payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+            policy = payload.get("sandbox_policy")
+            turns.append((policy.get("type") if isinstance(policy, dict) else None,
+                          payload.get("active_permission_profile")))
+    if not turns:
+        return {"reason": "permissions_unverified", "missing": "turn_context"}
+    allowed = {"read-only"} if sandbox in (None, "read-only") else {"read-only", "workspace-write"}
+    wider = sorted({str(kind) for kind, _ in turns if kind not in allowed})
+    if wider:
+        return {"reason": "sandbox_not_as_requested", "requested": sandbox or "read-only", "observed": wider}
+    if any(profile not in (None, "") for _, profile in turns):
+        return {"reason": "named_permission_profile_active", "requested": sandbox or "read-only"}
+    return None
 
 
 def assert_safe(engine: str, argv: Iterable[str]) -> None:
@@ -550,14 +611,15 @@ def classify(native: Optional[Dict[str, Any]], *, exit_code: Optional[int], exit
 
 def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_id: Optional[str],
            exit_code: Optional[int], exit_signal: Optional[int], exit_known: bool, cancel_requested: bool,
-           guard: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any]]:
+           guard: Optional[Dict[str, Any]] = None, sandbox: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
     """Name an attempt's outcome from what the run left behind; returns (outcome, evidence).
 
     The keeper and reconciliation both call this, so the outcome does not depend on which of
-    them closes the attempt. A run shown not to be served by the subscription is ``blocked``
-    whatever else happened: ``guard`` is what the keeper saw while the run was live (also
-    persisted in exit.json); the init event of the saved output and the Codex thread record
-    are re-read here, so the fact survives a keeper that died before committing."""
+    them closes the attempt. A run shown not to be served by the subscription, or not shown to
+    have kept the requested sandbox, is ``blocked`` whatever else happened: ``guard`` is what
+    the keeper saw while the run was live (also persisted in exit.json); the init event of the
+    saved output and the Codex thread record are re-read here, so the fact survives a keeper
+    that died before committing."""
     if guard is None and engine in ("claude", "fixture") and parsed.get("init"):
         guard = billing_violation(engine, {"type": "system", "subtype": "init", **parsed["init"]})
     if guard is not None:
@@ -565,6 +627,9 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
     provider = provider_violation(engine, env, session_id)
     if provider is not None:
         return "blocked", {"provider_check": provider}
+    permissions = permission_violation(engine, env, session_id, sandbox)
+    if permissions is not None:
+        return "blocked", {"permission_check": permissions}
     return classify(parsed.get("native"), exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,
                     cancel_requested=cancel_requested), {}
 

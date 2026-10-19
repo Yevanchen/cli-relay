@@ -278,7 +278,8 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     cancel_requested = cancel["set"] or ledger.cancel_requested(attempt_id)
     outcome, decided = engines.decide(engine, parsed, env=env, session_id=parsed["session_id"] or recorded_sid,
                                       exit_code=exit_info["exit_code"], exit_signal=exit_info["signal"],
-                                      exit_known=True, cancel_requested=cancel_requested, guard=violation)
+                                      exit_known=True, cancel_requested=cancel_requested, guard=violation,
+                                      sandbox=engines.requested_sandbox(engine, payload))
     evidence: Dict[str, Any] = {"exit_source": "keeper_waitpid", **decided}
     if signalled_at is not None or "remaining_after_normal_exit" in cleanup:
         evidence["process_group_cleanup"] = cleanup

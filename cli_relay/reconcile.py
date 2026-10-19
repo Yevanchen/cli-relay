@@ -88,7 +88,8 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
         # The same decision the keeper makes, including the billing guard it may have tripped.
         return engines.decide(engine, parsed, env=env, session_id=parsed["session_id"] or att["native_session_id"],
                               exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,
-                              cancel_requested=cancel_requested, guard=(exit_info or {}).get("billing_guard"))
+                              cancel_requested=cancel_requested, guard=(exit_info or {}).get("billing_guard"),
+                              sandbox=engines.requested_sandbox(engine, json.loads(task["payload_json"])))
 
     if exit_info is not None:
         # The keeper died after recording the exit status but before committing it.
