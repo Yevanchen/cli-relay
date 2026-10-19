@@ -30,7 +30,7 @@ ledger rather than a fork.
 ## Verification status (v0.2.0 branch)
 
 The 156-test and real-CLI rows below describe candidate `d27b849`, before the
-independent review fixes. Revised-code evidence is tracked in `docs/acceptance.md` §2.5;
+independent review fixes. Revised-code checks are described in `docs/acceptance.md` §2.5 and recorded on [PR #2](https://github.com/Yevanchen/cli-relay/pull/2);
 passing the earlier candidate does not certify the revised code or a live deployment.
 
 | Evidence | Status |

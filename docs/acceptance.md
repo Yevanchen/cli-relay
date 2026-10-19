@@ -184,8 +184,20 @@ certify the revised code and none is a long-run result.
 
 ### 2.5 Independent-review repair verification
 
-The D14 code changes are awaiting the final fixed-commit local suite and CI. Do not reuse
-section 2.4 as a PASS for them. No real model or Grok calls are part of the repair tests.
+D14 has focused regressions in `test_notifier_faults`, `test_notifier_routing`,
+`test_ind_04_stop_evidence`, `test_resume_permission_checkpoint` and the existing isolation tests.
+They cover adapter exceptions without secret exposure, abandoned claims with a still-live
+sender, ACK-before-recovery, conservative wake bounds, server retry delays, fixed owners and
+migration, incomplete cancellation cleanup, and old resume evidence that cannot verify a new turn.
+
+The merge gate is the complete isolated suite and CI on the repaired code; run-specific results
+are recorded in [PR #2](https://github.com/Yevanchen/cli-relay/pull/2) and its linked checks.
+Section 2.4 is historical and is not substituted for those checks. Fixtures use temporary ledgers,
+local fake HTTP and fake CLIs; they make no real model or Grok calls.
+
+A stopped keeper can leave a live CLI briefly in `unknown` before it finishes as `blocked`.
+The billing-guard regression waits for `attempt.state=finished` before asserting the final
+outcome; it must not mistake this observable intermediate state for a completed cancellation.
 Real two-host notification, model/Max settings and the 30-minute window remain **NOT RUN**.
 
 ## 3. Real 25-hour soak

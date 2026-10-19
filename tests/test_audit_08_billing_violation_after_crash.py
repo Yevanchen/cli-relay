@@ -18,7 +18,8 @@ class BillingViolationSurvivesKeeperCrash(RelayTestCase):
         return bool(r["keeper_pid"]) and procs.same_process_alive(r["keeper_pid"], r["keeper_token"]) is False
 
     def finished(self, task_id: str) -> dict:
-        return wait_until(lambda: (lambda s: s if s["task"]["state"] not in ("accepted", "running") else None)(
+        # A detected guard stays unknown while the orphan CLI/group is still alive.
+        return wait_until(lambda: (lambda s: s if s["attempts"][0]["state"] == "finished" else None)(
             self.status(task_id)), timeout=30, interval=0.3)
 
     def test_keeper_dies_after_exit_record(self) -> None:

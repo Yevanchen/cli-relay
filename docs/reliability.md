@@ -360,7 +360,8 @@ Two machines are two independent ledgers and notifiers. Every payload names `sou
 - Cancellation cannot undo work the CLI has already done. "No side effect" in the cancel test
   only reflects the fixture's timing.
 - A same-UID local user can edit the ledger. The ledger is not a security boundary.
-- Timestamps use the wall clock. Clock jumps affect only the 5 s re-kick grace period and reporting.
+- Persisted timestamps use the wall clock. Clock jumps can affect the re-kick grace, retry
+  deadlines, ACK reminder timing and reporting; they do not prove whether a process stopped.
 
 
 ## Evidence
