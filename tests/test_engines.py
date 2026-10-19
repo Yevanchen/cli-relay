@@ -46,11 +46,13 @@ class ArgvSafety(unittest.TestCase):
     def test_claude_argv(self) -> None:
         new = self.build("claude").argv
         self.assertEqual(new[1:], ["-p", "--output-format", "stream-json", "--verbose", "--session-id",
-                                   "11111111-1111-4111-8111-111111111111", "--permission-prompts", "none"])
+                                   "11111111-1111-4111-8111-111111111111", "--permission-mode", "dontAsk",
+                                   "--permission-prompts", "none"])
         res = self.build("claude", resume="22222222-2222-4222-8222-222222222222").argv
         self.assertIn("--resume", res)
         self.assertNotIn("--session-id", res)
-        for flag in ("--continue", "-c", "--dangerously-skip-permissions", "--bare", "--permission-mode"):
+        self.assertEqual(res[res.index("--permission-mode") + 1], "dontAsk")
+        for flag in ("--continue", "-c", "--dangerously-skip-permissions", "--bare", "--setting-sources"):
             self.assertNotIn(flag, new + res)
 
     def test_codex_argv(self) -> None:

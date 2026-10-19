@@ -122,7 +122,7 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         close("blocked", {"preflight": {"reason": exc.code, **exc.detail}})
         return 0
     try:
-        pf = engines.preflight(engine, env, cwd=payload["cwd"])
+        pf = engines.preflight(engine, env, cwd=payload["cwd"], options=payload.get("options"))
     except Exception as exc:  # an unexpected failure must end the attempt, not crash-loop the keeper
         log(f"preflight failed: {exc!r}")
         close("blocked", {"preflight": {"reason": "preflight_error", "error": type(exc).__name__}})

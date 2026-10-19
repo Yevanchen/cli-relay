@@ -38,21 +38,27 @@ SCRUB_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "
 
 _FORBIDDEN = {
     "claude": {"--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--bare", "--continue",
-               "-c", "--permission-mode", "--fork-session"},
+               "-c", "--fork-session", "--setting-sources"},
     "codex": {"--dangerously-bypass-approvals-and-sandbox", "--approve-for-me", "--last", "--full-auto",
               "--dangerously-bypass-hook-trust", "--yolo"},
     "fixture": set(),
 }
 
 _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
-    "claude": {"model": (str,)},
-    "codex": {"model": (str,), "sandbox": (str,), "skip_git_repo_check": (bool,)},
+    "claude": {"model": (str,), "effort": (str,)},
+    "codex": {"model": (str,), "effort": (str,), "sandbox": (str,), "skip_git_repo_check": (bool,)},
     "fixture": {"duration_s": (int, float), "exit_code": (int,), "result": (str,), "side_effect_file": (str,),
                 "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,),
                 "descendant_s": (int, float), "descendant_pid_file": (str,)},
 }
 
 CODEX_SANDBOXES = ("read-only", "workspace-write")
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# One adapter contract: preflight, argv and runtime verification must agree. This only tightens
+# the session default; existing allow/ask/deny rules and managed settings remain loaded.
+CLAUDE_PERMISSION_MODE = "dontAsk"
+CLAUDE_PERMISSION_MODES = ("default", "manual", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan")
+CLAUDE_EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
 
 # Configuration layers outside the user's own files that the CLIs also read.
 CODEX_SYSTEM_CONFIG = (Path("/etc/codex/config.toml"),)
@@ -103,6 +109,8 @@ def validate_options(engine: str, options: Dict[str, Any]) -> Dict[str, Any]:
     if engine == "codex" and "sandbox" in clean and clean["sandbox"] not in CODEX_SANDBOXES:
         raise UsageError("codex sandbox must be read-only or workspace-write (danger-full-access is never used)",
                          allowed=list(CODEX_SANDBOXES))
+    if "effort" in clean and clean["effort"] not in EFFORT_LEVELS:
+        raise UsageError("effort must be low, medium, high, xhigh or max", allowed=list(EFFORT_LEVELS))
     for key in ("side_effect_file", "descendant_pid_file"):
         if engine == "fixture" and key in clean and not os.path.isabs(clean[key]):
             raise UsageError(f"{key} must be an absolute path")
@@ -164,9 +172,11 @@ def _dirs_up(cwd: Optional[str]) -> List[Path]:
 def _existing_once(layers: Iterable[Tuple[str, Path]]) -> List[Tuple[str, Path]]:
     seen, out = set(), []
     for layer, path in layers:
-        real = os.path.realpath(path)
-        if real not in seen and os.path.isfile(path):
-            seen.add(real)
+        # Aliases may cross trust layers. A user symlink to a managed file must not erase
+        # the managed provenance (or make its policy eligible for a user-only override).
+        identity = (layer, os.path.realpath(path))
+        if identity not in seen and os.path.isfile(path):
+            seen.add(identity)
             out.append((layer, path))
     return out
 
@@ -247,10 +257,12 @@ def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tup
     return problems, read
 
 
-def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tuple[List[str], List[str]]:
-    """Name every Claude settings layer (user, ``.claude/settings[.local].json`` of the task directory
-    and its parents, managed) that sets a credential helper, a non-claude.ai login or a billing
-    variable in its ``env``. Only key and variable names are reported."""
+def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None, *,
+                             permission_mode: Optional[str] = None,
+                             effort: Optional[str] = None) -> Tuple[List[str], List[str]]:
+    """Check subscription routing and permission/effort constraints in the Claude settings layers.
+    ``permission_mode`` is the adapter's known CLI override, not permission to skip settings.
+    Without it a bypass default is unsafe. Only key and variable names are reported."""
     layers = [("user", claude_config_dir(env) / "settings.json")]
     for d in _dirs_up(cwd):
         layers += [("project", d / ".claude" / "settings.json"), ("project", d / ".claude" / "settings.local.json")]
@@ -280,12 +292,28 @@ def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None) -> 
             problems.append(f"{layer}:permissions")
             permissions = {}
         mode = permissions.get("defaultMode")
-        if mode == "bypassPermissions" or not isinstance(mode, (str, type(None))):  # nothing would be denied
+        # The adapter pins dontAsk on every first/resumed run. Only that known CLI override
+        # permits a non-managed bypass default; malformed or managed policy still blocks.
+        if ((mode is not None and mode not in CLAUDE_PERMISSION_MODES) or
+                (mode == "bypassPermissions" and permission_mode != CLAUDE_PERMISSION_MODE) or
+                (permission_mode == CLAUDE_PERMISSION_MODE and
+                 (mode == "plan" or (layer == "managed" and mode not in (None, CLAUDE_PERMISSION_MODE))))):
             problems.append(f"{layer}:permissions.defaultMode")
+        if effort and layer == "managed":
+            managed_effort = settings_env.get(CLAUDE_EFFORT_ENV)
+            if managed_effort is not None and managed_effort != effort:
+                problems.append(f"{layer}:env.{CLAUDE_EFFORT_ENV}")
+        if effort:
+            # maxEffortLevel is restrictive across every scope: even a higher managed value
+            # cannot lift a lower user/project cap. Do not spend a request at a known lower effort.
+            cap = data.get("maxEffortLevel")
+            if cap is not None and (cap not in EFFORT_LEVELS or EFFORT_LEVELS.index(cap) < EFFORT_LEVELS.index(effort)):
+                problems.append(f"{layer}:maxEffortLevel")
     return problems, read
 
 
-def preflight(engine: str, env: Dict[str, str], cwd: Optional[str] = None) -> Preflight:
+def preflight(engine: str, env: Dict[str, str], cwd: Optional[str] = None, *,
+              options: Optional[Dict[str, Any]] = None) -> Preflight:
     """Everything that decides which account serves the run is checked before the CLI starts:
     billing variables, the CLI's configuration layers that apply to ``cwd``, and the login."""
     present = [name for name in BILLING_ENV[engine] if env.get(name)]
@@ -293,8 +321,12 @@ def preflight(engine: str, env: Dict[str, str], cwd: Optional[str] = None) -> Pr
         return Preflight(False, "billing_env_present", {"names": present})
     if engine == "fixture":
         return Preflight(True)
-    check = codex_config_problems if engine == "codex" else claude_settings_problems
-    problems, layers = check(env, cwd)
+    opts = validate_options(engine, options or {})
+    if engine == "codex":
+        problems, layers = codex_config_problems(env, cwd)
+    else:
+        problems, layers = claude_settings_problems(env, cwd, permission_mode=CLAUDE_PERMISSION_MODE,
+                                                   effort=opts.get("effort"))
     if problems:
         return Preflight(False, "config_not_subscription", {"settings": problems})
     binary = resolve_bin(engine, env)
@@ -419,19 +451,35 @@ def assert_safe(engine: str, argv: Iterable[str]) -> None:
     bad = sorted(set(args) & _FORBIDDEN[engine])
     if bad:
         raise RuntimeError(f"refusing to run {engine} with forbidden flags {bad}")
+    if engine == "claude":
+        modes = [args[i + 1] if i + 1 < len(args) else None for i, arg in enumerate(args)
+                 if arg == "--permission-mode"]
+        if modes != [CLAUDE_PERMISSION_MODE] or any(arg.startswith("--permission-mode=") for arg in args):
+            raise RuntimeError("refusing to run claude without the explicit dontAsk permission mode")
     for i, arg in enumerate(args):
         if arg in ("--sandbox", "-s") and i + 1 < len(args) and args[i + 1] not in CODEX_SANDBOXES:
             raise RuntimeError("refusing to run codex with a sandbox other than read-only/workspace-write")
         if engine == "codex" and arg in ("-c", "--config") and i + 1 < len(args):
             override = args[i + 1].replace(" ", "")
             allowed = {f'sandbox_mode="{s}"' for s in CODEX_SANDBOXES}
+            allowed.update(f'model_reasoning_effort="{e}"' for e in EFFORT_LEVELS)
             if override not in allowed:
-                raise RuntimeError("refusing a codex config override other than a read-only/workspace-write sandbox")
+                raise RuntimeError("refusing a codex config override other than a safe sandbox or validated effort")
+        if engine == "claude" and arg == "--settings":
+            try:
+                setting = json.loads(args[i + 1])
+            except (IndexError, ValueError):
+                setting = None
+            if not any(setting == {"env": {CLAUDE_EFFORT_ENV: e}} for e in EFFORT_LEVELS):
+                raise RuntimeError("refusing claude settings other than a task-local effort override")
+        if engine == "claude" and arg == "--effort":
+            if i + 1 == len(args) or args[i + 1] not in EFFORT_LEVELS:
+                raise RuntimeError("refusing an unvalidated claude effort")
 
 
 def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_dir: Path,
           fixture_state_dir: str, env: Dict[str, str]) -> Spec:
-    opts = payload.get("options", {})
+    opts = validate_options(engine, payload.get("options", {}))
     cwd = payload["cwd"]
     resume = attempt.get("resume_session_id")
     cenv = child_env(env)
@@ -440,9 +488,14 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
         binary = resolve_bin(engine, env)
         argv = [binary, "-p", "--output-format", "stream-json", "--verbose"]
         argv += ["--resume", resume] if resume else ["--session-id", attempt["native_session_id"]]
-        argv += ["--permission-prompts", "none"]
+        argv += ["--permission-mode", CLAUDE_PERMISSION_MODE, "--permission-prompts", "none"]
         if opts.get("model"):
             argv += ["--model", opts["model"]]
+        if opts.get("effort"):
+            # Settings env can override the shell and --effort. This generated one-key CLI
+            # settings layer wins over user/project values without changing auth or any rules.
+            argv += ["--effort", opts["effort"], "--settings",
+                     json.dumps({"env": {CLAUDE_EFFORT_ENV: opts["effort"]}}, separators=(",", ":"))]
     elif engine == "codex":
         binary = resolve_bin(engine, env)
         last_message = str(run_dir / "last_message.txt")
@@ -460,6 +513,8 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
             argv.append("--skip-git-repo-check")
         if opts.get("model"):
             argv += ["-m", opts["model"]]
+        if opts.get("effort"):
+            argv += ["-c", f'model_reasoning_effort="{opts["effort"]}"']
         argv += [resume, "-"] if resume else ["-"]
     else:
         argv = [sys.executable, "-m", "cli_relay.fixture", "--state-dir", fixture_state_dir]
@@ -557,14 +612,17 @@ def session_id_from_event(engine: str, ev: Dict[str, Any]) -> Optional[str]:
 
 
 def billing_violation(engine: str, ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """A Claude-format init event that reports an API-key source means the run is not on the
-    subscription; one that reports bypassPermissions means nothing would be denied."""
+    """Reject a Claude-format API-key/bypass init, and require the real Claude adapter's fixed
+    permission mode. The fixture keeps its independent permission-denial scenarios."""
     if engine in ("claude", "fixture") and ev.get("type") == "system" and ev.get("subtype") == "init":
         source = ev.get("apiKeySource")
         if source not in (None, "none"):
             return {"reason": "api_key_source_detected", "apiKeySource": source}
         if ev.get("permissionMode") == "bypassPermissions":
             return {"reason": "bypass_permissions_mode", "permissionMode": ev["permissionMode"]}
+        if engine == "claude" and ev.get("permissionMode") != CLAUDE_PERMISSION_MODE:
+            return {"reason": "permission_mode_not_as_requested", "requested": CLAUDE_PERMISSION_MODE,
+                    "observed": ev.get("permissionMode")}
     return None
 
 
@@ -664,6 +722,8 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
         guard = billing_violation(engine, {"type": "system", "subtype": "init", **parsed["init"]})
     if guard is not None:
         return "blocked", {"billing_guard": guard}
+    if engine == "claude" and not parsed.get("init"):
+        return "blocked", {"permission_check": {"reason": "permissions_unverified", "missing": "init"}}
     provider = provider_violation(engine, env, session_id)
     if provider is not None:
         return "blocked", {"provider_check": provider}
