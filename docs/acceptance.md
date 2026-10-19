@@ -102,7 +102,7 @@ every schedule.
 | H0 | The real-CLI script itself: checks exactly its own three events, ACKs only those, leaves other events alone, exits non-zero on FAIL | `test_passes_and_acks_only_its_own_events`, `test_a_failed_step_gives_a_nonzero_exit_code` (fixture mode) | PASS |
 | I0 | The soak verdict fails on each false-pass path: a short task that never executed, a long task cut short, a run shorter than planned; `soak.py verdict` re-evaluates read-only | `test_a_short_task_that_never_executed_fails`, `test_a_long_task_cut_short_fails`, `test_a_run_shorter_than_planned_fails`, `test_unexecuted_short_task_and_too_short_long_task_fail`, `test_consistent_run_passes`, `test_verdict_command_re_evaluates_a_finished_soak_without_writing` | PASS |
 | J1 | Execution across machine sleep, power loss or reboot | — | NOT RUN (out of scope by design; sleep settings are not changed and the machine is not restarted) |
-| J2 | CI on `ubuntu-latest` with Python 3.11 / 3.12 / 3.14 | workflow in this repository | NOT RUN (runs after publishing) |
+| J2 | CI on `ubuntu-latest` with Python 3.11 / 3.12 / 3.14 | workflow in this repository | PASS on `baff533`: [push run](https://github.com/Yevanchen/cli-relay/actions/runs/39197188143), [tag run](https://github.com/Yevanchen/cli-relay/actions/runs/39197203482) |
 
 ### 2.2 Recorded short-test results on `a431845`
 
