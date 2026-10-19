@@ -36,7 +36,7 @@ class Disconnect(RelayTestCase):
             pass  # macOS reports EPERM for a group that only holds the zombie leader
         shell.wait(timeout=10)
         shell.stdout.close()
-        bare = {"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", "/"), "PYTHONPATH": str(REPO)}
+        bare = {"PATH": "/usr/bin:/bin", "HOME": base_env()["HOME"], "PYTHONPATH": str(REPO)}
         done = self.cli("wait", out["task_id"], "--timeout", "30", env=bare)
         self.assertEqual(done["task"]["state"], "succeeded")
         self.assertTrue(done["attempts"][0]["exit"]["known"], "the keeper survived the caller")

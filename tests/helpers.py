@@ -3,6 +3,7 @@ temporary ledger, and only ever signals processes recorded in that ledger (pid +
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
@@ -19,12 +20,47 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from cli_relay import procs  # noqa: E402
+from cli_relay import engines, procs  # noqa: E402
+
+# System and managed CLI configuration layers cannot be redirected for a test (doing so would let a
+# caller bypass them in production too), so tests that need a clean configuration skip on a host
+# that has any of them.
+HOST_SYSTEM_CLI_CONFIG = [str(p) for p in (*engines.CODEX_SYSTEM_CONFIG, *engines.CODEX_MANAGED_CONFIG,
+                                           *engines.CLAUDE_MANAGED_SETTINGS) if p.exists()]
+needs_clean_cli_config = unittest.skipIf(bool(HOST_SYSTEM_CLI_CONFIG),
+                                         f"host has system-level CLI configuration: {HOST_SYSTEM_CLI_CONFIG}")
+
+
+# A minimal PATH: no real `claude` or `codex` can be found by accident.
+TEST_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+_SHARED_HOME: Optional[Path] = None
+
+
+def isolated_env(tmp: Path, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """An environment for in-process engine calls: a minimal PATH and an empty home of its own."""
+    home = Path(tmp) / "isolated-home"
+    for d in (home / ".codex", home / ".claude"):
+        d.mkdir(parents=True, exist_ok=True)
+    env = {"PATH": TEST_PATH, "HOME": str(home), "CODEX_HOME": str(home / ".codex"),
+           "CLAUDE_CONFIG_DIR": str(home / ".claude")}
+    env.update(extra or {})
+    return env
+
+
+def _shared_home() -> Path:
+    global _SHARED_HOME
+    if _SHARED_HOME is None:
+        _SHARED_HOME = Path(tempfile.mkdtemp(prefix="cli-relay-test-home-"))
+        atexit.register(shutil.rmtree, str(_SHARED_HOME), True)
+    return _SHARED_HOME
 
 
 def base_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CLI_RELAY_")}
-    env["PYTHONPATH"] = str(REPO)
+    """The environment of every relay process a test starts, built from scratch. Nothing comes from
+    the host: no billing variable, no CLI configuration, no PATH entry that could reach a real CLI."""
+    env = isolated_env(_shared_home(), {"PYTHONPATH": str(REPO), "PYTHONDONTWRITEBYTECODE": "1"})
+    if os.environ.get("TMPDIR"):
+        env["TMPDIR"] = os.environ["TMPDIR"]
     env.update(extra or {})
     return env
 
