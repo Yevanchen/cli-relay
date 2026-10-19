@@ -262,3 +262,99 @@ reason and evidence are recorded here.
    closes an attempt as lost. Those platforms were already unsupported.
 8. **Python floor.** `tomllib` needs 3.11 (D5). CI moved from 3.10/3.12/3.14 to
    3.11/3.12/3.14.
+
+## D12. v0.2: proactive notification on top of the ledger (design record)
+
+**Problem.** In v0.1 a finished task waited in the ledger until someone asked. A Grok Bot that
+had dispatched it would only learn the result if the user asked again. Notification itself is a
+solved problem: the review of existing systems found several working implementations. What
+was missing was the last link from this ledger to the consumer's existing wake-up entry.
+
+**Decision: reuse, don't add platforms.**
+- **Ledger.** The ledger, its events and its ACKs stay the source of truth. There is no second
+  database, message server, networked relay, model harness or phone app.
+- **Pending fact.** It is the event the ledger already commits with the terminal state (a
+  transactional outbox without a second write). A new `notifications` table records only the
+  transport per (event, route).
+- **Notifier.** It is a deterministic local program, `cli-relay notify flush` / `notify run`:
+  - it never calls a model;
+  - nothing polls the Bot;
+  - the keeper starts one pass right after a terminal event;
+  - the periodic pass covers retries, reminders and restarts.
+- **Wake-up entry.** The machines' existing notifier (`notify.sh <job> <stage> <status>
+  <summary> [artifact]`) feeding a Grok webhook routine. The command adapter speaks exactly that
+  interface. An optional HTTP adapter calls the webhook directly when transport acceptance must
+  be known.
+- **Two acknowledgements, never merged.** The transport result (HTTP 2xx, or only "handed off"
+  for `notify.sh`, which always exits 0) is one fact. The consumer's ACK, recorded by the Bot
+  through `cli-relay ack` after it has reported, is the other. HTTP 200 from a routine means a
+  run was started, not that a chat message exists.
+- **Bounded by design.** The routine has no idempotency key, and each run uses the Bot's quota:
+  - a lost response is `unconfirmed` and is never resent at once;
+  - reminders are limited (`max_wakes`, default 2);
+  - transport retries are limited (`max_attempts`, default 6);
+  - due events of one route are batched into one wake-up;
+  - an event that is never acknowledged stays visible (`unacknowledged`/`failed`) and is never
+    cleared.
+- **Two machines.**
+  - Each machine has its own ledger, notifier and `source_id`.
+  - Every payload names `source_id`, `ledger_id`, route and the event/task/attempt ids.
+  - `ack --ledger-id` refuses an event of another ledger.
+  - Nothing is read across machines.
+- **Default wake-ups.** Only `succeeded`, `failed`, `blocked`, `needs_input` and `unknown`.
+  Ordinary logs and heartbeats are not events.
+- **Compatibility.** The schema change is additive and `schema_version` stays 1. v0.1.0 opens a
+  migrated ledger, which is the rollback path. `migrate` writes a consistent SQLite backup
+  first.
+
+**Not done.**
+- Merging progress messages: there are none; only outcomes are events.
+- Reading `notify.sh`'s own log to infer HTTP results: another program's log format is not an
+  interface.
+- A daemon of our own: `notify run` is meant for the machine's existing service manager.
+
+Usage, the routine contract, install and rollback are in [`notifier.md`](notifier.md).
+
+## D13. Independent audit of v0.1.0 (2026-10-19): handling and deviations
+
+An independent review of the published v0.1.0 (`baff533`) found defects that the earlier
+review had not. They were handled as new findings, one commit each, each with a regression test
+that failed on the unfixed code ([`acceptance.md`](acceptance.md), section 2.3).
+
+1. **Soak verdict passed with zero events.** Every attempt must now have its event, delivered
+   to and acknowledged by the soak consumer.
+2. **Codex permissions beyond `--sandbox` (conditional).** On the target machine (codex-cli
+   0.163.0) no requirements or managed layer exists, and every recorded turn ran in the
+   requested sandbox with no named profile. So the conditional branch is not active there, and
+   nothing was widened to try it. The fix fails closed in two places:
+   - before the run, any permission setting, requirements or managed-preference layer, or the
+     selected config-profile file blocks the run;
+   - after the run, every recorded turn must show the requested sandbox or a narrower one, with
+     no named profile.
+
+   Deviation: this can block a configuration that is in fact harmless. The reason is reported
+   by key name.
+3. **Cancel vs. reconciliation race left `unknown`.** The closing write re-reads the attempt in
+   its own transaction. Attempts already left that way converge to `cancelled` once their
+   processes are provably gone.
+4. **Descendants in the process group outlived a cancel.** After a cancel or a guard stop the
+   keeper stops every member of its group and commits only once the group is empty.
+   Deviation: after a *normal* exit, lingering members are recorded but not killed, because
+   they may be intended (for example a started server). Resume still refuses while they run.
+5. **Empty Linux boot ids compared as equal.** Any missing part of an identity is now
+   "cannot verify". Consequence: on a Linux host without a readable boot id, reconciliation
+   cannot prove a keeper gone and keeps observing.
+6. **Unexpected configuration structure crashed the preflight.** It now converges to `blocked`:
+   - every value is type-checked;
+   - any remaining exception in the preflight or argv construction closes the attempt as
+     blocked, instead of re-kicking a keeper that crashes again.
+7. **Tests read the host environment.** Test environments are built from scratch, with a minimal
+   `PATH` and an empty home. Before the fix, a re-kicked keeper in one test could find the
+   host's real `codex` through the inherited `PATH`. It created no session and made no model
+   request.
+   Deviation: system and managed CLI configuration cannot be redirected for a test without
+   weakening the production check, so tests that need a clean configuration skip on hosts that
+   have it.
+8. **An efficiency statement exceeded the evidence.** The unacknowledged-events query fetches no
+   acknowledged rows into Python, but SQLite still scans the whole event table. The
+   documentation now says so; no performance claim is made.

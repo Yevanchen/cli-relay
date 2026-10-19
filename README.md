@@ -1,8 +1,8 @@
 # cli-relay
 
-**Experimental (v0.1.0).** A thin local ledger for tasks run by the official coding CLIs
-(Claude Code, Codex) on the machine where they are installed. It adds three things the
-CLIs do not do by themselves:
+**Experimental (v0.2.0, in review on the `v0.2.0` branch).** A thin local ledger for tasks run by
+the official coding CLIs (Claude Code, Codex) on the machine where they are installed. It adds
+three things the CLIs do not do by themselves, plus, since v0.2, a notifier:
 
 1. **No blind re-run for a repeated request key.** The same `(scope, key)` returns the same
    task. The same key with a different payload is an explicit conflict.
@@ -12,6 +12,13 @@ CLIs do not do by themselves:
 3. **Results kept until the consumer ACKs them.** The terminal state and a stable event id are
    committed in one transaction. They are re-delivered until a named consumer ACKs, and are
    never expired or garbage-collected.
+4. **A wake-up when a task ends (v0.2).** A local notifier wakes the consumer through an existing
+   notifier script or webhook, for example a Grok Bot routine. It does this for `succeeded`,
+   `failed`, `blocked`, `needs_input` and `unknown`.
+   - Retries are bounded, and wake-ups are deduplicated per event.
+   - After a restart it sends what is still due.
+   - The transport result is never taken for the consumer's ACK.
+   - See [`docs/notifier.md`](docs/notifier.md).
 
 Everything else stays native: the CLIs do the work, own the sessions, apply their own
 permission rules and use your existing subscription login. cli-relay is not a model proxy, an
@@ -20,24 +27,25 @@ agent harness, a networked relay, a terminal runtime or an orchestrator.
 Network, Agenvo, AGPair) already cover. It also explains why this is a small separate
 ledger rather than a fork.
 
-## Verification status (v0.1.0)
+## Verification status (v0.2.0 branch)
 
-| Evidence | Code | Status |
-|---|---|---|
-| Fault-injection suite: 105 tests, fixture engine, real OS processes (macOS) | `a431845` | PASS, 105/105 in 2 consecutive rounds |
-| Scaled-down soak (0.03 h) | `a431845` | PASS. A short test, **not** the 25 h result |
-| Real Claude Code loop: success, failure parsing, exact resume, events → ACK | `a431845` | PASS, 3/3 runs |
-| Real Codex loop: same steps | `a431845` | PASS, 3/3 runs |
-| 25 h soak | `b72618d` (before the audit fixes) | **RUNNING** |
-| 25 h soak | `a431845` (current code) | **NOT RUN** |
-| C4: second entry point over a real bot/SSH channel | — | **NOT RUN** (simulated locally only) |
-| F5: real disk-full on the ledger volume | — | **NOT RUN** (simulated only) |
-| J1: execution across machine sleep, power loss or reboot | — | **NOT RUN** |
-| J2: CI on `ubuntu-latest`, Python 3.11 / 3.12 / 3.14 | `baff533` | **PASS** (3.11 / 3.12 / 3.14): [push run](https://github.com/Yevanchen/cli-relay/actions/runs/39197188143), [tag run](https://github.com/Yevanchen/cli-relay/actions/runs/39197203482) |
+| Evidence | Status |
+|---|---|
+| Fault-injection suite + notifier scenarios (fixture engine, real OS processes, local fake webhook; macOS) | PASS, 156/156 in each of 2 consecutive rounds |
+| Regression tests for the independent audit of v0.1.0 (each failed before its fix) | PASS |
+| Real Claude Code loop with the notify step (local fake webhook) | PASS, 2/2 runs |
+| Real Codex loop with the notify step (local fake webhook) | PASS, 2/2 runs (every turn read-only, no named permission profile) |
+| CI on `ubuntu-latest`, Python 3.11 / 3.12 / 3.14 | runs on the pull request |
+| Two-machine deployment with the real Bot | **NOT RUN** (pending deployment) |
+| A real 30-minute task window with the real Bot | **NOT RUN** (pending deployment) |
+| 25 h soak of this version | **Not completed. Does not block this controlled rollout** |
+| 25 h soak of `b72618d` (v0.1 before both audits) | RUNNING; it says nothing about this version |
+| C4 real bot/SSH entry point, F5 real disk-full, J1 sleep/power loss/reboot | **NOT RUN** |
 
 Not promised:
 - exactly-once external side effects;
-- delivery of any notification (chat bot, phone or anything else).
+- that any notification reaches a chat, a phone or a person;
+- that a process keeps running across sleep, power loss or reboot.
 
 The matrix, numbers and limits are in [`docs/acceptance.md`](docs/acceptance.md).
 
@@ -68,6 +76,12 @@ cli-relay ack --consumer grok --task t-… --attempt 1 --event e-…
 cli-relay status t-…               # full record: attempts, identities, exit status, native result
 cli-relay resume t-… --prompt "Continue with the next failing test."   # exact native session
 cli-relay cancel t-…
+
+# v0.2: wake a consumer when tasks end (configuration in <home>/notifier.json, see docs/notifier.md)
+cli-relay migrate                  # once per existing v0.1 ledger: backup, then add the notifier tables
+cli-relay submit --key k --engine claude --cwd ~/code/app --prompt "…" --notify-route bot
+cli-relay notify run --interval 60 # periodic pass (retries, reminders, catch-up after a restart)
+cli-relay notify status            # per event: transport state and consumer ACK
 ```
 
 Every command prints exactly one JSON object on stdout. Only `--help` and `--version` print
@@ -108,7 +122,9 @@ danger-full-access`, `--continue`, `--last`, `--bare`.
   - a configuration layer it cannot read;
   - a login that is not a subscription.
 - It also stops the run if the CLI itself reports an API-key source.
-- After a Codex run, the thread's own record must name the built-in `openai` provider.
+- After a Codex run, the thread's own record must name the built-in `openai` provider, and
+  every turn must have run in the requested sandbox with no named permission profile. Before
+  the run, any Codex permission setting, requirements layer or selected profile file blocks it.
 - These outcomes do not depend on whether the keeper survived: reconciliation applies the same
   checks. See [`docs/reliability.md`](docs/reliability.md) for the exact layers and limits.
 
@@ -125,11 +141,13 @@ danger-full-access`, `--continue`, `--last`, `--bare`.
    - `resume` continues the exact native session;
    - `resume --fresh --confirm-rerun` starts over and may repeat side effects.
 
-The relay keeps the result and the event; it does **not** deliver notifications. Whether a
-chat bot, a phone notification or a person ever sees the result depends on the consumer reading
-again or on a separate wake-up mechanism.
+Since v0.2 the notifier wakes the consumer when a task ends, so it does not have to poll. It uses
+the machine's existing notifier script or a webhook, with bounded retries and per-event
+deduplication. The consumer still reads the task by id and ACKs it after reporting. What a
+wake-up means, and does not mean, is in [`docs/notifier.md`](docs/notifier.md). Whether a chat,
+a phone or a person ever sees the result is outside what the relay can know.
 
-## Limits (v0.1)
+## Limits
 
 - No exactly-once guarantee for external side effects. The relay never re-runs on its own,
   but an explicit resume or re-run can repeat a last step.
@@ -146,15 +164,22 @@ again or on a separate wake-up mechanism.
   resolvers. A routing setting it does not know about is not detected before the run.
 - The run's own provider record is checked for Codex only. It is written when a thread is
   created, so a resumed Codex turn relies on the preflight check.
+- Notifications are at least one attempt and at most a bounded number, not exactly once.
+  - A lost webhook response or a reminder can wake the consumer twice for one event.
+  - A wake-up that the receiver accepted may still never produce a chat message.
+  - `notify.sh`-style programs that always exit 0 tell the notifier nothing about the HTTP
+    result.
+- A notification that is due while the machine sleeps or is off is sent by the next pass after
+  it comes back.
 
 ## Tests and acceptance
 
 ```sh
-python3 -m unittest discover -s tests -t tests -v   # fixture engine, real OS processes, ~2 min
+python3 -m unittest discover -s tests -t tests -v   # fixture engine, real OS processes, local fake webhook, ~4 min
 python3 scripts/soak.py run --dir /tmp/soak --hours 0.03                   # scaled-down soak
 python3 scripts/soak.py start --dir ~/soak-cli-relay --hours 25            # the real 25 h soak
 python3 scripts/soak.py verdict --dir ~/soak-cli-relay                     # re-check a finished soak
-python3 scripts/real_cli_acceptance.py --engine claude --home DIR --workdir DIR --out result.json
+python3 scripts/real_cli_acceptance.py --engine claude --notify --home DIR --workdir DIR --out result.json
 ```
 
 `soak.py run`, `soak.py verdict` and `real_cli_acceptance.py` exit with status 0 only on PASS.
