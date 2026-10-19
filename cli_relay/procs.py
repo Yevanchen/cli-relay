@@ -11,9 +11,10 @@ so a failed query answers None rather than "recycled".
 
 from __future__ import annotations
 
+import ctypes.util
 import os
 import sys
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 def _linux_boot_id() -> str:
@@ -142,6 +143,79 @@ def same_process_alive(pid: Optional[int], token: Optional[str]) -> Optional[boo
     if token is None:
         return None
     return _compare_tokens(token, current)
+
+
+def _darwin_group_members(pgid: int) -> Optional[List[int]]:
+    """Live (non-zombie) pids in process group pgid via sysctl(KERN_PROC_PGRP). The element size is
+    taken from a single-process query, and the layout is checked by finding the caller in the list
+    when it belongs to the group."""
+    import ctypes
+    import struct
+
+    try:
+        libc = _DARWIN_LIBC or ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        # The size of one kinfo_proc is what the kernel writes for one process (a size-only query
+        # returns an estimate with room to spare).
+        one = (ctypes.c_int * 4)(1, 14, 1, os.getpid())  # KERN_PROC_PID
+        estimate = ctypes.c_size_t(0)
+        if libc.sysctl(one, 4, None, ctypes.byref(estimate), None, 0) != 0 or estimate.value < 44:
+            return None
+        first = ctypes.create_string_buffer(estimate.value)
+        elem = ctypes.c_size_t(estimate.value)
+        if libc.sysctl(one, 4, first, ctypes.byref(elem), None, 0) != 0 or elem.value < 44:
+            return None
+        mib = (ctypes.c_int * 4)(1, 14, 2, pgid)  # CTL_KERN, KERN_PROC, KERN_PROC_PGRP, pgid
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 4, None, ctypes.byref(size), None, 0) != 0:
+            return None
+        buf = ctypes.create_string_buffer(size.value + elem.value * 16)
+        size = ctypes.c_size_t(len(buf))
+        if libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) != 0 or size.value % elem.value:
+            return None
+        members = []
+        for off in range(0, size.value, elem.value):
+            p_stat = buf.raw[off + 36]
+            p_pid = struct.unpack_from("i", buf.raw, off + 40)[0]
+            if p_pid <= 0:
+                return None
+            if p_stat != 5:  # SZOMB: already dead
+                members.append(p_pid)
+    except (OSError, AttributeError, ValueError, struct.error):
+        return None
+    if os.getpgid(0) == pgid and os.getpid() not in members:
+        return None  # unexpected layout
+    return members
+
+
+def _linux_group_members(pgid: int) -> Optional[List[int]]:
+    members = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return None
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as f:
+                data = f.read().decode("utf-8", "replace")
+            rest = data[data.rindex(")") + 2:].split()
+            if int(rest[2]) == pgid and not rest[0].startswith("Z"):  # fields 5 (pgrp) and 3 (state)
+                members.append(int(name))
+        except (OSError, ValueError, IndexError):
+            continue  # exited while listing
+    return members
+
+
+def group_members(pgid: int) -> Optional[List[int]]:
+    """Live pids in process group pgid; None if they cannot be listed on this platform."""
+    if pgid <= 1:
+        return None
+    if sys.platform == "darwin":
+        return _darwin_group_members(pgid)
+    if sys.platform.startswith("linux"):
+        return _linux_group_members(pgid)
+    return None
 
 
 def group_alive(pgid: Optional[int]) -> Optional[bool]:
