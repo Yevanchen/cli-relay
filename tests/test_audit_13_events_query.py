@@ -49,8 +49,9 @@ class EventsQueryCost(unittest.TestCase):
         self.assertEqual(run_cli(self.home, "init")[0], 0)
         conn = sqlite3.connect(str(self.home / "ledger.db"))
         now = "2026-01-01T00:00:00.000Z"
-        conn.execute("INSERT INTO tasks VALUES ('t-1','default','k','h','{}','fixture','/','succeeded',1,1,?,?)",
-                     (now, now))
+        conn.execute("INSERT INTO tasks (task_id, scope, request_key, payload_sha256, payload_json, engine, cwd, state, "
+                     "current_attempt, submit_count, created_at, updated_at) "
+                     "VALUES ('t-1','default','k','h','{}','fixture','/','succeeded',1,1,?,?)", (now, now))
         rows = [(f"e-{i:05d}", "t-1", i + 1, "terminal", "{}", now) for i in range(3000)]
         conn.executemany("INSERT INTO events VALUES (?,?,?,?,?,?)", rows)
         conn.executemany("INSERT INTO acks VALUES (?,?,?,?,?)", [(r[0], "grok", "t-1", r[2], now) for r in rows])

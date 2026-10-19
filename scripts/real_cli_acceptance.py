@@ -16,16 +16,23 @@ prompts plus one request that fails on an unknown model, all on the existing sub
 how CI tests this script; `--sabotage-resume` (fixture only) replaces the exact resume with a
 fresh re-run so that the FAIL path can be tested.
 
+`--notify` also configures the notifier of the run's ledger against a local fake webhook (an
+HTTP server on 127.0.0.1 started by this script; no real Bot is contacted) and adds a step:
+  5. each of the three terminal events was sent exactly once, naming this ledger and route,
+     with the transport accepted; after the consumer ACKs of step 4 every notification is acked.
+
 Exit status: 0 PASS, 1 FAIL, 3 NOT RUN (subscription auth path not confirmed).
 """
 
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,6 +44,42 @@ from cli_relay import engines  # noqa: E402
 
 PHRASE = "relay-ok"
 CONSUMER = "acceptance"
+
+
+class LocalWebhook:
+    """Records POSTs and answers 200; stands in for the Bot's webhook."""
+
+    def __init__(self) -> None:
+        self.bodies: List[Dict[str, Any]] = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                outer.bodies.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0")))))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def configure(self, home: Path) -> None:
+        (home / "acceptance-webhook-url").write_text(f"http://127.0.0.1:{self.server.server_address[1]}/hook\n")
+        (home / "acceptance-webhook-token").write_text("local-acceptance-token\n")
+        (home / "notifier.json").write_text(json.dumps({
+            "source_id": "acceptance", "default_route": "local",
+            "routes": {"local": {"consumer": CONSUMER, "chat": "local fake webhook", "adapter": {
+                "type": "http", "url_file": str(home / "acceptance-webhook-url"),
+                "token_file": str(home / "acceptance-webhook-token"), "timeout_s": 5}}},
+            "reminder": {"ack_timeout_s": 3600, "max_wakes": 2}}))
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
 
 
 def relay(home: Path, *args: str, timeout: float = 900) -> Tuple[int, Dict[str, Any], List[str]]:
@@ -86,6 +129,7 @@ def main() -> int:
     ap.add_argument("--workdir", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--sabotage-resume", action="store_true", help="(fixture only) self-test of the FAIL path")
+    ap.add_argument("--notify", action="store_true", help="also check the notifier against a local fake webhook")
     a = ap.parse_args()
     if a.sabotage_resume and a.engine != "fixture":
         ap.error("--sabotage-resume is only for --engine fixture")
@@ -104,10 +148,16 @@ def main() -> int:
         a.out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
 
     relay(a.home, "init")
+    hook = None
+    if a.notify:
+        hook = LocalWebhook()
+        hook.configure(a.home)
     code, doc, cmd = relay(a.home, "doctor", "--engine", a.engine, "--cwd", str(a.workdir))
     step("preflight", "PASS" if code == 0 else "BLOCKED", command=cmd, engine_check=doc.get("engine"))
     if code != 0:
         report["result"] = "NOT RUN (auth path not confirmed as subscription)"
+        if hook:
+            hook.stop()
         write_report()
         print(json.dumps({"engine": a.engine, "result": report["result"]}))
         return 3
@@ -186,6 +236,31 @@ def main() -> int:
                  and not left_mine)
     step("events_ack", "PASS" if events_ok else "FAIL", command=cmd, expected=[list(e) for e in expected],
          seen=[list(e) for e in seen], events=acked, other_events_left_unacked=len(after["events"]) - len(left_mine))
+
+    if hook:
+        # Each terminal event was sent by the pass its keeper started. Further passes record the
+        # consumer ACKs of the previous step; a pass still sending is left to finish first.
+        mine_ids = {x["event_id"] for x in acked}
+        ledger_id = json.loads((a.home / "LEDGER.json").read_text(encoding="utf-8"))["ledger_id"]
+        rows: Dict[str, Dict[str, Any]] = {}
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            relay(a.home, "notify", "flush")
+            _, st, _ = relay(a.home, "notify", "status")
+            rows = {r["event_id"]: r for r in st["notifications"] if r["event_id"] in mine_ids}
+            if set(rows) == mine_ids and all(r["state"] == "acked" for r in rows.values()):
+                break
+            time.sleep(1)
+        sent = sorted(e["event_id"] for b in hook.bodies for e in b["cli_relay"]["events"])
+        named = all((b["cli_relay"]["source_id"], b["cli_relay"]["ledger_id"], b["cli_relay"]["route"])
+                    == ("acceptance", ledger_id, "local") for b in hook.bodies)
+        notify_ok = (bool(mine_ids) and sent == sorted(mine_ids) and named and set(rows) == mine_ids
+                     and all(r["state"] == "acked" and r["transport_accepted"] and r["consumer_acked"]
+                             for r in rows.values()))
+        step("notify", "PASS" if notify_ok else "FAIL", webhook_requests=len(hook.bodies), events_sent=len(sent),
+             distinct_events_sent=len(set(sent)), named_source_ledger_route=named,
+             states=sorted((r["state"], r["transport_accepted"], r["consumer_acked"]) for r in rows.values()))
+        hook.stop()
 
     verdicts = [s["verdict"] for s in report["steps"]]
     report["result"] = "PASS" if all(v == "PASS" for v in verdicts) else "FAIL"

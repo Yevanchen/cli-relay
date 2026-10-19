@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import unittest
 
-from helpers import REPO, RelayTestCase, run_cli, side_effects
+from helpers import REPO, RelayTestCase, base_env, run_cli, side_effects
 
 
 class BasicRoundTrip(RelayTestCase):
@@ -38,7 +37,7 @@ class BasicRoundTrip(RelayTestCase):
         sub = self.submit("k-entry", duration=0.2)
         self.cli("wait", sub["task_id"], "--timeout", "30")
         # A different process with a bare environment (as an SSH command would have) sees the same task.
-        bare = {"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", "/"), "PYTHONPATH": str(REPO)}
+        bare = {"PATH": "/usr/bin:/bin", "HOME": base_env()["HOME"], "PYTHONPATH": str(REPO)}
         code, out = run_cli(self.home, "status", "--key", "k-entry", env=bare)
         self.assertEqual(code, 0, out)
         self.assertEqual(out["task"]["task_id"], sub["task_id"])

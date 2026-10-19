@@ -20,12 +20,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import __version__, engines, procs
+from . import __version__, engines, notify, procs
 from .errors import NotFound, Refused, RelayError, UsageError
 from .keeper import _hook
 from .ledger import Ledger, init_ledger
 from .reconcile import old_run_stopped, reconcile_all, reconcile_task
-from .spawn import SpawnFailed, spawn_keeper
+from .spawn import SpawnFailed, spawn_keeper, spawn_notifier_pass
 
 MAX_PROMPT_BYTES = 1 << 20
 _NAME_RE = re.compile(r"^[A-Za-z0-9._:@/+-]{1,64}$")
@@ -154,17 +154,33 @@ def cmd_submit(args: argparse.Namespace) -> int:
     options = engines.validate_options(engine, _parse_options(args.option))
     payload = {"engine": engine, "cwd": cwd, "prompt": prompt, "options": options}
     ledger = Ledger(args.home, integrity=True)
+    existing = None
     try:
-        ledger.find_task(scope, key)
+        existing = ledger.find_task(scope, key)
     except NotFound:
         # Preconditions for new work only: a caller re-sending a known key (e.g. after a lost
         # reply) must get its task back even if the directory is gone or the disk is nearly full.
         if not os.path.isdir(cwd):
             raise UsageError("--cwd must be an existing directory")
         ledger.check_disk()
+    route = consumer = chat = None
+    bound = False
+    if existing is None:
+        # A retry recovers its first receipt, even if the route was removed or the
+        # notifier configuration changed after the original transaction committed.
+        cfg = notify.load_config(args.home) if notify.configured(args.home) else None
+        if args.notify_route is not None:
+            route = _check_route(args.notify_route, cfg)
+        if cfg is not None:
+            route = route if route is not None else cfg["default_route"]
+            if route is not None:
+                owner = cfg["routes"][route]
+                consumer, chat = owner["consumer"], owner["chat"]
+            bound = True
     native_sid = str(uuid.uuid4()) if engine in ("claude", "fixture") else None
     status, task, sha = ledger.submit(scope=scope, key=key, payload=payload, prompt=prompt,
-                                      native_session_id=native_sid)
+                                      native_session_id=native_sid, notify_route=route,
+                                      notify_consumer=consumer, notify_chat=chat, notify_bound=bound)
     _hook("submit_after_commit")  # fault injection: committed, keeper not yet started, no response sent
     keeper = "already_started"
     att = ledger.current_attempt(task["task_id"])
@@ -176,20 +192,53 @@ def cmd_submit(args: argparse.Namespace) -> int:
             keeper = "spawn_failed_retry_with_same_key"
     else:
         actions = reconcile_task(ledger, task["task_id"], kick=True, spawn=_spawner(args.home))
+        _after_reconcile(args.home, actions)
         if any(a["action"] in ("kicked_keeper", "released_claim_and_kicked") for a in actions):
             keeper = "kicked"
         task = ledger.get_task(task["task_id"])
         att = ledger.current_attempt(task["task_id"])
     emit({"ok": True, "accepted": True, "status": status, "task_id": task["task_id"], "state": task["state"],
           "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
-          "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper})
+          "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper,
+          "notify_route": task.get("notify_route"), "notify_consumer": task.get("notify_consumer"),
+          "notify_chat": task.get("notify_chat"), "notify_bound": task.get("notify_bound") == 1,
+          "notify_owner_state": "manual_restore" if task.get("notify_bound") == -1 else
+          ("bound" if task.get("notify_bound") == 1 else "unbound"),
+          "ledger_id": ledger.ledger_id})
     return 0
+
+
+def _check_route(route: str, cfg: Optional[Dict[str, Any]] = None) -> str:
+    if not notify.ROUTE_RE.match(route or ""):
+        raise UsageError("invalid --notify-route: use 1-32 chars of [A-Za-z0-9._-]")
+    if cfg is not None:
+        if route not in cfg["routes"]:
+            raise UsageError("--notify-route is not one of the routes in notifier.json", allowed=sorted(cfg["routes"]))
+    return route
+
+
+def _after_reconcile(home: Path, actions: List[Dict[str, Any]]) -> None:
+    """Reconciliation that closed an attempt created an event: start a notifier pass for it."""
+    if any(a.get("event_id") for a in actions) and notify.configured(home):
+        spawn_notifier_pass(home)
+
+
+def _source(home: Path, ledger: Ledger) -> Dict[str, Any]:
+    source_id = default_route = None
+    if notify.configured(home):
+        try:
+            cfg = notify.load_config(home)
+            source_id, default_route = cfg["source_id"], cfg["default_route"]
+        except RelayError:
+            pass
+    return {"source_id": source_id, "ledger_id": ledger.ledger_id, "default_route": default_route}
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     ledger = Ledger(args.home)
     task_id = _resolve_task(ledger, args)
     actions = [] if args.no_reconcile else reconcile_task(ledger, task_id, kick=True, spawn=_spawner(args.home))
+    _after_reconcile(args.home, actions)
     emit({"ok": True, **task_view(ledger, task_id), "reconcile": actions})
     return 0
 
@@ -199,7 +248,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
     task_id = _resolve_task(ledger, args)
     deadline = time.monotonic() + max(0.0, args.timeout)
     while True:
-        reconcile_task(ledger, task_id, kick=True, spawn=_spawner(args.home))
+        _after_reconcile(args.home, reconcile_task(ledger, task_id, kick=True, spawn=_spawner(args.home)))
         state = ledger.get_task(task_id)["state"]
         if state not in ("accepted", "running"):
             emit({"ok": True, "timed_out": False, **task_view(ledger, task_id)})
@@ -214,23 +263,39 @@ def cmd_wait(args: argparse.Namespace) -> int:
 def cmd_events(args: argparse.Namespace) -> int:
     consumer = _check_name("consumer", args.consumer)
     ledger = Ledger(args.home)
+    if ledger.has_notifier() and notify.configured(args.home):
+        try:
+            cfg = notify.load_config(args.home)
+        except RelayError:
+            pass  # Stored results and ownership remain readable with an invalid notifier config.
+        else:
+            ledger.bind_notification_owners(cfg)
     if not args.no_reconcile:
         # Polling is the recovery path too: an attempt that provably never started is kicked here.
         if args.task:
-            reconcile_task(ledger, args.task, kick=True, spawn=_spawner(args.home))
+            _after_reconcile(args.home, reconcile_task(ledger, args.task, kick=True, spawn=_spawner(args.home)))
         else:
-            reconcile_all(ledger, kick=True, spawn=_spawner(args.home))
+            _after_reconcile(args.home, reconcile_all(ledger, kick=True, spawn=_spawner(args.home)))
     rows = ledger.events_for(consumer, task_id=args.task, include_acked=args.include_acked)
     warning = None
     try:
         counts = ledger.record_deliveries(consumer, [r["event_id"] for r in rows])
     except RelayError as exc:  # delivery bookkeeping is best effort; never hide events because of it
         counts, warning = {}, exc.code
+    source = _source(args.home, ledger)
+    owners = ledger.task_notification_owners([r["task_id"] for r in rows])
+    source.pop("default_route")
+    # Every event names its machine, its ledger and its route, so two hosts are never mixed up.
     events = [{"event_id": r["event_id"], "task_id": r["task_id"], "attempt_no": r["attempt_no"], "kind": r["kind"],
                "created_at": r["created_at"], "acked_at": r["acked_at"],
                "superseded": r["attempt_no"] < r["current_attempt"], "delivery_count": counts.get(r["event_id"]),
+               **source, "route": owners.get(r["task_id"], {}).get("route"),
+               "owner_consumer": owners.get(r["task_id"], {}).get("consumer"),
+               "owner_chat": owners.get(r["task_id"], {}).get("chat"),
+               "route_bound": owners.get(r["task_id"], {}).get("bound", False),
+               "owner_state": owners.get(r["task_id"], {}).get("binding_state", "manual_restore"),
                "body": _loads(r["body_json"])} for r in rows]
-    out: Dict[str, Any] = {"ok": True, "consumer": consumer, "events": events}
+    out: Dict[str, Any] = {"ok": True, "consumer": consumer, **source, "events": events}
     if warning:
         out["warning"] = warning
     emit(out)
@@ -240,8 +305,17 @@ def cmd_events(args: argparse.Namespace) -> int:
 def cmd_ack(args: argparse.Namespace) -> int:
     consumer = _check_name("consumer", args.consumer)
     ledger = Ledger(args.home)
+    # A consumer serving two machines names the ledger it means; an ACK never lands on another one.
+    source = _source(args.home, ledger)
+    if args.ledger_id is not None and args.ledger_id != ledger.ledger_id:
+        raise Refused("wrong_ledger", "this event belongs to another ledger", ledger_id=ledger.ledger_id,
+                      given_ledger_id=args.ledger_id)
+    if args.source_id is not None and args.source_id != source["source_id"]:
+        raise Refused("wrong_source", "this event belongs to another machine", source_id=source["source_id"],
+                      given_source_id=args.source_id)
     res = ledger.ack(task_id=args.task, attempt_no=args.attempt, event_id=args.event, consumer=consumer)
-    emit({"ok": True, "acked": True, **res})
+    source.pop("default_route")
+    emit({"ok": True, "acked": True, **res, **source})
     return 0
 
 
@@ -346,6 +420,7 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         actions = reconcile_task(ledger, ledger.get_task(args.task_id)["task_id"], kick=True, spawn=spawn)
     else:
         actions = reconcile_all(ledger, kick=True, spawn=spawn)
+    _after_reconcile(args.home, actions)
     emit({"ok": True, "actions": actions})
     return 0
 
@@ -378,6 +453,53 @@ def cmd_keeper(args: argparse.Namespace) -> int:
     return run(args.home, args.task_id, args.attempt_id)
 
 
+def cmd_migrate(args: argparse.Namespace) -> int:
+    ledger = Ledger(args.home, integrity=True)
+    emit({"ok": True, **ledger.migrate(backfill=args.backfill), "ledger_id": ledger.ledger_id})
+    return 0
+
+
+def cmd_notify_flush(args: argparse.Namespace) -> int:
+    emit({"ok": True, **notify.flush(args.home)})
+    return 0
+
+
+def cmd_notify_run(args: argparse.Namespace) -> int:
+    if args.interval < 1:
+        raise UsageError("--interval must be at least 1 second")
+    notify.load_config(args.home)  # a broken configuration fails here, before the loop starts
+    Ledger(args.home).require_notifier()
+    emit({"ok": True, **notify.run_forever(args.home, args.interval, args.max_passes)})
+    return 0
+
+
+def cmd_notify_status(args: argparse.Namespace) -> int:
+    emit({"ok": True, "notifications": notify.status(args.home, task_id=args.task, event_id=args.event)})
+    return 0
+
+
+def cmd_notify_retry(args: argparse.Namespace) -> int:
+    changed = notify.retry(args.home, args.event)
+    if not changed:
+        raise Refused("not_retryable", "no failed or unacknowledged notification for this event", event_id=args.event)
+    emit({"ok": True, "event_id": args.event, "rescheduled": changed})
+    return 0
+
+
+def cmd_notify_bind_owner(args: argparse.Namespace) -> int:
+    route = _check_route(args.route)
+    consumer = _check_name("consumer", args.consumer)
+    if len(args.chat) > 80:
+        raise UsageError("--chat must be a label of at most 80 characters")
+    ledger = Ledger(args.home)
+    try:
+        result = ledger.restore_notification_owner(args.task, route=route, consumer=consumer, chat=args.chat)
+    finally:
+        ledger.close()
+    emit({"ok": True, **result})
+    return 0
+
+
 # ------------------------------------------------------------------------------- parser
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # type: ignore[override]
@@ -400,6 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--prompt")
     s.add_argument("--prompt-file")
     s.add_argument("--option", action="append", default=[], metavar="KEY=VALUE")
+    s.add_argument("--notify-route", help="route in notifier.json that is woken when the task ends")
     s.set_defaults(func=cmd_submit)
 
     for name, func, helptext in (("status", cmd_status, "show a task (reconciles first)"),
@@ -432,6 +555,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--task", required=True)
     a.add_argument("--attempt", required=True, type=int)
     a.add_argument("--event", required=True)
+    a.add_argument("--ledger-id", help="refuse unless the event belongs to this ledger")
+    a.add_argument("--source-id", help="refuse unless this machine has this notifier source id")
     a.set_defaults(func=cmd_ack)
 
     r = sub.add_parser("resume", help="explicitly continue the exact native session in a new attempt")
@@ -452,6 +577,32 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--engine", choices=engines.ENGINES)
     d.add_argument("--cwd", help="task directory whose project configuration is checked (default: current)")
     d.set_defaults(func=cmd_doctor)
+
+    m = sub.add_parser("migrate", help="add the notifier tables to an existing ledger (backup first)")
+    m.add_argument("--backfill", action="store_true", help="also notify events from before the migration")
+    m.set_defaults(func=cmd_migrate)
+
+    n = sub.add_parser("notify", help="wake the configured consumer when tasks end (see docs/notifier.md)")
+    nsub = n.add_subparsers(dest="notify_cmd", required=True)
+    nf = nsub.add_parser("flush", help="one pass: enqueue, retry, send what is due")
+    nf.set_defaults(func=cmd_notify_flush)
+    nr = nsub.add_parser("run", help="a pass every --interval seconds until SIGTERM (for launchd/systemd)")
+    nr.add_argument("--interval", type=float, default=60.0)
+    nr.add_argument("--max-passes", type=int)
+    nr.set_defaults(func=cmd_notify_run)
+    ns = nsub.add_parser("status", help="transport state and consumer ACK of each notification")
+    ns.add_argument("--task")
+    ns.add_argument("--event")
+    ns.set_defaults(func=cmd_notify_status)
+    nt = nsub.add_parser("retry", help="give a failed or unacknowledged notification a new budget")
+    nt.add_argument("--event", required=True)
+    nt.set_defaults(func=cmd_notify_retry)
+    nb = nsub.add_parser("bind-owner", help="explicitly restore the original owner of a migrated task")
+    nb.add_argument("--task", required=True)
+    nb.add_argument("--route", required=True)
+    nb.add_argument("--consumer", required=True)
+    nb.add_argument("--chat", required=True)
+    nb.set_defaults(func=cmd_notify_bind_owner)
 
     k = sub.add_parser("_keeper", help="(internal) supervise one attempt")
     k.add_argument("task_id")

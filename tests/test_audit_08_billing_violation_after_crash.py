@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from helpers import RelayTestCase, base_env, wait_until
+from helpers import RelayTestCase, base_env, needs_clean_cli_config, wait_until
 from test_audit_03_provider_bypass import fake_codex
 
 from cli_relay import procs
@@ -18,7 +18,8 @@ class BillingViolationSurvivesKeeperCrash(RelayTestCase):
         return bool(r["keeper_pid"]) and procs.same_process_alive(r["keeper_pid"], r["keeper_token"]) is False
 
     def finished(self, task_id: str) -> dict:
-        return wait_until(lambda: (lambda s: s if s["task"]["state"] not in ("accepted", "running") else None)(
+        # A detected guard stays unknown while the orphan CLI/group is still alive.
+        return wait_until(lambda: (lambda s: s if s["attempts"][0]["state"] == "finished" else None)(
             self.status(task_id)), timeout=30, interval=0.3)
 
     def test_keeper_dies_after_exit_record(self) -> None:
@@ -36,6 +37,7 @@ class BillingViolationSurvivesKeeperCrash(RelayTestCase):
         done = self.finished(sub["task_id"])
         self.assertEqual(done["task"]["state"], "blocked")
 
+    @needs_clean_cli_config
     def test_codex_provider_record_is_checked_after_a_keeper_crash(self) -> None:
         # The poller has neither CODEX_HOME nor the fake binary: reconciliation must still read the
         # thread record where the keeper's run wrote it.

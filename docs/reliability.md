@@ -1,9 +1,13 @@
 # Reliability model
 
 This document states what cli-relay guarantees, under which preconditions, and where the
-guarantees stop. Mechanism evidence (this document plus the fault-injection tests) and the real
-25-hour soak are reported separately in [`acceptance.md`](acceptance.md). Neither stands in
-for the other.
+guarantees stop. It is the **argument** (theory). The evidence comes in two other kinds, reported
+separately in [`acceptance.md`](acceptance.md):
+- **short tests:** fault injection with real OS processes, a local fake webhook, and a few real
+  CLI loops;
+- **the real 25-hour soak.**
+
+None of the three stands in for another. Their current status is in "Evidence" at the end.
 
 ## Components and ownership
 
@@ -96,10 +100,15 @@ There is no fallback to another source. `ps -o lstart` was dropped for two reaso
 - A token from another source or precision cannot be compared with the recorded one. Doing
   so made a live keeper look recycled.
 
-So a failed kernel query, or a recorded token of another source, answers "cannot verify". On
-Linux a different boot id means "gone", and an unreadable boot id means "cannot verify".
+So these answer "cannot verify":
+- a failed kernel query;
+- a recorded token of another source;
+- a token with any missing part, even when both sides are missing the same part. A Linux token
+  whose boot id could not be read is an example.
+
+On Linux a different (readable) boot id means "gone".
 Tests: `test_failed_kernel_query_does_not_fall_back_to_a_different_token`,
-`test_live_keeper_with_an_incomparable_token_keeps_its_claim`.
+`test_live_keeper_with_an_incomparable_token_keeps_its_claim`, `test_both_boot_ids_missing`.
 
 A recycled pid is treated as "gone" (`test_recycled_pid_is_not_mistaken_for_the_keeper`). An
 unverifiable answer is treated as "may be alive" and blocks closing and resuming. A lock, a pid
@@ -112,6 +121,15 @@ Signals follow the same rule.
   group id cannot be reused while a member exists.
 - Otherwise nothing is signalled. The request stays in the ledger and the reply says why
   (`test_cancel_does_not_signal_a_recycled_process_group`).
+- After a cancel or a guard stop, the keeper stops its whole process group except itself: the
+  CLI, and tool processes the CLI left in the group.
+  - Every other member gets SIGTERM, then SIGKILL after the grace (10 s).
+  - The terminal state is committed only once the group is empty, and the evidence records
+    `terminated`, `killed` and `remaining`
+    (`test_a_term_ignoring_descendant_is_stopped_before_the_commit`).
+  - Members are listed from the kernel (`kinfo_proc` on macOS, `/proc` on Linux).
+  - A group id cannot be reused while the keeper is in it, so every member is the attempt's own.
+  - After a normal exit, lingering members are left alone but counted in the evidence.
 
 Concurrency rules:
 - **Concurrent submits** of one key converge on one task and one execution (`BEGIN IMMEDIATE` plus a unique `(scope, key)` index).
@@ -125,6 +143,18 @@ Concurrency rules:
   `cancel_lost_race` is recorded. This is decided inside the transaction that closes the
   attempt, so a cancel committed just before that commit is not missed
   (`test_cancel_between_outcome_decision_and_commit`).
+- **Cancel vs. reconciliation.** Reconciliation decides from a snapshot. The write that would
+  mark the attempt `unknown` re-reads it in its own transaction: if a cancel was committed
+  meanwhile, the attempt is closed as `cancelled` (stopped without a result after a cancel).
+  - An attempt that an earlier version left `unknown` with a cancel recorded converges to
+    `cancelled` once its processes are provably gone
+    (`test_cancel_after_the_snapshot_is_seen_by_the_closing_write`,
+    `test_an_attempt_already_stuck_in_unknown_with_a_cancel_converges`).
+- **A preflight never crashes the keeper.**
+  - A configuration of unexpected structure is itself a reason to block.
+  - Any other exception in the preflight or in building argv closes the attempt as `blocked`.
+  - Otherwise reconciliation would release the claim and re-kick a keeper that crashes the same
+    way (`test_the_task_reaches_blocked_with_one_event_and_no_cli_start`).
 
 ## Subscription-only and permission guards
 
@@ -135,6 +165,17 @@ Permission posture does not depend on the CLIs' configuration of the moment:
 - A Claude settings layer whose `permissions.defaultMode` is `bypassPermissions`, or an init
   event reporting that mode, blocks the run. In that mode nothing would ever be denied.
 - `danger-full-access` and every permission-bypass flag are rejected in argv.
+- `--sandbox` is not the only thing that decides a Codex run's permissions: named permission
+  profiles and requirements can take precedence. Codex runs are checked on both sides:
+  - before the run, a permission setting, a requirements or managed-preference layer, or an unsafe or
+    unreadable config-profile selected by `profile` blocks the run; benign profiles are parsed;
+  - after the run, every `turn_context` in the thread's rollout must show the requested sandbox
+    (or a narrower one) and no active named permission profile. Otherwise the attempt is
+    `blocked`; a thread without that record is `permissions_unverified`. Before an exact resume,
+    the keeper records the rollout path, file identity and byte boundary in attempt evidence.
+    A resumed attempt also needs a new `turn_context` after that boundary. Missing evidence,
+    replacement or truncation of that file is unverified; reconciliation uses the same saved
+    boundary, so an earlier safe turn cannot certify a later attempt.
 
 The relay refuses to run, or stops and closes as `blocked`, whatever it can see routing a run
 away from the subscription login. It checks:
@@ -142,20 +183,26 @@ away from the subscription login. It checks:
 1. **Before the CLI starts (keeper preflight; also `doctor --engine E --cwd D`):**
    - billing or gateway variables in the environment (names only are reported);
    - the CLI's configuration layers that apply to the task directory:
-     - Codex: system, user (`$CODEX_HOME` or `~/.codex`), the active profile, every
-       `.codex/config.toml` from `/` down to the task directory, and managed. A non-default
-       `model_provider`, an override of the built-in `openai` provider, any `*base_url`
-       key, or an API login method blocks the run.
+     - Codex: system, user (`$CODEX_HOME` or `~/.codex`), the active profile and the
+       config-profile file it selects, every `.codex/config.toml` from `/` down to the task
+       directory, and managed. These block the run:
+       - a non-default `model_provider`;
+       - an override of the built-in `openai` provider;
+       - any `*base_url` key;
+       - an API login method;
+       - a permission setting.
      - Claude: user (`$CLAUDE_CONFIG_DIR` or `~/.claude`), `.claude/settings.json` and
        `settings.local.json` of the task directory and its parents, and managed. A
        credential helper (`apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`), a
        non-claude.ai `forceLoginMethod`, or a billing variable in `env` blocks the run.
-     - An unreadable layer also blocks: what cannot be confirmed is not run.
+     - An unreadable layer or an invalid checked routing/permission value blocks. This is
+       not a complete validator for every value accepted by the vendor configuration format.
    - the login (`claude auth status` → claude.ai / firstParty; `codex login status` → ChatGPT).
 2. **While it runs:** a Claude init event that reports an API-key source (or bypass mode)
    stops the CLI.
-3. **After it ran:** the Codex thread's own record (`session_meta.model_provider` in its
-   rollout) must name `openai`. A missing record also counts as unverified.
+3. **After it ran:** the Codex thread's own record must name `openai`
+   (`session_meta.model_provider` in its rollout) and show the requested sandbox for every turn.
+   A missing record also counts as unverified.
 
 The keeper and reconciliation name the outcome through one function. The guard result is
 therefore the same even when the keeper died before committing: the init event is re-read
@@ -253,10 +300,50 @@ Without a backup, physical corruption cannot be repaired.
 - The verdict counts what actually ran:
   - every key must reach `succeeded` with exactly its expected number of executions;
   - the run must last its planned time;
-  - the long task must run at least 95% of its configured duration.
+  - the long task must run at least 95% of its configured duration;
+  - every attempt must have its event (terminal or unknown), delivered to and acknowledged by
+    the soak consumer. A run that produced no events cannot pass.
 
-  A soak started before that rule existed (audit #9) must be re-evaluated with
-  `soak.py verdict --dir DIR`, which only reads its files.
+  A soak started before these rules existed must be re-evaluated with `soak.py verdict --dir
+  DIR`, which only reads its files.
+
+## Notifier (v0.2)
+
+The notifier ([`notifier.md`](notifier.md)) is a separate, deterministic program that turns
+committed events into wake-ups of the consumer. It cannot change a task: it reads tasks and
+events, and writes only its own `notifications` rows.
+
+| # | Crash or fault | What is durable | What happens | Test |
+|---|---|---|---|---|
+| N1 | the task ends, no pass runs (machine off, keeper died after the commit) | the event | the next pass enqueues and sends it | `test_migrate_backs_up_then_notifies_only_new_events` |
+| N2 | a pass dies after claiming, before marking `sending` | `claimed` + a dead claimer | provably not sent: back to `pending`, sent once by the next pass | `test_crash_before_send_is_sent_once_by_the_next_pass` |
+| N3 | a pass dies after `sending` (possibly after the POST) | `sending` + a dead claimer | may have woken the consumer: `unconfirmed`, no immediate resend, at most a bounded reminder | `test_crash_after_send_is_never_resent_blindly` |
+| N4 | the receiver is unreachable or restarts | `pending` with `next_at` | exponential backoff up to `max_attempts`, then `failed` (kept) | `test_outage_then_recovery`, `test_server_restart_between_two_events`, `test_retries_are_bounded` |
+| N5 | the request may have arrived but the response is lost or times out | `unconfirmed` | as N3 | `test_lost_response_is_unconfirmed_and_reminded_within_bounds` |
+| N6 | 429 / 5xx | `pending` with `next_at` (≥ `Retry-After`), or `failed` if a bound is reached | counts as a possible wake; retried within both bounds | `test_rate_limited_then_accepted` |
+| N7 | accepted, but the consumer never ACKs (its run failed, its ACK was lost) | `accepted` / `handed_off` | one reminder per `ack_timeout_s` up to `max_wakes`, then `unacknowledged`; never cleared | `test_a_lost_consumer_ack_gets_a_bounded_reminder`, `test_unacknowledged_events_are_never_cleared` |
+| N8 | concurrent passes, repeated passes, duplicate submits | one row per (event, route) | compare-and-set claims: one send | `test_concurrent_passes_and_duplicate_submits_send_once` |
+| N9 | an ACK arrives during a send | `sending` | the sender records its send; the next pass records the ACK | `test_an_ack_during_a_send_keeps_the_send_on_record` |
+
+Guarantees, given that the machine runs, the ledger is writable and a pass runs from time to
+time (the keeper's own pass plus `notify run`):
+- an event is offered to its stored owner while that route is valid; missing or changed owners,
+  permanent transport rejection or exhausted bounds leave a visible failure for explicit repair;
+- no event is offered more than `max_attempts` times, and no more than `max_wakes` of those
+  calls may have reached the consumer; this includes HTTP error responses and started commands
+  that exit non-zero, and it does not measure how many model runs the receiver actually starts;
+- a notification never runs, resumes or re-runs a task;
+- the transport result and the consumer ACK are stored separately; neither is inferred from
+  the other or from pull reads.
+
+Not guaranteed:
+- that a wake-up leads to a chat message, or that anyone reads it;
+- that the Bot is woken only once per event (bounded duplicates are possible, see N3, N5, N7);
+- anything while the machine is asleep or off.
+
+Two machines are two independent ledgers and notifiers. Every payload names `source_id` and
+`ledger_id`, and `ack --ledger-id` refuses an event of another ledger
+(`test_each_host_names_itself_and_acks_never_cross`).
 
 ## Residual risks
 
@@ -273,4 +360,21 @@ Without a backup, physical corruption cannot be repaired.
 - Cancellation cannot undo work the CLI has already done. "No side effect" in the cancel test
   only reflects the fixture's timing.
 - A same-UID local user can edit the ledger. The ledger is not a security boundary.
-- Timestamps use the wall clock. Clock jumps affect only the 5 s re-kick grace period and reporting.
+- Persisted timestamps use the wall clock. Clock jumps can affect the re-kick grace, retry
+  deadlines, ACK reminder timing and reporting; they do not prove whether a process stopped.
+
+
+## Evidence
+
+The three kinds are kept apart:
+
+1. **Argument**: this document.
+2. **Short tests**: the fault-injection suite (fixture engine, real OS processes), the notifier
+   scenarios against a local fake webhook, a scaled-down soak, and a few real Claude Code and
+   Codex loops. The results are in [`acceptance.md`](acceptance.md); they show the mechanisms,
+   not long-run behaviour.
+3. **The real 25-hour soak**: not completed for this version. It does not block this controlled
+   rollout, but nothing here is claimed to have run for 25 hours.
+
+Two-machine deployment, and a real 30-minute window with the real Bot, are **NOT RUN** (pending
+deployment).

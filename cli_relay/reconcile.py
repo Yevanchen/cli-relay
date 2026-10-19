@@ -36,6 +36,11 @@ def _evidence(att: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
 
+def _may_still_run(att: Dict[str, Any], cli_alive: Optional[bool], group_alive: Optional[bool]) -> bool:
+    """Whether the CLI or its descendants may still run (the keeper is known to be gone)."""
+    return group_alive is not False or (bool(att["cli_pid"]) and cli_alive is not False)
+
+
 def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
                       spawn: Optional[Spawner]) -> Dict[str, Any]:
     action: Dict[str, Any] = {"task_id": att["task_id"], "attempt_no": att["attempt_no"],
@@ -79,30 +84,13 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
         # The same decision the keeper makes, including the billing guard it may have tripped.
         return engines.decide(engine, parsed, env=env, session_id=parsed["session_id"] or att["native_session_id"],
                               exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,
-                              cancel_requested=cancel_requested, guard=(exit_info or {}).get("billing_guard"))
+                              cancel_requested=cancel_requested, guard=(exit_info or {}).get("billing_guard"),
+                              sandbox=engines.requested_sandbox(engine, json.loads(task["payload_json"])),
+                              permission_checkpoint=_evidence(att).get("codex_permission_checkpoint"),
+                              resume_session_id=att["resume_session_id"])
 
-    if exit_info is not None:
-        # The keeper died after recording the exit status but before committing it.
-        outcome, decided = decide(exit_info.get("exit_code"), exit_info.get("signal"), True)
-        eid = ledger.finish(att["attempt_id"], from_states=(state,), outcome=outcome,
-                            exit_code=exit_info.get("exit_code"), exit_signal=exit_info.get("signal"),
-                            exit_known=True, native=native,
-                            evidence={"exit_source": "exit.json", "reconciled_at": now_iso(), **decided},
-                            source="reconcile")
-        action.update(action="finished_from_exit_record", event_id=eid)
-        return action
-
-    if state == "unknown":
-        if native is not None:  # late evidence
-            outcome, decided = decide()
-            eid = ledger.finish(att["attempt_id"], from_states=("unknown",), outcome=outcome, exit_known=False,
-                                native=native, evidence={"late_native_result_at": now_iso(), **decided},
-                                source="reconcile")
-            action.update(action="finished_from_late_native_result", event_id=eid)
-        return action
-
-    if state == "claimed" and not att["spawn_started_at"]:
-        # 'spawning' is committed before Popen, so its absence proves the CLI never started.
+    if exit_info is None and state == "claimed" and not att["spawn_started_at"]:
+        # No spawning record proves the CLI never started, even if the old group is unverifiable.
         released = ledger.release_claim(att["attempt_id"], keeper_pid=att["keeper_pid"],
                                         evidence={"claim_released_at": now_iso(),
                                                   "claim_released_reason": "keeper_died_before_spawn"})
@@ -112,18 +100,63 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
             action["action"] = "released_claim_and_kicked"
         return action
 
+    outcome, decided = decide((exit_info or {}).get("exit_code"), (exit_info or {}).get("signal"),
+                              exit_info is not None)
     cli_alive = procs.same_process_alive(att["cli_pid"], att["cli_token"]) if att["cli_pid"] else None
     group_alive = procs.group_alive(att["keeper_pgid"])
     action.update(cli_alive=cli_alive, group_alive=group_alive)
-    maybe_running = (cli_alive is True
-                     or (cli_alive is None and group_alive is not False))
+    maybe_running = _may_still_run(att, cli_alive, group_alive)
+    must_stop = (outcome in ("cancelled", "blocked") or "process_group_cleanup" in (exit_info or {})
+                 or _evidence(att).get("unknown_reason") == "process_group_not_stopped")
+    if must_stop and maybe_running:
+        evidence = {"unknown_reason": "process_group_not_stopped", "cli_alive": cli_alive,
+                    "process_group_alive": group_alive, **decided}
+        if state == "unknown":
+            ledger.add_evidence(att["attempt_id"], evidence)
+            eid = None
+        else:
+            eid = ledger.mark_unknown(att["attempt_id"], from_states=(state,), evidence=evidence,
+                                      processes_stopped=False)
+        action.update(action="observing_process_group_after_stop", event_id=eid)
+        return action
+    if must_stop:
+        decided = {**decided, "processes_stopped": True, "cli_alive": cli_alive,
+                   "process_group_alive": group_alive}
+
+    if exit_info is not None:
+        # The keeper died after recording the exit status but before committing it.
+        if "process_group_cleanup" in exit_info:
+            decided = {**decided, "process_group_cleanup": exit_info["process_group_cleanup"]}
+        eid = ledger.finish(att["attempt_id"], from_states=(state,), outcome=outcome,
+                            exit_code=exit_info.get("exit_code"), exit_signal=exit_info.get("signal"),
+                            exit_known=True, native=native,
+                            evidence={"exit_source": "exit.json", "reconciled_at": now_iso(), **decided},
+                            source="reconcile")
+        action.update(action="finished_from_exit_record", event_id=eid)
+        return action
+
+    if state == "unknown":
+        if native is not None or outcome == "blocked":  # late evidence, or a guard after its group stopped
+            eid = ledger.finish(att["attempt_id"], from_states=("unknown",), outcome=outcome, exit_known=False,
+                                native=native, evidence={"reconciled_at": now_iso(), **decided},
+                                source="reconcile")
+            action.update(action="finished_from_late_native_result" if native is not None
+                          else "finished_blocked_without_result", event_id=eid)
+        elif cancel_requested and not maybe_running:
+            # Left `unknown` with a cancel recorded (a race in earlier versions): the run stopped
+            # without a result after a cancel.
+            eid = ledger.finish(att["attempt_id"], from_states=("unknown",), outcome="cancelled", exit_known=False,
+                                evidence={"stopped_after_cancel_without_result": True,
+                                          "converged_from_unknown_at": now_iso(), **decided}, source="reconcile")
+            action.update(action="finished_cancelled_after_unknown", event_id=eid)
+        return action
+
     if maybe_running:
         if "keeper_lost_at" not in _evidence(att):
             ledger.add_evidence(att["attempt_id"], {"keeper_lost_at": now_iso(), "cli_running_without_keeper": True})
         action["action"] = "observing_cli_without_keeper"
         return action
 
-    outcome, decided = decide()
     if native is not None:
         eid = ledger.finish(att["attempt_id"], from_states=(state,), outcome=outcome, exit_known=False,
                             native=native,
@@ -144,7 +177,7 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
         # A cancel was requested and the run has stopped without producing a result.
         eid = ledger.finish(att["attempt_id"], from_states=(state,), outcome="cancelled", exit_known=False,
                             evidence={"exit_source": "unavailable_keeper_lost",
-                                      "stopped_after_cancel_without_result": True, "reconciled_at": now_iso()},
+                                      "stopped_after_cancel_without_result": True, "reconciled_at": now_iso(), **decided},
                             source="reconcile")
         action.update(action="finished_cancelled_without_result", event_id=eid)
         return action
@@ -164,7 +197,7 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
         "native_trace_found": engines.native_trace_exists(engine, att["native_session_id"]),
         "marked_unknown_at": now_iso(),
     }
-    eid = ledger.mark_unknown(att["attempt_id"], from_states=(state,), evidence=evidence)
+    eid = ledger.mark_unknown(att["attempt_id"], from_states=(state,), evidence=evidence, processes_stopped=True)
     action.update(action="marked_unknown", event_id=eid)
     return action
 

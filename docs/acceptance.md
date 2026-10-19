@@ -12,36 +12,42 @@ Status words: **PASS**, **FAIL**, **NOT RUN** (with the reason), **RUNNING**.
 
 ## Code under test
 
-- Product code, scripts and tests at commit `a431845`. Later commits change documentation only.
-  - It includes the fixes for the external audit of `6c8d2f3` (product code `b72618d`), one commit
-    per finding (see [`decisions.md`](decisions.md), D11).
+- Branch `v0.2.0`; original candidate evidence is in section 2.4; subsequent independent-review
+  fixes and their separate verification are in section 2.5.
+  - It adds the notifier ([`notifier.md`](notifier.md), [`decisions.md`](decisions.md) D12).
+  - It fixes the findings of the independent audit of v0.1.0 (D13).
+  - The independent-review fixes change code and tests; earlier real-CLI results are historical.
 - macOS (Darwin 25.2.0, arm64), Python 3.14.3, SQLite 3.52.0.
 - Claude Code 2.1.301 (subscription login), Codex CLI 0.163.0 (ChatGPT login).
 - Linux and Python 3.11 / 3.12 / 3.14 are covered by CI
-  ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml), free `ubuntu-latest`). That CI has
-  not run yet; results appear once the repository is published.
+  ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml), free `ubuntu-latest`). It runs on
+  the pull request.
 
 ## How to reproduce
 
 ```sh
-python3 -m unittest discover -s tests -t tests -v                       # ~2 min, fixture engine only
+python3 -m unittest discover -s tests -t tests -v                       # ~4 min, fixture engine and a local fake webhook
 python3 scripts/soak.py run --dir SOAK --hours 0.03                     # scaled-down soak, exit 0 only on PASS
-python3 scripts/real_cli_acceptance.py --engine claude --home H --workdir W --out claude.json
-python3 scripts/real_cli_acceptance.py --engine codex  --home H --workdir W --out codex.json
+python3 scripts/real_cli_acceptance.py --engine claude --notify --home H --workdir W --out claude.json
+python3 scripts/real_cli_acceptance.py --engine codex  --notify --home H --workdir W --out codex.json
 python3 scripts/soak.py start --dir SOAK25 --hours 25                   # the real 25 h soak
 python3 scripts/soak.py verdict --dir SOAK25                            # evaluate it when finished
 ```
 
 Each real-CLI run makes two tiny model calls plus one request rejected for an unknown model,
-all on the existing subscription. It refuses to run (NOT RUN, exit 3) unless `doctor --engine
---cwd` confirms a subscription login and configuration for the work directory. It exits 0
-only on PASS.
+all on the existing subscription.
+- It refuses to run (NOT RUN, exit 3) unless `doctor --engine --cwd` confirms a subscription
+  login and configuration for the work directory.
+- With `--notify` it points the run's notifier at a webhook on 127.0.0.1 that the script itself
+  starts. No real Bot is contacted.
+- It exits 0 only on PASS.
 
 ## 1. Argument
 
 [`reliability.md`](reliability.md) covers:
 - the attempt state machine;
 - the crash windows W0–W9 and what each leaves durable;
+- the notifier's crash windows N1–N9 and its bounds;
 - process identity, and when the relay may signal a process;
 - the subscription and permission guards;
 - the safety and liveness conditions;
@@ -80,7 +86,7 @@ every schedule.
 | D3 | ACK with wrong task / attempt / unknown event is rejected | `test_mismatched_ack_is_rejected` | PASS |
 | D4 | Consumers are independent; an offline consumer reads everything later | `test_consumers_are_independent`, `test_offline_consumer_reads_everything_later` | PASS |
 | D5 | No code path deletes results (no TTL, no GC) | `test_ledger_code_never_deletes` (a search for delete statements; the design argument is in `reliability.md`) | PASS |
-| D6 | An empty poll does not read the acknowledged history (filtered in SQL) | `test_empty_poll_reads_no_acknowledged_rows` | PASS |
+| D6 | Acknowledged events are filtered in SQL: an empty poll fetches no acknowledged rows into Python. SQLite still scans the event table, so the cost grows with history; no performance claim is made | `test_empty_poll_reads_no_acknowledged_rows` | PASS |
 | E1 | Cancel a running task → `cancelled` (SIGTERM recorded) | `test_cancel_running_task` | PASS ("no side effect" only reflects the fixture's timing; a cancel cannot undo work a real CLI already did) |
 | E2 | Cancel before any keeper → `cancelled_before_start`; resubmit does not run it | `test_cancel_pending_attempt_before_any_keeper` | PASS |
 | E3 | Cancel vs. completion race → exactly one terminal event; a lost cancel is recorded, also when the cancel lands between the outcome decision and the commit | `test_cancel_racing_completion_has_one_consistent_outcome`, `test_cancel_between_outcome_decision_and_commit` | PASS |
@@ -102,72 +108,119 @@ every schedule.
 | H0 | The real-CLI script itself: checks exactly its own three events, ACKs only those, leaves other events alone, exits non-zero on FAIL | `test_passes_and_acks_only_its_own_events`, `test_a_failed_step_gives_a_nonzero_exit_code` (fixture mode) | PASS |
 | I0 | The soak verdict fails on each false-pass path: a short task that never executed, a long task cut short, a run shorter than planned; `soak.py verdict` re-evaluates read-only | `test_a_short_task_that_never_executed_fails`, `test_a_long_task_cut_short_fails`, `test_a_run_shorter_than_planned_fails`, `test_unexecuted_short_task_and_too_short_long_task_fail`, `test_consistent_run_passes`, `test_verdict_command_re_evaluates_a_finished_soak_without_writing` | PASS |
 | J1 | Execution across machine sleep, power loss or reboot | — | NOT RUN (out of scope by design; sleep settings are not changed and the machine is not restarted) |
-| J2 | CI on `ubuntu-latest` with Python 3.11 / 3.12 / 3.14 | workflow in this repository | PASS on `baff533`: [push run](https://github.com/Yevanchen/cli-relay/actions/runs/39197188143), [tag run](https://github.com/Yevanchen/cli-relay/actions/runs/39197203482) |
+| J2 | CI on `ubuntu-latest` with Python 3.11 / 3.12 / 3.14 | workflow in this repository | v0.1.0: PASS on `baff533` ([push run](https://github.com/Yevanchen/cli-relay/actions/runs/39197188143), [tag run](https://github.com/Yevanchen/cli-relay/actions/runs/39197203482)). v0.2.0: runs on the pull request; see section 2.4 |
 
-### 2.2 Recorded short-test results on `a431845`
+### 2.2 Notifier (fixture engine, local fake webhook; no model, no real Bot)
 
-All of these are short tests. None of them is a long-run result.
+| # | Requirement | Evidence | Result |
+|---|---|---|---|
+| N1 | One wake-up per terminal event, naming source, ledger, route and event/task/attempt; transport accepted is kept apart from the consumer ACK; an acknowledged event is never sent again | `test_one_wake_with_routing_identity_then_the_consumer_ack_closes_it` | PASS |
+| N2 | Only configured outcomes wake the consumer; `cancelled` is opt-in; no route means no wake-up | `test_only_the_configured_outcomes_wake_the_consumer`, `test_cancelled_is_not_a_default_wake_and_no_route_means_no_wake` | PASS |
+| N3 | Crash before the send: sent once by the next pass | `test_crash_before_send_is_sent_once_by_the_next_pass` | PASS |
+| N4 | Crash after the send: never resent at once; one bounded reminder; then `unacknowledged` | `test_crash_after_send_is_never_resent_blindly` | PASS |
+| N5 | Receiver down, then back: retried with backoff, sent once | `test_outage_then_recovery` | PASS |
+| N6 | Response lost: `unconfirmed`, bounded reminder | `test_lost_response_is_unconfirmed_and_reminded_within_bounds` | PASS |
+| N7 | Receiver restart between two events: only the event not yet accepted is sent again | `test_server_restart_between_two_events` | PASS |
+| N8 | 429 with `Retry-After`: honoured, then accepted | `test_rate_limited_then_accepted` | PASS |
+| N9 | Bounded retries: exactly `max_attempts` calls, then `failed` (kept) | `test_retries_are_bounded` | PASS |
+| N10 | Concurrent passes and a duplicate submit: one send | `test_concurrent_passes_and_duplicate_submits_send_once` | PASS |
+| N11 | A lost consumer ACK: one reminder; a repeated ACK is a duplicate; then nothing more | `test_a_lost_consumer_ack_gets_a_bounded_reminder` | PASS |
+| N12 | An ACK during a send: the send stays on record | `test_an_ack_during_a_send_keeps_the_send_on_record` | PASS |
+| N13 | Accepted but never acknowledged (e.g. the Bot run failed on its rate limit): never cleared; only an explicit retry sends again | `test_unacknowledged_events_are_never_cleared` | PASS |
+| N14 | Two hosts: each names itself; an ACK never lands on the other ledger | `test_each_host_names_itself_and_acks_never_cross` | PASS |
+| N15 | `notify.sh`-style command adapter: five arguments, one sanitized line, exit 0 recorded as `handed_off` (not accepted), bounded reminder | `test_exit_0_is_a_hand_off_not_an_acceptance` | PASS |
+| N16 | The keeper starts a pass when the task ends | `test_the_keeper_starts_a_pass_when_the_task_ends` | PASS |
+| N17 | The token never appears in output or logs | `test_the_token_never_appears_in_output_or_logs` | PASS |
+| N18 | Invalid configuration is refused, nothing sent; an unknown route is refused at submit | `test_invalid_configuration_is_refused_and_nothing_is_sent`, `test_a_route_must_exist_in_the_configuration` | PASS |
+| N19 | Migration: backup first, idempotent, earlier events not notified (unless `--backfill`); an unmigrated ledger refuses notifier commands | `test_migrate_backs_up_then_notifies_only_new_events`, `test_backfill_includes_earlier_events`, `test_unmigrated_ledger_refuses_notifier_commands` | PASS |
+| N20 | Rollback: v0.1.0 (`baff533`) still reads a migrated ledger (status, events) | `test_v010_code_still_reads_a_migrated_ledger` (skipped where the checkout lacks that commit) | PASS |
+| N21 | The real-CLI acceptance script's notify step (fixture mode) | `test_notify_step_sends_each_terminal_event_once` | PASS |
 
-- **Fault-injection suite.** 105 tests: the 58 earlier tests (some extended) plus the audit
-  regression tests and the permission-posture tests. **105/105 passed in each of two
-  consecutive rounds** (107.1 s and 106.7 s).
-  - Before any fix, the audit regression tests were run on the audited code: 33 tests,
-    24 failures and 4 errors. Every must-fix item had a failing test. The 5 that passed were
-    controls or already-correct paths.
-  - Each test added later failed on the commit before its fix, unless it tests a helper or a
-    command that did not exist yet.
-  - The per-finding record is in [`decisions.md`](decisions.md) (D11).
-- **Scaled-down soak (0.03 h).** **PASS, 12/12 verdicts**, under the corrected verdict rules.
-  - It ran from a frozen copy of `a431845` for 0.03 h of the planned 0.03 h.
-  - The long task ran 0.029 h of its configured 0.029 h.
-  - 11 short tasks ran, each exactly once. No key was off, and no clock gaps occurred.
-  - 15 events: none lost or changed, and all ACKed at the end.
-  - The control restart was exercised, and repeated ACKs were reported as duplicates.
-  - The unknown task had exactly 2 attempts.
-  - `soak.py verdict` on the finished run also gave PASS (exit 0).
-  - The same scaled-down soak on `df2f153`, after the must-fix items, also passed.
-- **Real Claude Code loop, 3 runs.** **PASS 3/3**, every run 5/5 steps.
-  - Preflight: `claude.ai` / `firstParty`.
-  - Success in 6.1 s each.
-  - Failure: an unknown model gave exit 1 in 3.1–4.1 s, with `is_error: true` while
-    `subtype` was `success`.
-  - Exact resume: 5.1–7.2 s, same pre-assigned session id, and the model repeated the
-    earlier phrase.
-  - Events: exactly this run's 3 terminal events were seen and ACKed, and no others.
-  - The init event of every attempt reported `apiKeySource: none` and `permissionMode: default`.
-- **Real Codex loop, 3 runs.** **PASS 3/3**, every run 5/5 steps.
-  - Preflight: ChatGPT login, user configuration layer only.
-  - Success in 9.2–21.2 s; the thread record named provider `openai`, sandbox `read-only`.
-  - Failure: an unknown model gave exit 1 in 5.1–6.2 s, with an HTTP 400 that refers to
-    "a ChatGPT account".
-  - Exact resume: 8.2–10.2 s, same thread id. The resumed turn's sandbox was `read-only`, but
-    that is also this machine's default, so it does not by itself show the fix for audit #2
-    (the argv tests do).
-  - Events: exactly this run's 3 terminal events were seen and ACKed.
+### 2.3 Independent audit of v0.1.0 (regression tests; each failed before its fix)
+
+| # | Requirement | Evidence | Result |
+|---|---|---|---|
+| I1 | The soak verdict fails a run without events, and a run with one attempt missing its event | `test_zero_events_acks_and_deliveries_fail`, `test_one_attempt_without_its_event_fails`, `test_the_same_run_with_its_events_delivered_and_acked_passes` | PASS |
+| I2 | Codex permissions: permission settings, requirements, unsafe or unreadable selected profiles block the run; after it, a wider sandbox, a named profile or a missing record blocks | `test_ind_02_codex_permissions` (10 tests) | PASS |
+| I3 | Cancel racing reconciliation converges to `cancelled` | `test_cancel_after_the_snapshot_is_seen_by_the_closing_write`, `test_an_attempt_already_stuck_in_unknown_with_a_cancel_converges` | PASS |
+| I4 | A SIGTERM-ignoring descendant in the group is stopped before the cancelled state is committed | `test_a_term_ignoring_descendant_is_stopped_before_the_commit`, `test_lists_live_members_of_a_group` | PASS |
+| I5 | A missing identity part is unverifiable | `test_ind_05_linux_empty_boot_id` (4 tests) | PASS |
+| I6 | Unexpected configuration structure converges to `blocked` with one event and no CLI start | `test_ind_06_config_anomalies` (3 tests) | PASS |
+| I7 | Tests do not depend on the host environment | `test_base_env_carries_no_billing_variable_or_host_configuration`, `test_guard_tests_pass_with_billing_variables_and_hostile_user_settings_on_the_host` | PASS |
+| I8 | The events-query efficiency statement matches the evidence | D6 above (wording corrected) | PASS (documentation) |
+
+### 2.4 Historical short-test results (candidate `d27b849`)
+
+All of these are short tests on the original candidate, before the fixes in D14. They do not
+certify the revised code and none is a long-run result.
+
+- **Code.** The product code (`cli_relay/`, `scripts/`, `pyproject.toml`, CI) is identical in
+  every run below. Subsequent D14 repairs change code; the following results remain historical.
+- **Fault-injection suite with the notifier scenarios.** 156 tests: the v0.1 suite, the
+  regression tests for both audits, and 24 notifier scenarios against a local fake webhook.
+  - **156/156 passed in each of two consecutive rounds** on the final tests (209.8 s and
+    209.9 s), and in two earlier rounds (210.2 s and 209.6 s).
+  - No test was skipped on macOS. On Linux, CI skips the macOS-only tests.
+- **Regression tests for the independent audit, before the fixes.** On the unfixed code they gave
+  25 tests (with subtests): 22 failures, 2 errors, and 5 passing controls. Every finding had a
+  failing test.
+- **Scaled-down soak (0.03 h), new verdict rules.** **PASS, 13/13 verdicts.**
+  - 15 attempts, each with its event delivered and acknowledged.
+  - The long task ran 0.029 h of its configured 0.029 h; 11 short tasks ran.
+- **Real Claude Code loop with the notify step, 2 runs.** **PASS 2/2**, every run 6/6 steps.
+  - Preflight: `claude.ai`.
+  - Success, failure parsing (exit 1) and exact resume behaved as before.
+  - Notify step: each of the 3 terminal events was sent exactly once to the script's own local
+    webhook, naming this ledger, source and route. The transport was accepted, and every
+    notification was `acked` after the consumer ACKs.
+- **Real Codex loop with the notify step, 2 runs.** **PASS 2/2**, every run 6/6 steps.
+  - Preflight: ChatGPT login.
+  - The thread record named `openai`, and every turn ran `read-only` with no named permission
+    profile, so the new post-run permission check (I2) passed on the real CLI (codex-cli
+    0.163.0).
+  - The notify step was as for Claude.
 - **Raw reports.** They are kept locally and not committed, because they contain local paths
   and session ids.
 
+### 2.5 Independent-review repair verification
+
+D14 has focused regressions in `test_notifier_faults`, `test_notifier_routing`,
+`test_ind_04_stop_evidence`, `test_resume_permission_checkpoint` and the existing isolation tests.
+They cover adapter exceptions without secret exposure, abandoned claims with a still-live
+sender, ACK-before-recovery, conservative wake bounds, server retry delays, fixed owners and
+migration, incomplete cancellation cleanup, and old resume evidence that cannot verify a new turn.
+
+The merge gate is the complete isolated suite and CI on the repaired code; run-specific results
+are recorded in [PR #2](https://github.com/Yevanchen/cli-relay/pull/2) and its linked checks.
+Section 2.4 is historical and is not substituted for those checks. Fixtures use temporary ledgers,
+local fake HTTP and fake CLIs; they make no real model or Grok calls.
+
+A stopped keeper can leave a live CLI briefly in `unknown` before it finishes as `blocked`.
+The billing-guard regression waits for `attempt.state=finished` before asserting the final
+outcome; it must not mistake this observable intermediate state for a completed cancellation.
+Real two-host notification, model/Max settings and the 30-minute window remain **NOT RUN**.
+
 ## 3. Real 25-hour soak
 
-| Run | Code | Result |
+| Run | Code | Status |
 |---|---|---|
-| 25 h soak started 2026-10-19 03:28 UTC+8 (`scripts/soak.py start --hours 25`) | `b72618d`, before the audit fixes | **RUNNING** (planned end 2026-10-20 ≈04:30 UTC+8) |
-| 25 h soak on the fixed code | `a431845` | **NOT RUN** (whether to start one is the maintainer's decision) |
+| 25 h soak started 2026-10-19 03:28 UTC+8 | `b72618d` (v0.1 before both audits) | Historical run; current status not rechecked (planned end 2026-10-20 ≈04:30 UTC+8). Its own summary uses the old verdict rules; evaluate it with `soak.py verdict` from this version. The result is about `b72618d` only |
+| 25 h soak on v0.1.0 | `a431845` | NOT RUN |
+| 25 h soak on v0.2.0 | this branch | **Not completed. Does not block this controlled rollout.** Nothing here is claimed to have run for 25 hours |
 
-The running soak exercises the old code. Its own summary uses the verdict rules from before
-audit #9, which had false-pass paths. When it ends, evaluate it with the corrected rules:
+## 4. Deployment acceptance
 
-```sh
-python3 scripts/soak.py verdict --dir SOAK25   # reads only; exit 0 only on PASS
-```
-
-Even a PASS of that run says nothing directly about the fixed code. This section will only
-show a result once a run has actually elapsed and been evaluated.
+| # | Requirement | Status |
+|---|---|---|
+| K1 | Mac host-a: notifier installed, old path retired, one low-risk native-CLI task wakes the right Bot, which reports in the right chat and ACKs; no follow-up question needed | **NOT RUN** (pending deployment, after the independent review) |
+| K2 | Second machine: the same | **NOT RUN** (pending deployment) |
+| K3 | A real 30-minute task window: ordinary progress does not wake the Bot, the end does, once | **NOT RUN** (pending deployment) |
+| K4 | Real Grok run count and chat evidence per event (task, event, host, send time, run, chat, ACK) | **NOT RUN** (pending deployment) |
 
 ## What this does not show
 
 - Exactly-once external side effects. They are not claimed.
 - Delivery to any chat bot, phone or person. The relay stores results and re-delivers them;
-  notification is out of scope and not guaranteed.
+  transport notification is implemented, but actual chat delivery still requires the deployment checks above.
 - Behaviour across real machine sleep, power loss, reboot or a full disk.
 - That every possible CLI configuration is recognised by the subscription check.

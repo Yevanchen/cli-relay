@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import errno
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 import helpers  # noqa: F401  (puts the repository on sys.path)
 
@@ -62,6 +64,19 @@ class ProcessIdentity(unittest.TestCase):
             p.kill()
             p.wait()
         self.assertIs(procs.group_alive(p.pid), False)
+
+    def test_group_with_only_zombies_is_stopped(self) -> None:
+        with patch.object(procs, "group_members", return_value=[]), patch.object(os, "killpg") as killpg:
+            self.assertIs(procs.group_alive(5000), False)
+        killpg.assert_not_called()
+
+    def test_linux_group_read_errors_do_not_prove_an_empty_group(self) -> None:
+        with patch.object(os, "listdir", return_value=["5001"]):
+            for error in (PermissionError(errno.EACCES, "denied"), OSError(errno.EIO, "read failed")):
+                with self.subTest(error=error.errno), patch("builtins.open", side_effect=error):
+                    self.assertIsNone(procs._linux_group_members(5000))
+            with patch("builtins.open", side_effect=FileNotFoundError(errno.ENOENT, "exited")):
+                self.assertEqual(procs._linux_group_members(5000), [])
 
 
 if __name__ == "__main__":

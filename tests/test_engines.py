@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env, side_effects
+from helpers import RelayTestCase, base_env, isolated_env, needs_clean_cli_config, side_effects
 
 from cli_relay import engines
 from cli_relay.errors import UsageError
@@ -23,14 +23,16 @@ def _fake_cli(dirpath: Path, name: str, auth_output: str, marker: Path) -> Path:
     return path
 
 
+@needs_clean_cli_config
 class ArgvSafety(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="cli-relay-eng-"))
         self.marker = self.tmp / "spawned"
         self.claude = _fake_cli(self.tmp, "claude", '{"loggedIn": true, "authMethod": "claude.ai"}', self.marker)
         self.codex = _fake_cli(self.tmp, "codex", "Logged in using ChatGPT", self.marker)
-        self.env = {"PATH": "/usr/bin:/bin", "CLI_RELAY_CLAUDE_BIN": str(self.claude),
-                    "CLI_RELAY_CODEX_BIN": str(self.codex)}
+        # An empty home of its own: without it the preflight reads the host's CLI configuration.
+        self.env = isolated_env(self.tmp, {"CLI_RELAY_CLAUDE_BIN": str(self.claude),
+                                           "CLI_RELAY_CODEX_BIN": str(self.codex)})
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)

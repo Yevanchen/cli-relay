@@ -37,6 +37,8 @@ sys.path.insert(0, str(REPO))
 
 from cli_relay import procs  # noqa: E402
 
+CONSUMER = "soak-consumer"
+
 
 def _seconds_between(start: Optional[str], end: Optional[str]) -> Optional[float]:
     if not start or not end:
@@ -157,16 +159,16 @@ class Soak:
         self.s["short_index"] = i + 1
 
     def consume(self) -> None:
-        code, out = relay(self.home, "events", "--consumer", "soak-consumer")
+        code, out = relay(self.home, "events", "--consumer", CONSUMER)
         events = out.get("events", [])
         for ev in events:
-            c, res = relay(self.home, "ack", "--consumer", "soak-consumer", "--task", ev["task_id"], "--attempt",
+            c, res = relay(self.home, "ack", "--consumer", CONSUMER, "--task", ev["task_id"], "--attempt",
                            str(ev["attempt_no"]), "--event", ev["event_id"])
             if c != 0:
                 self.note(f"VIOLATION: ack failed for {ev['event_id']}: {res}")
         if events:
             ev = events[0]
-            c, res = relay(self.home, "ack", "--consumer", "soak-consumer", "--task", ev["task_id"], "--attempt",
+            c, res = relay(self.home, "ack", "--consumer", CONSUMER, "--task", ev["task_id"], "--attempt",
                            str(ev["attempt_no"]), "--event", ev["event_id"])
             if res.get("duplicate") is True:
                 self.s["ack_duplicates"] += 1
@@ -188,7 +190,7 @@ class Soak:
         unknown_attempts = len(self.rows("SELECT * FROM attempts WHERE task_id=?",
                                          (self.s["keys"]["soak-unknown"]["task_id"],)))
         unacked = len(self.rows("SELECT e.event_id FROM events e LEFT JOIN acks a ON a.event_id=e.event_id "
-                                "AND a.consumer='soak-consumer' WHERE a.event_id IS NULL"))
+                                "AND a.consumer=? WHERE a.event_id IS NULL", (CONSUMER,)))
         return {"at_s": round(self.rel(), 1), "events_total": len(current), "events_lost": lost,
                 "event_bodies_changed": changed, "keys_over_executed": over, "states": states,
                 "unknown_task_attempts": unknown_attempts, "unacked_by_consumer": unacked,
@@ -227,12 +229,37 @@ class Soak:
             rows = self.rows("SELECT * FROM attempts WHERE task_id=? AND attempt_no=?", (keys[key]["task_id"], no))
             return dict(rows[0]) if rows else {}
 
+        # Every attempt owes an event: a terminal one when finished, an unknown one when unknown. Each
+        # must exist and must have been delivered to and acknowledged by the soak consumer. Checking
+        # only the events that happen to exist would PASS a run that produced none at all.
+        all_attempts = [dict(r) for v in keys.values()
+                        for r in self.rows("SELECT * FROM attempts WHERE task_id=?", (v["task_id"],))]
+        event_facts_missing = []
+        for a in all_attempts:
+            kind = {"finished": "terminal", "unknown": "unknown"}.get(a["state"])
+            where = {"task_id": a["task_id"], "attempt_no": a["attempt_no"]}
+            if kind is None:
+                event_facts_missing.append({**where, "problem": f"attempt still {a['state']}"})
+                continue
+            ev = self.rows("SELECT event_id FROM events WHERE task_id=? AND attempt_no=? AND kind=?",
+                           (a["task_id"], a["attempt_no"], kind))
+            if not ev:
+                event_facts_missing.append({**where, "problem": f"no {kind} event"})
+                continue
+            eid = ev[0]["event_id"]
+            if not self.rows("SELECT 1 FROM deliveries WHERE event_id=? AND consumer=? AND count>=1",
+                             (eid, CONSUMER)):
+                event_facts_missing.append({**where, "problem": "event never delivered to the consumer"})
+            if not self.rows("SELECT 1 FROM acks WHERE event_id=? AND consumer=?", (eid, CONSUMER)):
+                event_facts_missing.append({**where, "problem": "event not acknowledged by the consumer"})
+
         long_row, kill_row, unknown_first = attempt("soak-long"), attempt("soak-keeper-kill"), attempt("soak-unknown")
         long_ran_s = _seconds_between(long_row.get("started_at"), long_row.get("ended_at"))
         elapsed_s = self.rel() if elapsed_s is None else elapsed_s
         shorts = [k for k in keys if k.startswith("soak-short-")]
         violations = [n for n in self.s["notes"] if n["msg"].startswith("VIOLATION")]
         verdicts = {
+            "every_attempt_has_its_event_delivered_and_acked": bool(all_attempts) and not event_facts_missing,
             "no_lost_or_changed_events": not c["events_lost"] and not c["event_bodies_changed"],
             "every_key_executed_exactly_as_expected": all(effects[k] == v["expected_effects"] for k, v in keys.items()),
             "every_task_succeeded": all(s == "succeeded" for s in state.values()),
@@ -255,6 +282,7 @@ class Soak:
                 "long_task_planned_hours": round(keys["soak-long"]["duration_s"] / 3600.0, 3),
                 "long_task_ran_hours": None if long_ran_s is None else round(long_ran_s / 3600.0, 3),
                 "short_tasks": len(shorts),
+                "attempts": len(all_attempts), "event_facts_missing": event_facts_missing[:50],
                 "keys_not_as_expected": {k: {"state": state[k], "executions": effects[k],
                                              "expected_executions": v["expected_effects"]}
                                          for k, v in keys.items()

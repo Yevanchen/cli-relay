@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env, side_effects, wait_until
+from helpers import RelayTestCase, base_env, needs_clean_cli_config, side_effects, wait_until
 from test_audit_03_provider_bypass import fake_claude
 
 from cli_relay import engines, procs
@@ -40,6 +40,7 @@ class CodexSandboxIsAlwaysExplicit(unittest.TestCase):
         self.assertEqual(resumed[resumed.index("--sandbox") + 1], "workspace-write")
 
 
+@needs_clean_cli_config
 class ClaudeBypassModeIsBlocked(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="cli-relay-perm-"))

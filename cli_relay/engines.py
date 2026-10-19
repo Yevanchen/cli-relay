@@ -48,7 +48,8 @@ _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
     "claude": {"model": (str,)},
     "codex": {"model": (str,), "sandbox": (str,), "skip_git_repo_check": (bool,)},
     "fixture": {"duration_s": (int, float), "exit_code": (int,), "result": (str,), "side_effect_file": (str,),
-                "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,)},
+                "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,),
+                "descendant_s": (int, float), "descendant_pid_file": (str,)},
 }
 
 CODEX_SANDBOXES = ("read-only", "workspace-write")
@@ -56,6 +57,10 @@ CODEX_SANDBOXES = ("read-only", "workspace-write")
 # Configuration layers outside the user's own files that the CLIs also read.
 CODEX_SYSTEM_CONFIG = (Path("/etc/codex/config.toml"),)
 CODEX_MANAGED_CONFIG = (Path("/etc/codex/managed_config.toml"),)
+# Layers that can constrain or replace permissions in ways the legacy --sandbox flag does not
+# override; cli-relay cannot evaluate them, so their presence blocks a Codex run.
+CODEX_REQUIREMENTS = (Path("/etc/codex/requirements.toml"),
+                      Path("/Library/Managed Preferences/com.openai.codex.plist"))
 CLAUDE_MANAGED_SETTINGS = (Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
                            Path("/etc/claude-code/managed-settings.json"))
 # Claude settings keys that obtain credentials other than the claude.ai login.
@@ -98,8 +103,9 @@ def validate_options(engine: str, options: Dict[str, Any]) -> Dict[str, Any]:
     if engine == "codex" and "sandbox" in clean and clean["sandbox"] not in CODEX_SANDBOXES:
         raise UsageError("codex sandbox must be read-only or workspace-write (danger-full-access is never used)",
                          allowed=list(CODEX_SANDBOXES))
-    if engine == "fixture" and "side_effect_file" in clean and not os.path.isabs(clean["side_effect_file"]):
-        raise UsageError("side_effect_file must be an absolute path")
+    for key in ("side_effect_file", "descendant_pid_file"):
+        if engine == "fixture" and key in clean and not os.path.isabs(clean[key]):
+            raise UsageError(f"{key} must be an absolute path")
     return clean
 
 
@@ -141,6 +147,12 @@ def claude_config_dir(env: Dict[str, str]) -> Path:
     return Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else _home(env) / ".claude"
 
 
+def codex_system_requirements_paths(env: Dict[str, str]) -> List[Path]:
+    user_name = env.get("USER") or os.environ.get("USER") or ""
+    return [*CODEX_REQUIREMENTS,
+            Path("/Library/Managed Preferences") / user_name / "com.openai.codex.plist"]
+
+
 def _dirs_up(cwd: Optional[str]) -> List[Path]:
     """The task directory and all of its parents, outermost first."""
     if not cwd:
@@ -172,29 +184,54 @@ def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tup
     run from anything but the built-in OpenAI provider with the ChatGPT sign-in. Project layers are
     read whether or not Codex trusts the project, and an unreadable layer is a problem: when the
     configuration cannot be confirmed, the run is blocked. Only key names are reported."""
-    layers = [("system", p) for p in CODEX_SYSTEM_CONFIG] + [("user", codex_home(env) / "config.toml")]
-    layers += [("project", d / ".codex" / "config.toml") for d in _dirs_up(cwd)]
-    layers += [("managed", p) for p in CODEX_MANAGED_CONFIG]
-    merged: Dict[str, Any] = {}
+    home = codex_home(env)
     problems: List[str] = []
-    read: List[str] = []
-    for layer, path in _existing_once(layers):
-        try:
-            data = tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-            problems.append(f"{layer}:unreadable")
-            continue
-        read.append(layer)
-        merged = _merge(merged, data)
+    if any(p.exists() for p in [*codex_system_requirements_paths(env), home / "requirements.toml"]):
+        problems.append("requirements")
+
+    def load(profile_file: Optional[Path]) -> Tuple[Dict[str, Any], List[str], List[str]]:
+        layers = [("system", p) for p in CODEX_SYSTEM_CONFIG] + [("user", home / "config.toml")]
+        if profile_file is not None:  # Codex 0.163: `profile = X` layers $CODEX_HOME/X.config.toml on the user config
+            layers.append(("profile_file", profile_file))
+        layers += [("project", d / ".codex" / "config.toml") for d in _dirs_up(cwd)]
+        layers += [("managed", p) for p in CODEX_MANAGED_CONFIG]
+        merged: Dict[str, Any] = {}
+        bad: List[str] = []
+        read: List[str] = []
+        for layer, path in _existing_once(layers):
+            try:
+                data = tomllib.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+                bad.append(f"{layer}:unreadable")
+                continue
+            read.append(layer)
+            merged = _merge(merged, data)
+        return merged, bad, read
+
+    merged, bad, read = load(None)
+    profile_file = None
+    if isinstance(merged.get("profile"), str) and (home / f"{merged['profile']}.config.toml").is_file():
+        profile_file = home / f"{merged['profile']}.config.toml"
+        merged, bad, read = load(profile_file)
+    problems += bad
+    # Every value is type-checked: a structure this check does not expect is itself a problem, so
+    # an unusual file blocks the run instead of making the check fail (independent audit 6).
     tables: List[Tuple[str, Dict[str, Any]]] = [("", merged)]
+    profiles = merged.get("profiles", {})
+    if not isinstance(profiles, dict):
+        problems.append("profiles")
+        profiles = {}
     if "profile" in merged:
-        profile = (merged.get("profiles") or {}).get(merged["profile"])
+        profile = profiles.get(merged["profile"]) if isinstance(merged["profile"], str) else None
         if isinstance(profile, dict):
             tables.append(("profiles.<active>.", profile))
-        else:
+        elif profile_file is None:
             problems.append("profile")
-    provider = "openai"
+    provider: Any = "openai"
     for prefix, table in tables:
+        # Named permission profiles and permission overrides can take precedence over --sandbox
+        # (independent audit 2), so any permission setting blocks the run rather than being trusted.
+        problems += [prefix + key for key in sorted(table) if "permission" in key.lower()]
         provider = table.get("model_provider", provider)
         problems += [prefix + key for key in sorted(table) if key.endswith("base_url")]
         for key in ("forced_login_method", "preferred_auth_method"):
@@ -202,7 +239,10 @@ def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tup
                 problems.append(prefix + key)
     if provider != "openai":
         problems.append("model_provider")
-    if "openai" in (merged.get("model_providers") or {}):
+    providers = merged.get("model_providers", {})
+    if not isinstance(providers, dict):
+        problems.append("model_providers")
+    elif "openai" in providers:
         problems.append("model_providers.openai")
     return problems, read
 
@@ -229,10 +269,18 @@ def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None) -> 
         problems += [f"{layer}:{key}" for key in CLAUDE_CREDENTIAL_SETTINGS if data.get(key)]
         if data.get("forceLoginMethod") not in (None, "claudeai"):
             problems.append(f"{layer}:forceLoginMethod")
-        settings_env = data.get("env") if isinstance(data.get("env"), dict) else {}
+        # A section of an unexpected type cannot be checked, so it is a problem itself.
+        settings_env = data.get("env", {})
+        if not isinstance(settings_env, dict):
+            problems.append(f"{layer}:env")
+            settings_env = {}
         problems += [f"{layer}:env.{name}" for name in BILLING_ENV["claude"] if settings_env.get(name)]
-        permissions = data.get("permissions") if isinstance(data.get("permissions"), dict) else {}
-        if permissions.get("defaultMode") == "bypassPermissions":  # nothing would ever be denied
+        permissions = data.get("permissions", {})
+        if not isinstance(permissions, dict):
+            problems.append(f"{layer}:permissions")
+            permissions = {}
+        mode = permissions.get("defaultMode")
+        if mode == "bypassPermissions" or not isinstance(mode, (str, type(None))):  # nothing would be denied
             problems.append(f"{layer}:permissions.defaultMode")
     return problems, read
 
@@ -278,6 +326,18 @@ def codex_rollout(env: Dict[str, str], thread_id: str) -> Optional[Path]:
     return Path(sorted(matches)[0]) if matches else None
 
 
+def codex_permission_checkpoint(env: Dict[str, str], session_id: str) -> Dict[str, Any]:
+    """Capture the existing thread boundary before a resumed CLI can append its turn."""
+    path = codex_rollout(env, session_id)
+    if path is None:
+        return {"missing": "rollout"}
+    try:
+        stat = path.stat()
+        return {"path": str(path.resolve()), "dev": stat.st_dev, "ino": stat.st_ino, "offset": stat.st_size}
+    except OSError as exc:
+        return {"error": type(exc).__name__}
+
+
 def provider_violation(engine: str, env: Dict[str, str], session_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """After a run: Codex records the provider that served a thread in the thread's own rollout
     (``session_meta.model_provider``). Anything but the built-in ``openai`` provider, or a thread
@@ -290,11 +350,68 @@ def provider_violation(engine: str, env: Dict[str, str], session_id: Optional[st
         return {"reason": "provider_unverified", "missing": "rollout"}
     for ev in iter_json_lines(path):
         if ev.get("type") == "session_meta":
-            provider = (ev.get("payload") or {}).get("model_provider")
+            payload = ev.get("payload")
+            provider = payload.get("model_provider") if isinstance(payload, dict) else None
             if provider == "openai":
                 return None
             return {"reason": "provider_not_subscription", "model_provider": provider}
     return {"reason": "provider_unverified", "missing": "session_meta"}
+
+
+def requested_sandbox(engine: str, payload: Dict[str, Any]) -> Optional[str]:
+    if engine != "codex":
+        return None
+    return (payload.get("options") or {}).get("sandbox") or "read-only"
+
+
+def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[str],
+                         sandbox: Optional[str], *, permission_checkpoint: Optional[Dict[str, Any]] = None,
+                         resume_session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """After a run: Codex records each turn's effective sandbox and any active named permission
+    profile in the thread's rollout (``turn_context``). Every turn must have run in the requested
+    sandbox or a narrower one, with no named profile; a thread without that record is not shown
+    to have kept the requested permissions."""
+    if engine != "codex":
+        return None
+    if resume_session_id and session_id != resume_session_id:
+        return {"reason": "permissions_unverified", "missing": "resumed_session"}
+    if not session_id:
+        return None
+    path = codex_rollout(env, session_id)
+    if path is None:
+        return {"reason": "permissions_unverified", "missing": "rollout"}
+    if resume_session_id:
+        checkpoint = permission_checkpoint
+        if (not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("path"), str)
+                or any(type(checkpoint.get(k)) is not int or checkpoint[k] < 0 for k in ("dev", "ino", "offset"))):
+            return {"reason": "permissions_unverified", "missing": "permission_checkpoint"}
+        try:
+            stat = path.stat()
+            unchanged = (str(path.resolve()) == checkpoint["path"] and stat.st_dev == checkpoint["dev"]
+                         and stat.st_ino == checkpoint["ino"] and stat.st_size >= checkpoint["offset"])
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            return {"reason": "permissions_unverified", "missing": "unchanged_rollout"}
+        # An old safe turn cannot certify a resumed attempt whose own context is absent.
+        if not any(ev.get("type") == "turn_context" for ev in iter_json_lines(path, offset=checkpoint["offset"])):
+            return {"reason": "permissions_unverified", "missing": "current_turn_context"}
+    turns = []
+    for ev in iter_json_lines(path):
+        if ev.get("type") == "turn_context":
+            payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+            policy = payload.get("sandbox_policy")
+            kind = policy.get("type") if isinstance(policy, dict) else None
+            turns.append((kind if isinstance(kind, str) else None, payload.get("active_permission_profile")))
+    if not turns:
+        return {"reason": "permissions_unverified", "missing": "turn_context"}
+    allowed = {"read-only"} if sandbox in (None, "read-only") else {"read-only", "workspace-write"}
+    wider = sorted({str(kind) for kind, _ in turns if kind not in allowed})
+    if wider:
+        return {"reason": "sandbox_not_as_requested", "requested": sandbox or "read-only", "observed": wider}
+    if any(profile not in (None, "") for _, profile in turns):
+        return {"reason": "named_permission_profile_active", "requested": sandbox or "read-only"}
+    return None
 
 
 def assert_safe(engine: str, argv: Iterable[str]) -> None:
@@ -358,6 +475,10 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
             argv += ["--api-key-source", opts["api_key_source"]]
         if opts.get("permission_mode"):
             argv += ["--permission-mode-reported", opts["permission_mode"]]
+        if opts.get("descendant_s"):
+            argv += ["--descendant", str(opts["descendant_s"])]
+            if opts.get("descendant_pid_file"):
+                argv += ["--descendant-pid-file", opts["descendant_pid_file"]]
         pkg_parent = str(Path(__file__).resolve().parent.parent)
         cenv["PYTHONPATH"] = pkg_parent + (os.pathsep + cenv["PYTHONPATH"] if cenv.get("PYTHONPATH") else "")
         cenv["CLI_RELAY_ATTEMPT_ID"] = attempt["attempt_id"]
@@ -368,12 +489,13 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
 
 
 # ---------------------------------------------------------------------------- output parsing
-def iter_json_lines(path: Path) -> Iterable[Dict[str, Any]]:
+def iter_json_lines(path: Path, *, offset: int = 0) -> Iterable[Dict[str, Any]]:
     try:
         f = open(path, "rb")
     except OSError:
         return
     with f:
+        f.seek(offset)
         for raw in f:
             raw = raw.strip()
             if not raw:
@@ -527,14 +649,17 @@ def classify(native: Optional[Dict[str, Any]], *, exit_code: Optional[int], exit
 
 def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_id: Optional[str],
            exit_code: Optional[int], exit_signal: Optional[int], exit_known: bool, cancel_requested: bool,
-           guard: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any]]:
+           guard: Optional[Dict[str, Any]] = None, sandbox: Optional[str] = None,
+           permission_checkpoint: Optional[Dict[str, Any]] = None,
+           resume_session_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
     """Name an attempt's outcome from what the run left behind; returns (outcome, evidence).
 
     The keeper and reconciliation both call this, so the outcome does not depend on which of
-    them closes the attempt. A run shown not to be served by the subscription is ``blocked``
-    whatever else happened: ``guard`` is what the keeper saw while the run was live (also
-    persisted in exit.json); the init event of the saved output and the Codex thread record
-    are re-read here, so the fact survives a keeper that died before committing."""
+    them closes the attempt. A run shown not to be served by the subscription, or not shown to
+    have kept the requested sandbox, is ``blocked`` whatever else happened: ``guard`` is what
+    the keeper saw while the run was live (also persisted in exit.json); the init event of the
+    saved output and the Codex thread record are re-read here, so the fact survives a keeper
+    that died before committing."""
     if guard is None and engine in ("claude", "fixture") and parsed.get("init"):
         guard = billing_violation(engine, {"type": "system", "subtype": "init", **parsed["init"]})
     if guard is not None:
@@ -542,6 +667,10 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
     provider = provider_violation(engine, env, session_id)
     if provider is not None:
         return "blocked", {"provider_check": provider}
+    permissions = permission_violation(engine, env, session_id, sandbox,
+                                       permission_checkpoint=permission_checkpoint, resume_session_id=resume_session_id)
+    if permissions is not None:
+        return "blocked", {"permission_check": permissions}
     return classify(parsed.get("native"), exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,
                     cancel_requested=cancel_requested), {}
 

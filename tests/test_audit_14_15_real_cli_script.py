@@ -39,6 +39,12 @@ class RealCliScript(RelayTestCase):
         self.assertEqual(report["result"], "FAIL")
         self.assertNotEqual(code, 0)
 
+    def test_notify_step_sends_each_terminal_event_once(self) -> None:
+        code, report = self.run_script("--notify")
+        self.assertEqual((code, report["result"]), (0, "PASS"), report)
+        step = report["steps"][-1]
+        self.assertEqual((step["name"], step["events_sent"], step["distinct_events_sent"]), ("notify", 3, 3))
+
 
 if __name__ == "__main__":
     unittest.main()

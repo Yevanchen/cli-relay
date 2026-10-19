@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env
+from helpers import RelayTestCase, base_env, needs_clean_cli_config
 
 from cli_relay import engines
 
@@ -17,7 +17,10 @@ THREAD = "11111111-2222-4333-8444-555555555555"
 
 def fake_codex(dirpath: Path, marker: Path, rollout_provider: str = "openai") -> Path:
     path = dirpath / "codex"
-    rollout = f'{{"type":"session_meta","payload":{{"session_id":"{THREAD}","model_provider":"{rollout_provider}"}}}}'
+    # Like Codex 0.163.0: session_meta, then a turn_context with the turn's effective sandbox.
+    rollout = (f'{{"type":"session_meta","payload":{{"session_id":"{THREAD}","model_provider":"{rollout_provider}"}}}}'
+               '\n{"type":"turn_context","payload":{"sandbox_policy":{"type":"read-only"},'
+               '"active_permission_profile":null}}')
     path.write_text(
         "#!/bin/sh\n"
         'case "$1" in login) echo "Logged in using ChatGPT"; exit 0;; esac\n'
@@ -41,6 +44,7 @@ def fake_claude(dirpath: Path) -> Path:
     return path
 
 
+@needs_clean_cli_config
 class ProviderConfigPreflight(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="cli-relay-a03-"))
@@ -94,6 +98,7 @@ class ProviderConfigPreflight(unittest.TestCase):
         self.assertFalse(engines.preflight("claude", self.env, cwd=str(self.work)).ok)
 
 
+@needs_clean_cli_config
 class ProviderGuardsAtRunTime(RelayTestCase):
     def setUp(self) -> None:
         super().setUp()
