@@ -55,14 +55,17 @@ class SoakVerdict(unittest.TestCase):
 
     def close(self, task_id: str, attempt_no: int, outcome: str, *, exit_known: int = 1,
               ran_s: float = 1.0, state: str = "finished") -> None:
+        # Through the ledger, so each closed attempt has its event, as a real run would.
+        aid = self.ledger.attempts(task_id)[attempt_no - 1]["attempt_id"]
+        if state == "finished":
+            self.ledger.finish(aid, from_states=("pending",), outcome=outcome, exit_code=0 if exit_known else None,
+                               exit_known=bool(exit_known), native={"ok": outcome == "succeeded"}, source="test")
+        else:
+            self.ledger.mark_unknown(aid, from_states=("pending",), evidence={"synthetic": True})
         end = datetime.now(timezone.utc)
         conn = sqlite3.connect(str(self.home / "ledger.db"))
-        conn.execute("UPDATE attempts SET state=?, outcome=?, exit_code=0, exit_known=?, started_at=?, ended_at=? "
-                     "WHERE task_id=? AND attempt_no=?",
-                     (state, outcome if state == "finished" else None, exit_known,
-                      iso(end - timedelta(seconds=ran_s)), iso(end), task_id, attempt_no))
-        conn.execute("UPDATE tasks SET state=? WHERE task_id=? AND current_attempt=?",
-                     (outcome if state == "finished" else state, task_id, attempt_no))
+        conn.execute("UPDATE attempts SET started_at=?, ended_at=? WHERE attempt_id=?",
+                     (iso(end - timedelta(seconds=ran_s)), iso(end), aid))
         conn.commit()
         conn.close()
 
