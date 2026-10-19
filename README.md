@@ -1,6 +1,6 @@
 # cli-relay
 
-**Experimental (v0.1).** A thin local ledger for tasks run by the official coding CLIs
+**Experimental (v0.1.0).** A thin local ledger for tasks run by the official coding CLIs
 (Claude Code, Codex) on the machine where they are installed. It adds three things the
 CLIs do not do by themselves:
 
@@ -19,6 +19,27 @@ agent harness, a networked relay, a terminal runtime or an orchestrator.
 [`docs/decisions.md`](docs/decisions.md) maps what the CLIs and existing projects (Reason
 Network, Agenvo, AGPair) already cover. It also explains why this is a small separate
 ledger rather than a fork.
+
+## Verification status (v0.1.0)
+
+| Evidence | Code | Status |
+|---|---|---|
+| Fault-injection suite: 105 tests, fixture engine, real OS processes (macOS) | `a431845` | PASS, 105/105 in 2 consecutive rounds |
+| Scaled-down soak (0.03 h) | `a431845` | PASS. A short test, **not** the 25 h result |
+| Real Claude Code loop: success, failure parsing, exact resume, events → ACK | `a431845` | PASS, 3/3 runs |
+| Real Codex loop: same steps | `a431845` | PASS, 3/3 runs |
+| 25 h soak | `b72618d` (before the audit fixes) | **RUNNING** |
+| 25 h soak | `a431845` (current code) | **NOT RUN** |
+| C4: second entry point over a real bot/SSH channel | — | **NOT RUN** (simulated locally only) |
+| F5: real disk-full on the ledger volume | — | **NOT RUN** (simulated only) |
+| J1: execution across machine sleep, power loss or reboot | — | **NOT RUN** |
+| J2: CI on `ubuntu-latest`, Python 3.11 / 3.12 / 3.14 | — | **NOT RUN** when this was written. Its first run starts when the repository is published |
+
+Not promised:
+- exactly-once external side effects;
+- delivery of any notification (chat bot, phone or anything else).
+
+The matrix, numbers and limits are in [`docs/acceptance.md`](docs/acceptance.md).
 
 ## Requirements
 
