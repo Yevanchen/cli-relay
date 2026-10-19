@@ -33,7 +33,7 @@ ledger rather than a fork.
 | C4: second entry point over a real bot/SSH channel | — | **NOT RUN** (simulated locally only) |
 | F5: real disk-full on the ledger volume | — | **NOT RUN** (simulated only) |
 | J1: execution across machine sleep, power loss or reboot | — | **NOT RUN** |
-| J2: CI on `ubuntu-latest`, Python 3.11 / 3.12 / 3.14 | — | **NOT RUN** when this was written. Its first run starts when the repository is published |
+| J2: CI on `ubuntu-latest`, Python 3.11 / 3.12 / 3.14 | `baff533` | **PASS** (3.11 / 3.12 / 3.14): [push run](https://github.com/Yevanchen/cli-relay/actions/runs/39197188143), [tag run](https://github.com/Yevanchen/cli-relay/actions/runs/39197203482) |
 
 Not promised:
 - exactly-once external side effects;
