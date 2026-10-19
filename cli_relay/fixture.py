@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -53,7 +54,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--no-result", action="store_true")
     p.add_argument("--api-key-source", default="none")
     p.add_argument("--permission-mode-reported", default="default")
+    p.add_argument("--descendant", type=float, default=0.0,
+                   help="leave a SIGTERM-ignoring child in this process group for this many seconds")
+    p.add_argument("--descendant-pid-file")
     a = p.parse_args(argv)
+    if a.descendant > 0:
+        # Like a tool subprocess that outlives a cancelled CLI: same process group, ignores SIGTERM.
+        child = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, "
+                                  f"signal.SIG_IGN); time.sleep({a.descendant})"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if a.descendant_pid_file:
+            _append_durably(a.descendant_pid_file, f"{child.pid}\n")
 
     prompt = sys.stdin.read()
     state = Path(a.state_dir)

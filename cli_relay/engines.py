@@ -48,7 +48,8 @@ _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
     "claude": {"model": (str,)},
     "codex": {"model": (str,), "sandbox": (str,), "skip_git_repo_check": (bool,)},
     "fixture": {"duration_s": (int, float), "exit_code": (int,), "result": (str,), "side_effect_file": (str,),
-                "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,)},
+                "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,),
+                "descendant_s": (int, float), "descendant_pid_file": (str,)},
 }
 
 CODEX_SANDBOXES = ("read-only", "workspace-write")
@@ -98,8 +99,9 @@ def validate_options(engine: str, options: Dict[str, Any]) -> Dict[str, Any]:
     if engine == "codex" and "sandbox" in clean and clean["sandbox"] not in CODEX_SANDBOXES:
         raise UsageError("codex sandbox must be read-only or workspace-write (danger-full-access is never used)",
                          allowed=list(CODEX_SANDBOXES))
-    if engine == "fixture" and "side_effect_file" in clean and not os.path.isabs(clean["side_effect_file"]):
-        raise UsageError("side_effect_file must be an absolute path")
+    for key in ("side_effect_file", "descendant_pid_file"):
+        if engine == "fixture" and key in clean and not os.path.isabs(clean[key]):
+            raise UsageError(f"{key} must be an absolute path")
     return clean
 
 
@@ -358,6 +360,10 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
             argv += ["--api-key-source", opts["api_key_source"]]
         if opts.get("permission_mode"):
             argv += ["--permission-mode-reported", opts["permission_mode"]]
+        if opts.get("descendant_s"):
+            argv += ["--descendant", str(opts["descendant_s"])]
+            if opts.get("descendant_pid_file"):
+                argv += ["--descendant-pid-file", opts["descendant_pid_file"]]
         pkg_parent = str(Path(__file__).resolve().parent.parent)
         cenv["PYTHONPATH"] = pkg_parent + (os.pathsep + cenv["PYTHONPATH"] if cenv.get("PYTHONPATH") else "")
         cenv["CLI_RELAY_ATTEMPT_ID"] = attempt["attempt_id"]
