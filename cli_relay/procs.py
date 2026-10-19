@@ -12,6 +12,7 @@ so a failed query answers None rather than "recycled".
 from __future__ import annotations
 
 import ctypes.util
+import errno
 import os
 import sys
 from typing import List, Optional, Tuple
@@ -202,8 +203,12 @@ def _linux_group_members(pgid: int) -> Optional[List[int]]:
             rest = data[data.rindex(")") + 2:].split()
             if int(rest[2]) == pgid and not rest[0].startswith("Z"):  # fields 5 (pgrp) and 3 (state)
                 members.append(int(name))
-        except (OSError, ValueError, IndexError):
-            continue  # exited while listing
+        except OSError as exc:
+            if exc.errno in (errno.ENOENT, errno.ESRCH):
+                continue  # exited while listing
+            return None
+        except (ValueError, IndexError):
+            return None
     return members
 
 
@@ -222,6 +227,9 @@ def group_alive(pgid: Optional[int]) -> Optional[bool]:
     """Whether any process is left in process group pgid (None if no pgid recorded)."""
     if not pgid or pgid <= 1:
         return None
+    members = group_members(pgid)
+    if members is not None:
+        return bool(members)  # zombies have already stopped
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:

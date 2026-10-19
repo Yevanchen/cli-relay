@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from helpers import RelayTestCase, base_env, wait_until
+from helpers import RelayTestCase, base_env, needs_clean_cli_config, wait_until
 from test_audit_03_provider_bypass import fake_codex
 
 from cli_relay import procs
@@ -36,6 +36,7 @@ class BillingViolationSurvivesKeeperCrash(RelayTestCase):
         done = self.finished(sub["task_id"])
         self.assertEqual(done["task"]["state"], "blocked")
 
+    @needs_clean_cli_config
     def test_codex_provider_record_is_checked_after_a_keeper_crash(self) -> None:
         # The poller has neither CODEX_HOME nor the fake binary: reconciliation must still read the
         # thread record where the keeper's run wrote it.

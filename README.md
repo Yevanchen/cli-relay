@@ -29,6 +29,10 @@ ledger rather than a fork.
 
 ## Verification status (v0.2.0 branch)
 
+The 156-test and real-CLI rows below describe candidate `d27b849`, before the
+independent review fixes. Revised-code evidence is tracked in `docs/acceptance.md` §2.5;
+passing the earlier candidate does not certify the revised code or a live deployment.
+
 | Evidence | Status |
 |---|---|
 | Fault-injection suite + notifier scenarios (fixture engine, real OS processes, local fake webhook; macOS) | PASS, 156/156 in each of 2 consecutive rounds |
@@ -39,7 +43,7 @@ ledger rather than a fork.
 | Two-machine deployment with the real Bot | **NOT RUN** (pending deployment) |
 | A real 30-minute task window with the real Bot | **NOT RUN** (pending deployment) |
 | 25 h soak of this version | **Not completed. Does not block this controlled rollout** |
-| 25 h soak of `b72618d` (v0.1 before both audits) | RUNNING; it says nothing about this version |
+| 25 h soak of `b72618d` (v0.1 before both audits) | Historical run; current status not rechecked. It says nothing about this version |
 | C4 real bot/SSH entry point, F5 real disk-full, J1 sleep/power loss/reboot | **NOT RUN** |
 
 Not promised:
@@ -123,8 +127,9 @@ danger-full-access`, `--continue`, `--last`, `--bare`.
   - a login that is not a subscription.
 - It also stops the run if the CLI itself reports an API-key source.
 - After a Codex run, the thread's own record must name the built-in `openai` provider, and
-  every turn must have run in the requested sandbox with no named permission profile. Before
-  the run, any Codex permission setting, requirements layer or selected profile file blocks it.
+  every turn must have run in the requested sandbox with no named permission profile. An exact
+  resume also needs a new turn record after its saved pre-run file boundary; old history alone
+  cannot verify that attempt. Before the run, a Codex permission setting, requirements layer, or an unsafe or unreadable selected profile blocks it.
 - These outcomes do not depend on whether the keeper survived: reconciliation applies the same
   checks. See [`docs/reliability.md`](docs/reliability.md) for the exact layers and limits.
 

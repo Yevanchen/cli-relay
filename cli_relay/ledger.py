@@ -41,10 +41,10 @@ DB_NAME = "ledger.db"
 DEFAULT_MIN_FREE_BYTES = 64 * 1024 * 1024
 RESULT_EXCERPT_CHARS = 2000
 
-# The notifier extension (v0.2) is additive: new tables, new indexes and one nullable column.
+# The notifier extension (v0.2) is additive: new tables, indexes and routing columns.
 # schema_version stays 1 because v0.1.0 checks exactly that and ignores what it does not know,
 # so v0.1.0 can still open a migrated ledger. That is the rollback path.
-NOTIFIER_SCHEMA = "1"
+NOTIFIER_SCHEMA = "2"
 NOTIFIER_DDL = (
     """CREATE TABLE IF NOT EXISTS notifications (
   event_id TEXT NOT NULL REFERENCES events(event_id),
@@ -83,14 +83,21 @@ NOTIFIER_DDL = (
 )
 
 
-def _apply_notifier_extension(c: sqlite3.Connection, cutoff: str) -> None:
+def _apply_notifier_extension(c: sqlite3.Connection, cutoff: str, *, historical: bool = False) -> None:
     """Inside an open transaction: idempotent."""
     for stmt in NOTIFIER_DDL:
         c.execute(stmt)
     columns = {r[1] for r in c.execute("PRAGMA table_info(tasks)").fetchall()}
-    if "notify_route" not in columns:
-        c.execute("ALTER TABLE tasks ADD COLUMN notify_route TEXT")
-    c.execute("INSERT OR IGNORE INTO meta (k, v) VALUES ('notifier_schema', ?)", (NOTIFIER_SCHEMA,))
+    for name, sql_type in (("notify_route", "TEXT"), ("notify_consumer", "TEXT"),
+                           ("notify_chat", "TEXT"), ("notify_bound", "INTEGER NOT NULL DEFAULT 0")):
+        if name not in columns:
+            c.execute(f"ALTER TABLE tasks ADD COLUMN {name} {sql_type}")
+    if historical and "notify_bound" not in columns:
+        # Old task/transport rows did not record the receiving identity. Today's config
+        # is not evidence of the original consumer or chat; restoration must be explicit.
+        c.execute("UPDATE tasks SET notify_bound=-1")
+    c.execute("INSERT INTO meta (k, v) VALUES ('notifier_schema', ?) "
+              "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (NOTIFIER_SCHEMA,))
     c.execute("INSERT OR IGNORE INTO meta (k, v) VALUES ('notifier_cutoff', ?)", (cutoff,))
     c.execute("INSERT OR IGNORE INTO meta (k, v) VALUES ('notifier_migrated_at', ?)", (now_iso(),))
 
@@ -402,18 +409,83 @@ class Ledger:
 
     def require_notifier(self) -> None:
         if not self.has_notifier():
-            raise Refused("not_migrated", "this ledger has no notifier tables yet; run `cli-relay migrate` first")
+            raise Refused("not_migrated", "this ledger needs a notifier migration; run `cli-relay migrate` first")
 
     def notifier_cutoff(self) -> str:
         return self._meta("notifier_cutoff") or ""
 
     def task_routes(self, task_ids: Sequence[str]) -> Dict[str, Optional[str]]:
+        return {task_id: owner["route"] for task_id, owner in self.task_notification_owners(task_ids).items()}
+
+    def task_notification_owners(self, task_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         ids = sorted(set(task_ids))
         if not ids or not self.has_notifier():
             return {}
-        rows = self.conn.execute(f"SELECT task_id, notify_route FROM tasks WHERE task_id IN ({','.join('?' * len(ids))})",
-                                 tuple(ids)).fetchall()
-        return {r[0]: r[1] for r in rows}
+        rows = self.conn.execute(
+            "SELECT task_id, notify_route, notify_consumer, notify_chat, notify_bound FROM tasks "
+            f"WHERE task_id IN ({','.join('?' * len(ids))})", tuple(ids)).fetchall()
+        return {r["task_id"]: {"route": r["notify_route"], "consumer": r["notify_consumer"],
+                               "chat": r["notify_chat"], "bound": r["notify_bound"] == 1,
+                               "binding_state": "manual_restore" if r["notify_bound"] == -1 else
+                               ("bound" if r["notify_bound"] == 1 else "unbound")} for r in rows}
+
+    def bind_notification_owners(self, cfg: Dict[str, Any]) -> int:
+        """Bind pre-configuration tasks once, never reinterpret an existing owner.
+
+        An explicitly selected route may wait for its configuration. A known configuration
+        with no route is a deliberate opt-out and is bound too. Migrated historical tasks
+        have notify_bound=-1 and are deliberately excluded.
+        """
+        self.require_notifier()
+        changed = 0
+        with self.tx() as c:
+            tasks = c.execute("SELECT task_id, notify_route FROM tasks WHERE notify_bound=0").fetchall()
+            for task in tasks:
+                route = task["notify_route"]
+                if route is None:
+                    route = cfg["default_route"]
+                owner = cfg["routes"].get(route) if route is not None else None
+                if route is not None and owner is None:
+                    continue
+                cur = c.execute(
+                    "UPDATE tasks SET notify_route=?, notify_consumer=?, notify_chat=?, notify_bound=1 "
+                    "WHERE task_id=? AND notify_bound=0",
+                    (route, owner["consumer"] if owner else None, owner["chat"] if owner else None, task["task_id"]))
+                changed += cur.rowcount
+        return changed
+
+    def restore_notification_owner(self, task_id: str, *, route: str, consumer: str, chat: str) -> Dict[str, Any]:
+        """Explicitly restore a migrated task's missing owner without rewriting transport facts."""
+        self.require_notifier()
+        with self.tx() as c:
+            task = c.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if task is None:
+                raise NotFound("no such task", task_id=task_id)
+            if task["notify_bound"] != -1:
+                raise Refused("owner_not_unresolved", "only migrated tasks with an unresolved owner can be restored")
+            if task["notify_route"] is not None and task["notify_route"] != route:
+                raise Refused("historical_route_mismatch", "the supplied route differs from the task's recorded route")
+            rows = c.execute(
+                "SELECT n.*, EXISTS(SELECT 1 FROM notification_sends s WHERE s.event_id=n.event_id "
+                "AND s.route=n.route) AS has_sends FROM notifications n "
+                "JOIN events e ON e.event_id=n.event_id WHERE e.task_id=?", (task_id,)).fetchall()
+            placeholders = []
+            for row in rows:
+                result = json.loads(row["last_result_json"] or "{}")
+                placeholder = (row["route"] == "-" and row["state"] == "failed"
+                               and result.get("why") == "owner_unresolved" and row["attempts"] == 0
+                               and row["wakes"] == 0 and not row["has_sends"]
+                               and row["first_sent_at"] is None and row["last_sent_at"] is None)
+                if placeholder:
+                    placeholders.append(row["event_id"])
+                elif row["route"] != route:
+                    raise Refused("historical_route_mismatch", "the supplied route differs from a recorded notification")
+            c.execute("UPDATE tasks SET notify_route=?, notify_consumer=?, notify_chat=?, notify_bound=1 "
+                      "WHERE task_id=? AND notify_bound=-1", (route, consumer, chat, task_id))
+            for event_id in placeholders:
+                c.execute("UPDATE notifications SET route=?, updated_at=? WHERE event_id=? AND route='-'",
+                          (route, now_iso(), event_id))
+        return {"task_id": task_id, "route": route, "consumer": consumer, "chat": chat, "restored": True}
 
     def migrate(self, *, backfill: bool = False) -> Dict[str, Any]:
         """Add the notifier extension to a v0.1 ledger. A consistent copy (SQLite backup API, not a
@@ -434,9 +506,9 @@ class Ledger:
         finally:
             dest.close()
         os.chmod(str(dest_path), 0o600)
-        cutoff = "" if backfill else now_iso()
+        cutoff = self.notifier_cutoff() if self._meta("notifier_schema") else ("" if backfill else now_iso())
         with self.tx() as c:
-            _apply_notifier_extension(c, cutoff=cutoff)
+            _apply_notifier_extension(c, cutoff=cutoff, historical=True)
         return {"migrated": True, "backup": str(dest_path), "cutoff": cutoff, "schema_version": SCHEMA_VERSION,
                 "notifier_schema": NOTIFIER_SCHEMA}
 
@@ -489,12 +561,12 @@ class Ledger:
 
     # ------------------------------------------------------------------ submit
     def submit(self, *, scope: str, key: str, payload: Dict[str, Any], prompt: str,
-               native_session_id: Optional[str], notify_route: Optional[str] = None) -> Tuple[str, Dict[str, Any], str]:
+               native_session_id: Optional[str], notify_route: Optional[str] = None,
+               notify_consumer: Optional[str] = None, notify_chat: Optional[str] = None,
+               notify_bound: bool = False) -> Tuple[str, Dict[str, Any], str]:
         """Returns (status, task, payload_sha256) with status in created|duplicate|conflict.
         The caller may only report "accepted" after this returns (i.e. after COMMIT).
-        ``notify_route`` is routing metadata, not payload: a duplicate keeps the first one."""
-        if notify_route is not None:
-            self.require_notifier()
+        Notification ownership is metadata, not payload: a duplicate keeps the first binding."""
         sha = payload_hash(payload)
         now = now_iso()
         with self.tx() as c:
@@ -508,6 +580,8 @@ class Ledger:
                               (now, existing["task_id"]))
                 task_id = existing["task_id"]
             else:
+                if notify_route is not None or notify_bound:
+                    self.require_notifier()
                 status = "created"
                 task_id, attempt_id = new_id("t"), new_id("a")
                 c.execute(
@@ -515,8 +589,9 @@ class Ledger:
                     "state, current_attempt, submit_count, created_at, updated_at) "
                     "VALUES (?,?,?,?,?,?,?,'accepted',1,1,?,?)",
                     (task_id, scope, key, sha, canonical_json(payload), payload["engine"], payload["cwd"], now, now))
-                if notify_route is not None:
-                    c.execute("UPDATE tasks SET notify_route=? WHERE task_id=?", (notify_route, task_id))
+                if notify_route is not None or notify_bound:
+                    c.execute("UPDATE tasks SET notify_route=?, notify_consumer=?, notify_chat=?, notify_bound=? "
+                              "WHERE task_id=?", (notify_route, notify_consumer, notify_chat, int(notify_bound), task_id))
                 c.execute(
                     "INSERT INTO attempts (attempt_id, task_id, attempt_no, reason, state, prompt, native_session_id, "
                     "cwd, created_at, updated_at) VALUES (?,?,1,'initial','pending',?,?,?,?,?)",
@@ -657,12 +732,13 @@ class Ledger:
                                      exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,
                                      native=native, evidence=evidence, source=source)
 
-    def mark_unknown(self, attempt_id: str, *, from_states: Sequence[str], evidence: Dict[str, Any]) -> Optional[str]:
+    def mark_unknown(self, attempt_id: str, *, from_states: Sequence[str], evidence: Dict[str, Any],
+                     processes_stopped: bool = False) -> Optional[str]:
         with self.tx() as c:
             att = c.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
             if att is None or att["state"] not in from_states:
                 return None
-            if att["cancel_requested_at"]:
+            if att["cancel_requested_at"] and processes_stopped:
                 # The caller decided from an earlier snapshot; a cancel committed since then is seen
                 # here. A run that stopped without a result after a cancel is `cancelled`.
                 return self._close_in_tx(c, att, new_state="finished", kind="terminal", outcome="cancelled",

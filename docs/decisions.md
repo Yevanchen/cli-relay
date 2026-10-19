@@ -327,8 +327,8 @@ that failed on the unfixed code ([`acceptance.md`](acceptance.md), section 2.3).
    0.163.0) no requirements or managed layer exists, and every recorded turn ran in the
    requested sandbox with no named profile. So the conditional branch is not active there, and
    nothing was widened to try it. The fix fails closed in two places:
-   - before the run, any permission setting, requirements or managed-preference layer, or the
-     selected config-profile file blocks the run;
+   - before the run, any permission setting, requirements or managed-preference layer, or an unsafe or
+     unreadable selected config-profile blocks the run; benign profiles are parsed;
    - after the run, every recorded turn must show the requested sandbox or a narrower one, with
      no named profile.
 
@@ -345,7 +345,7 @@ that failed on the unfixed code ([`acceptance.md`](acceptance.md), section 2.3).
    "cannot verify". Consequence: on a Linux host without a readable boot id, reconciliation
    cannot prove a keeper gone and keeps observing.
 6. **Unexpected configuration structure crashed the preflight.** It now converges to `blocked`:
-   - every value is type-checked;
+   - routing and permission values are checked; this is not a complete vendor-config validator;
    - any remaining exception in the preflight or argv construction closes the attempt as
      blocked, instead of re-kicking a keeper that crashes again.
 7. **Tests read the host environment.** Test environments are built from scratch, with a minimal
@@ -358,3 +358,32 @@ that failed on the unfixed code ([`acceptance.md`](acceptance.md), section 2.3).
 8. **An efficiency statement exceeded the evidence.** The unacknowledged-events query fetches no
    acknowledged rows into Python, but SQLite still scans the whole event table. The
    documentation now says so; no performance claim is made.
+
+## D14. Independent review of the v0.2 candidate (2026-10-19)
+
+The original candidate `d27b849` passed its 156 tests but failed new counterexamples. The
+repairs keep the existing CLI, SQLite ledger and adapters; they add no gateway or message service.
+
+- Invalid credentials and adapter failures use fixed error codes, never raw exception text.
+  A finished or failed pass releases its in-process claim even when result recording fails;
+  recovery keeps an ambiguous send distinct from a send known not to have happened.
+- Notification route, consumer and chat are saved once. Configuration changes cannot transfer
+  an old task or reinterpret another consumer's ACK. An identical submit recovers its receipt
+  even if the route has since been removed. Historical missing owners need explicit restoration.
+- Recover abandoned claims before checking ACKs and sending. An already acknowledged event
+  must not be posted again merely because its sender died.
+- Server `Retry-After` is a lower bound after local exponential backoff is capped. Responses
+  indicating failure do not prove the receiver did no work; possible wake-ups count toward the
+  budget. The transport bounds are not exactly-once or measured model-call counts.
+- A requested cancellation is not proof of stopping. If descendants remain or cannot be queried,
+  retain an observable unknown outcome until their absence is proved. Never signal a stale,
+  unverified process group to make this check pass.
+- Codex resume permission evidence must include the current attempt's new turn, anchored to a
+  saved pre-run rollout boundary. Keeper and reconciliation use the same evidence.
+- Normal rollback preserves the current ledger. Stop periodic, immediate and in-flight sends
+  before enabling a previous notifier. Restoring an old pending-task backup can repeat work;
+  it is a manual data-recovery operation, not the code rollback path.
+
+Merge checks are isolated regressions, the complete suite and CI for the fixed code. Real
+Grok chat delivery, the two host installations, exact model/Max settings and the 30-minute
+window remain deployment checks. The 25-hour soak remains uncompleted and nonblocking.

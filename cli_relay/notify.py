@@ -35,9 +35,11 @@ import os
 import re
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -60,6 +62,9 @@ WAITING = ("accepted", "handed_off", "unconfirmed")
 FINAL = ("acked", "skipped", "failed", "unacknowledged")
 SUMMARY_MAX = 400
 EXCERPT_MAX = 120
+# A live process can abandon a pass after an exception. PID liveness alone cannot own its claims.
+_ACTIVE_CLAIMS: set[str] = set()
+_CLAIMS_LOCK = threading.Lock()
 
 
 # --------------------------------------------------------------------------------- config
@@ -212,7 +217,7 @@ def _secret(spec: Dict[str, Any], kind: str, env: Dict[str, str]) -> Optional[st
     else:
         try:
             value = Path(spec[f"{kind}_file"]).read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeError):
             value = None
     value = (value or "").strip()
     return value or None
@@ -232,18 +237,25 @@ def send_command(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str
         if adapter["exit_status"] == "verified":
             return {"outcome": "accepted", "why": "command_exit_0_verified"}
         return {"outcome": "handed_off", "why": "command_exit_0_unverified"}
-    return {"outcome": "retry", "why": "command_failed", "exit_code": p.returncode}
+    return {"outcome": "ambiguous", "why": "command_failed", "exit_code": p.returncode}
 
 
 def send_http(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str, str]) -> Dict[str, Any]:
     url, token = _secret(adapter, "url", env), _secret(adapter, "token", env)
     if not url or not token:
         return {"outcome": "permanent", "why": "credentials_unavailable"}
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
+    if not token.isascii() or any(ord(ch) <= 32 or ord(ch) == 127 for ch in token):
+        return {"outcome": "permanent", "why": "token_invalid"}
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+        valid = parts.scheme in ("http", "https") and parts.hostname and parts.username is None
+    except (ValueError, UnicodeError):
+        valid = False
+    if not valid:
         return {"outcome": "permanent", "why": "url_invalid"}
     conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
-    conn = conn_cls(parts.hostname, parts.port, timeout=adapter["timeout_s"])
+    conn = conn_cls(parts.hostname, port, timeout=adapter["timeout_s"])
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
     try:
@@ -266,17 +278,37 @@ def send_http(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str, s
     if 200 <= status < 300:
         return {"outcome": "accepted", "why": "http_2xx", "status": status}
     if status == 429 or status == 408 or status >= 500:
-        out: Dict[str, Any] = {"outcome": "retry", "why": "http_retryable", "status": status}
-        if retry_after and retry_after.strip().isdigit():
-            out["retry_after_s"] = int(retry_after.strip())
+        out: Dict[str, Any] = {"outcome": "retry", "why": "http_retryable", "status": status,
+                               "may_have_woken": True}
+        delay = _retry_after(retry_after)
+        if delay is not None:
+            out["retry_after_s"] = delay
         return out
-    return {"outcome": "permanent", "why": "http_rejected", "status": status}
+    return {"outcome": "permanent", "why": "http_rejected", "status": status, "may_have_woken": True}
+
+
+def _retry_after(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        if value.strip().isdigit():
+            return float(value.strip())
+        until = parsedate_to_datetime(value)
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        return max(0.0, (until - datetime.now(timezone.utc)).total_seconds())
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 def send(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str, str]) -> Dict[str, Any]:
-    if adapter["type"] == "command":
-        return send_command(adapter, payload, env)
-    return send_http(adapter, payload, env)
+    try:
+        if adapter["type"] == "command":
+            return send_command(adapter, payload, env)
+        return send_http(adapter, payload, env)
+    except Exception as exc:
+        # Third-party exception text can contain the URL or Authorization header.
+        return {"outcome": "ambiguous", "why": "adapter_error", "error": type(exc).__name__}
 
 
 # ------------------------------------------------------------------------------- the pass
@@ -285,24 +317,31 @@ def _iso(dt: datetime) -> str:
 
 
 def _later(seconds: float) -> str:
-    return _iso(datetime.now(timezone.utc) + timedelta(seconds=seconds))
+    try:
+        return _iso(datetime.now(timezone.utc) + timedelta(seconds=seconds))
+    except OverflowError:
+        return _iso(datetime.max.replace(tzinfo=timezone.utc))
 
 
 def enqueue(ledger: Ledger, cfg: Dict[str, Any]) -> int:
     """Create the transport record for every event since the cutoff that has none yet."""
+    ledger.bind_notification_owners(cfg)
     cutoff = ledger.notifier_cutoff()
     now = now_iso()
     created = 0
     with ledger.tx() as c:
         rows = c.execute(
-            "SELECT e.event_id, e.kind, e.body_json, t.notify_route FROM events e JOIN tasks t ON t.task_id=e.task_id "
+            "SELECT e.event_id, e.kind, e.body_json, t.notify_route, t.notify_bound FROM events e "
+            "JOIN tasks t ON t.task_id=e.task_id "
             "WHERE e.created_at >= ? AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.event_id=e.event_id) "
             "ORDER BY e.created_at, e.event_id", (cutoff,)).fetchall()
         for r in rows:
             outcome = json.loads(r["body_json"]).get("outcome") or r["kind"]
-            route = r["notify_route"] or cfg["default_route"]
+            route = r["notify_route"]
             state, why = "pending", None
-            if route is None:
+            if r["notify_bound"] != 1:
+                state, why, route = "failed", "owner_unresolved", route or "-"
+            elif route is None:
                 state, why, route = "skipped", "no_route", "-"
             elif route not in cfg["routes"]:
                 state, why = "failed", "route_not_configured"
@@ -313,6 +352,10 @@ def enqueue(ledger: Ledger, cfg: Dict[str, Any]) -> int:
                       (r["event_id"], route, state, now if state == "pending" else None,
                        canonical_json({"why": why}) if why else None, now, now))
             created += 1
+        names = tuple(cfg["routes"])
+        c.execute("UPDATE notifications SET state='failed', next_at=NULL, last_result_json=?, updated_at=? "
+                  f"WHERE state='pending' AND route NOT IN ({','.join('?' for _ in names)})",
+                  (canonical_json({"why": "route_not_configured"}), now, *names))
     return created
 
 
@@ -321,14 +364,14 @@ def sync_acks(ledger: Ledger, cfg: Dict[str, Any]) -> int:
     ('claimed', 'sending') are left to it, so its send is recorded; the next pass closes them."""
     changed = 0
     with ledger.tx() as c:
-        for name, route in cfg["routes"].items():
-            cur = c.execute(
-                "UPDATE notifications SET state='acked', next_at=NULL, updated_at=?, acked_at=(SELECT acked_at FROM "
-                "acks a WHERE a.event_id=notifications.event_id AND a.consumer=?) WHERE route=? AND state NOT IN "
-                "('acked','skipped','claimed','sending') AND EXISTS (SELECT 1 FROM acks a WHERE "
-                "a.event_id=notifications.event_id AND a.consumer=?)", (now_iso(), route["consumer"], name,
-                                                                        route["consumer"]))
-            changed += cur.rowcount
+        owner_ack = ("SELECT a.acked_at FROM acks a JOIN events e ON e.event_id=a.event_id "
+                     "JOIN tasks t ON t.task_id=e.task_id WHERE a.event_id=notifications.event_id "
+                     "AND t.notify_bound=1 AND a.consumer=t.notify_consumer")
+        cur = c.execute(
+            f"UPDATE notifications SET state='acked', next_at=NULL, updated_at=?, acked_at=({owner_ack}) "
+            "WHERE state NOT IN ('acked','skipped','claimed','sending') "
+            f"AND EXISTS ({owner_ack})", (now_iso(),))
+        changed += cur.rowcount
     return changed
 
 
@@ -338,7 +381,9 @@ def recover(ledger: Ledger, cfg: Dict[str, Any]) -> Dict[str, int]:
     with ledger.tx() as c:
         rows = c.execute("SELECT * FROM notifications WHERE state IN ('claimed','sending')").fetchall()
         for r in rows:
-            if procs.same_process_alive(r["claimed_by"], r["claimed_token"]) is not False:
+            with _CLAIMS_LOCK:
+                abandoned_here = r["claimed_by"] == os.getpid() and r["claim_id"] not in _ACTIVE_CLAIMS
+            if not abandoned_here and procs.same_process_alive(r["claimed_by"], r["claimed_token"]) is not False:
                 continue  # its sender may still be working on it
             if r["state"] == "claimed":
                 c.execute("UPDATE notifications SET state='pending', next_at=?, claimed_by=NULL, claimed_token=NULL, "
@@ -376,18 +421,40 @@ def remind(ledger: Ledger, cfg: Dict[str, Any]) -> Dict[str, int]:
     return out
 
 
-def _claim(ledger: Ledger, route: str) -> Tuple[str, List[Dict[str, Any]]]:
+def _claim(ledger: Ledger, route: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
     claim_id = uuid.uuid4().hex
     me = os.getpid()
     now = now_iso()
-    with ledger.tx() as c:
-        c.execute("UPDATE notifications SET state='claimed', claimed_by=?, claimed_token=?, claim_id=?, claimed_at=?, "
-                  "updated_at=? WHERE route=? AND state='pending' AND next_at <= ?",
-                  (me, procs.start_token(me), claim_id, now, now, route, now))
-        rows = c.execute(
-            "SELECT n.*, e.task_id, e.attempt_no, e.kind, e.body_json, t.request_key FROM notifications n "
-            "JOIN events e ON e.event_id=n.event_id JOIN tasks t ON t.task_id=e.task_id "
-            "WHERE n.claim_id=? ORDER BY e.created_at, e.event_id", (claim_id,)).fetchall()
+    with _CLAIMS_LOCK:
+        _ACTIVE_CLAIMS.add(claim_id)
+    try:
+        with ledger.tx() as c:
+            c.execute("UPDATE notifications SET state='failed', next_at=NULL, last_result_json=?, updated_at=? "
+                      "WHERE route=? AND state='pending' AND (attempts >= ? OR wakes >= ?)",
+                      (canonical_json({"why": "budget_exhausted"}), now, route["name"],
+                       cfg["retry"]["max_attempts"], cfg["reminder"]["max_wakes"]))
+            owner_matches = ("SELECT 1 FROM events e JOIN tasks t ON t.task_id=e.task_id "
+                             "WHERE e.event_id=notifications.event_id AND t.notify_bound=1 "
+                             "AND t.notify_consumer=? AND t.notify_chat=?")
+            c.execute("UPDATE notifications SET state='failed', next_at=NULL, last_result_json=?, updated_at=? "
+                      f"WHERE route=? AND state='pending' AND NOT EXISTS ({owner_matches})",
+                      (canonical_json({"why": "route_owner_changed"}), now, route["name"],
+                       route["consumer"], route["chat"]))
+            c.execute("UPDATE notifications SET state='claimed', claimed_by=?, claimed_token=?, claim_id=?, claimed_at=?, "
+                      "updated_at=? WHERE route=? AND state='pending' AND next_at <= ? "
+                      "AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.event_id=notifications.event_id AND a.consumer=?)",
+                      (me, procs.start_token(me), claim_id, now, now, route["name"], now, route["consumer"]))
+            rows = c.execute(
+                "SELECT n.*, e.task_id, e.attempt_no, e.kind, e.body_json, t.request_key FROM notifications n "
+                "JOIN events e ON e.event_id=n.event_id JOIN tasks t ON t.task_id=e.task_id "
+                "WHERE n.claim_id=? ORDER BY e.created_at, e.event_id", (claim_id,)).fetchall()
+    except BaseException:
+        with _CLAIMS_LOCK:
+            _ACTIVE_CLAIMS.discard(claim_id)
+        raise
+    if not rows:
+        with _CLAIMS_LOCK:
+            _ACTIVE_CLAIMS.discard(claim_id)
     return claim_id, [dict(r) for r in rows]
 
 
@@ -398,16 +465,19 @@ def _record(ledger: Ledger, cfg: Dict[str, Any], claim_id: str, result: Dict[str
         rows = c.execute("SELECT * FROM notifications WHERE claim_id=? AND state='sending'", (claim_id,)).fetchall()
         for r in rows:
             attempts = r["attempts"] + 1
+            may_have_woken = outcome in ("accepted", "handed_off", "ambiguous") or result.get("may_have_woken", False)
+            wakes = r["wakes"] + int(may_have_woken)
             if outcome in ("accepted", "handed_off", "ambiguous"):
                 state = {"accepted": "accepted", "handed_off": "handed_off", "ambiguous": "unconfirmed"}[outcome]
-                wakes, next_at = r["wakes"] + 1, _later(cfg["reminder"]["ack_timeout_s"])
-            elif outcome == "retry" and attempts < cfg["retry"]["max_attempts"]:
+                next_at = _later(cfg["reminder"]["ack_timeout_s"])
+            elif (outcome == "retry" and attempts < cfg["retry"]["max_attempts"]
+                  and wakes < cfg["reminder"]["max_wakes"]):
                 delay = min(cfg["retry"]["max_delay_s"], cfg["retry"]["base_delay_s"] * 2 ** (attempts - 1))
                 if "retry_after_s" in result:
-                    delay = min(cfg["retry"]["max_delay_s"], max(delay, float(result["retry_after_s"])))
-                state, wakes, next_at = "pending", r["wakes"], _later(delay)
+                    delay = max(delay, float(result["retry_after_s"]))
+                state, next_at = "pending", _later(delay)
             else:  # permanent rejection, or out of attempts
-                state, wakes, next_at = "failed", r["wakes"], None
+                state, next_at = "failed", None
             c.execute("UPDATE notifications SET state=?, attempts=?, wakes=?, next_at=?, last_result_json=?, "
                       "first_sent_at=COALESCE(first_sent_at, ?), last_sent_at=?, accepted_at=CASE WHEN ?='accepted' "
                       "THEN COALESCE(accepted_at, ?) ELSE accepted_at END, claimed_by=NULL, claimed_token=NULL, "
@@ -425,39 +495,50 @@ def flush(home: Path, env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     cfg = load_config(home)
     env = dict(os.environ if env is None else env)
     ledger = Ledger(home)
-    ledger.require_notifier()
-    summary: Dict[str, Any] = {"enqueued": enqueue(ledger, cfg), "acked": sync_acks(ledger, cfg)}
-    summary.update(recover(ledger, cfg))
-    summary.update(remind(ledger, cfg))
-    sends = []
-    for name, route in cfg["routes"].items():
-        claim_id, rows = _claim(ledger, name)
-        if not rows:
-            continue
-        _hook("notify_after_claim")
-        refs = [_event_ref(r) for r in rows]
-        payload = build_payload(cfg, route, ledger.ledger_id, refs, reminder=any(r["reminder"] for r in rows))
-        started = now_iso()
-        with ledger.tx() as c:  # from here on, a crash may leave the consumer woken
-            c.execute("UPDATE notifications SET state='sending', updated_at=? WHERE claim_id=? AND state='claimed'",
-                      (started, claim_id))
-        _hook("notify_before_send")
-        result = send(route["adapter"], payload, env)
-        _hook("notify_after_send")
-        _record(ledger, cfg, claim_id, result, started)
-        sends.append({"route": name, "events": [r["event_id"] for r in refs], "outcome": result["outcome"],
-                      "why": result.get("why"), "status": result.get("status")})
-    summary["sends"] = sends
-    return summary
+    try:
+        ledger.require_notifier()
+        summary: Dict[str, Any] = {"enqueued": enqueue(ledger, cfg)}
+        summary.update(recover(ledger, cfg))
+        summary["acked"] = sync_acks(ledger, cfg)
+        summary.update(remind(ledger, cfg))
+        sends = []
+        for name, route in cfg["routes"].items():
+            claim_id, rows = _claim(ledger, route, cfg)
+            if not rows:
+                continue
+            try:
+                _hook("notify_after_claim")
+                refs = [_event_ref(r) for r in rows]
+                payload = build_payload(cfg, route, ledger.ledger_id, refs, reminder=any(r["reminder"] for r in rows))
+                started = now_iso()
+                with ledger.tx() as c:  # from here on, a crash may leave the consumer woken
+                    c.execute("UPDATE notifications SET state='sending', updated_at=? WHERE claim_id=? AND state='claimed'",
+                              (started, claim_id))
+                _hook("notify_before_send")
+                result = send(route["adapter"], payload, env)
+                _hook("notify_after_send")
+                _record(ledger, cfg, claim_id, result, started)
+                sends.append({"route": name, "events": [r["event_id"] for r in refs], "outcome": result["outcome"],
+                              "why": result.get("why"), "status": result.get("status")})
+            finally:
+                with _CLAIMS_LOCK:
+                    _ACTIVE_CLAIMS.discard(claim_id)
+        summary["sends"] = sends
+        return summary
+    finally:
+        ledger.close()
 
 
 def status(home: Path, *, task_id: Optional[str] = None, event_id: Optional[str] = None) -> List[Dict[str, Any]]:
     ledger = Ledger(home)
-    ledger.require_notifier()
-    rows = ledger.conn.execute(
-        "SELECT n.*, e.task_id, e.attempt_no, e.kind FROM notifications n JOIN events e ON e.event_id=n.event_id "
-        "WHERE (? IS NULL OR e.task_id=?) AND (? IS NULL OR n.event_id=?) ORDER BY n.created_at",
-        (task_id, task_id, event_id, event_id)).fetchall()
+    try:
+        ledger.require_notifier()
+        rows = ledger.conn.execute(
+            "SELECT n.*, e.task_id, e.attempt_no, e.kind FROM notifications n JOIN events e ON e.event_id=n.event_id "
+            "WHERE (? IS NULL OR e.task_id=?) AND (? IS NULL OR n.event_id=?) ORDER BY n.created_at",
+            (task_id, task_id, event_id, event_id)).fetchall()
+    finally:
+        ledger.close()
     out = []
     for r in rows:
         d = {k: r[k] for k in ("event_id", "route", "state", "attempts", "wakes", "next_at", "task_id", "attempt_no",
@@ -472,12 +553,15 @@ def status(home: Path, *, task_id: Optional[str] = None, event_id: Optional[str]
 def retry(home: Path, event_id: str) -> int:
     """An explicit operator action: give a failed or unacknowledged notification one new budget."""
     ledger = Ledger(home)
-    ledger.require_notifier()
-    with ledger.tx() as c:
-        cur = c.execute("UPDATE notifications SET state='pending', attempts=0, wakes=0, next_at=?, reminder=0, "
-                        "last_result_json=?, updated_at=? WHERE event_id=? AND state IN ('failed','unacknowledged')",
-                        (now_iso(), canonical_json({"manual_retry_at": now_iso()}), now_iso(), event_id))
-        return cur.rowcount
+    try:
+        ledger.require_notifier()
+        with ledger.tx() as c:
+            cur = c.execute("UPDATE notifications SET state='pending', attempts=0, wakes=0, next_at=?, reminder=0, "
+                            "last_result_json=?, updated_at=? WHERE event_id=? AND state IN ('failed','unacknowledged')",
+                            (now_iso(), canonical_json({"manual_retry_at": now_iso()}), now_iso(), event_id))
+            return cur.rowcount
+    finally:
+        ledger.close()
 
 
 def configured(home: Path) -> bool:

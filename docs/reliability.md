@@ -167,11 +167,15 @@ Permission posture does not depend on the CLIs' configuration of the moment:
 - `danger-full-access` and every permission-bypass flag are rejected in argv.
 - `--sandbox` is not the only thing that decides a Codex run's permissions: named permission
   profiles and requirements can take precedence. Codex runs are checked on both sides:
-  - before the run, a permission setting, a requirements or managed-preference layer, or the
-    config-profile file selected by `profile` blocks the run;
+  - before the run, a permission setting, a requirements or managed-preference layer, or an unsafe or
+    unreadable config-profile selected by `profile` blocks the run; benign profiles are parsed;
   - after the run, every `turn_context` in the thread's rollout must show the requested sandbox
     (or a narrower one) and no active named permission profile. Otherwise the attempt is
-    `blocked`; a thread without that record is `permissions_unverified`.
+    `blocked`; a thread without that record is `permissions_unverified`. Before an exact resume,
+    the keeper records the rollout path, file identity and byte boundary in attempt evidence.
+    A resumed attempt also needs a new `turn_context` after that boundary. Missing evidence,
+    replacement or truncation of that file is unverified; reconciliation uses the same saved
+    boundary, so an earlier safe turn cannot certify a later attempt.
 
 The relay refuses to run, or stops and closes as `blocked`, whatever it can see routing a run
 away from the subscription login. It checks:
@@ -191,8 +195,8 @@ away from the subscription login. It checks:
        `settings.local.json` of the task directory and its parents, and managed. A
        credential helper (`apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`), a
        non-claude.ai `forceLoginMethod`, or a billing variable in `env` blocks the run.
-     - An unreadable layer, or a value of an unexpected type, also blocks: what cannot be
-       confirmed is not run.
+     - An unreadable layer or an invalid checked routing/permission value blocks. This is
+       not a complete validator for every value accepted by the vendor configuration format.
    - the login (`claude auth status` → claude.ai / firstParty; `codex login status` → ChatGPT).
 2. **While it runs:** a Claude init event that reports an API-key source (or bypass mode)
    stops the CLI.
@@ -316,18 +320,18 @@ events, and writes only its own `notifications` rows.
 | N3 | a pass dies after `sending` (possibly after the POST) | `sending` + a dead claimer | may have woken the consumer: `unconfirmed`, no immediate resend, at most a bounded reminder | `test_crash_after_send_is_never_resent_blindly` |
 | N4 | the receiver is unreachable or restarts | `pending` with `next_at` | exponential backoff up to `max_attempts`, then `failed` (kept) | `test_outage_then_recovery`, `test_server_restart_between_two_events`, `test_retries_are_bounded` |
 | N5 | the request may have arrived but the response is lost or times out | `unconfirmed` | as N3 | `test_lost_response_is_unconfirmed_and_reminded_within_bounds` |
-| N6 | 429 / 5xx | `pending` with `next_at` (≥ `Retry-After`) | retried within bounds | `test_rate_limited_then_accepted` |
+| N6 | 429 / 5xx | `pending` with `next_at` (≥ `Retry-After`), or `failed` if a bound is reached | counts as a possible wake; retried within both bounds | `test_rate_limited_then_accepted` |
 | N7 | accepted, but the consumer never ACKs (its run failed, its ACK was lost) | `accepted` / `handed_off` | one reminder per `ack_timeout_s` up to `max_wakes`, then `unacknowledged`; never cleared | `test_a_lost_consumer_ack_gets_a_bounded_reminder`, `test_unacknowledged_events_are_never_cleared` |
 | N8 | concurrent passes, repeated passes, duplicate submits | one row per (event, route) | compare-and-set claims: one send | `test_concurrent_passes_and_duplicate_submits_send_once` |
 | N9 | an ACK arrives during a send | `sending` | the sender records its send; the next pass records the ACK | `test_an_ack_during_a_send_keeps_the_send_on_record` |
 
 Guarantees, given that the machine runs, the ledger is writable and a pass runs from time to
 time (the keeper's own pass plus `notify run`):
-- every committed event of a notified outcome is offered to its route at least once, unless
-  the route's transport rejects it permanently or exhausts its attempts (then it is `failed`,
-  and visible);
+- an event is offered to its stored owner while that route is valid; missing or changed owners,
+  permanent transport rejection or exhausted bounds leave a visible failure for explicit repair;
 - no event is offered more than `max_attempts` times, and no more than `max_wakes` of those
-  calls may have reached the consumer;
+  calls may have reached the consumer; this includes HTTP error responses and started commands
+  that exit non-zero, and it does not measure how many model runs the receiver actually starts;
 - a notification never runs, resumes or re-runs a task;
 - the transport result and the consumer ACK are stored separately; neither is inferred from
   the other or from pull reads.

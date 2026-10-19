@@ -17,7 +17,7 @@ class FakeWebhook:
     Retry-After: 1), '500', '401', or 'drop' (read the request, then close without answering, as
     when the response is lost after the receiver may already have started a run)."""
 
-    def __init__(self, behaviours: Optional[List[str]] = None, port: int = 0) -> None:
+    def __init__(self, behaviours: Optional[List[str]] = None, port: int = 0, retry_after: str = "1") -> None:
         self.requests: List[Dict[str, Any]] = []
         self.behaviours = list(behaviours or [])
         self.lock = threading.Lock()
@@ -40,7 +40,7 @@ class FakeWebhook:
                 code = {"ok": 200, "429": 429, "500": 500, "401": 401}[behaviour]
                 self.send_response(code)
                 if code == 429:
-                    self.send_header("Retry-After", "1")
+                    self.send_header("Retry-After", retry_after)
                 self.send_header("Content-Length", "2")
                 self.end_headers()
                 self.wfile.write(b"{}")

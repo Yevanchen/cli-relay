@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env, isolated_env, side_effects
+from helpers import RelayTestCase, base_env, isolated_env, needs_clean_cli_config, side_effects
 
 from cli_relay import engines
 from cli_relay.errors import UsageError
@@ -23,6 +23,7 @@ def _fake_cli(dirpath: Path, name: str, auth_output: str, marker: Path) -> Path:
     return path
 
 
+@needs_clean_cli_config
 class ArgvSafety(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="cli-relay-eng-"))

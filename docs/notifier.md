@@ -46,10 +46,13 @@ consumer (Bot) reads the task by id, reports in its chat, then `cli-relay ack` �
 - **Bounds.** Every number is configurable.
   - At most `retry.max_attempts` adapter calls per event (default 6).
   - Backoff doubles from `retry.base_delay_s` (default 30 s) up to `retry.max_delay_s` (default
-    30 min). `Retry-After` is honoured.
-  - At most `reminder.max_wakes` calls that may have reached the consumer (default 2). After an
-    accepted, handed-off or unconfirmed call, one reminder follows when no ACK arrived within
-    `reminder.ack_timeout_s` (default 30 min).
+    30 min). `Retry-After` is a lower bound applied after that cap, so it may require a longer wait.
+  - At most `reminder.max_wakes` calls that may have reached the consumer (default 2). HTTP
+    error responses and a command that starts but exits non-zero also count: failure is not
+    proof that the receiver did no work. Connection failures before sending do not count as a
+    possible wake, but still consume an attempt. After an accepted, handed-off or unconfirmed
+    call, a reminder follows only within the remaining budget and after
+    `reminder.ack_timeout_s` (default 30 min). These are transport bounds, not measured Bot run counts.
   - Then the row stays `failed` or `unacknowledged`. Nothing is deleted, and the event is still
     listed by `events`. Only `notify retry --event E` gives it a new budget.
 - **Crashes.** A pass that dies after claiming but before marking `sending` sent nothing, and the
@@ -91,10 +94,16 @@ Private to each machine. Never commit it. Keep it readable only by its owner (`c
   - A task chooses its route with `submit --notify-route NAME`.
   - Without one it uses `default_route`.
   - With neither it is not notified.
+  - The effective route, consumer and chat are stored once; changing the default cannot move
+    an existing task. If no configuration existed at submit, the first configured pass binds
+    it once. An explicit route can wait for its configuration.
+  - Credentials may rotate without changing the owner. If a route name is reused with a new
+    consumer or chat, old tasks fail with `route_owner_changed`; their owner is not rewritten.
+    Restore the original route identity before an explicit `notify retry`.
 - `adapter.type = "command"` runs `argv + [job, stage, status, summary, artifact]`. That is the
   interface of `notify.sh <job> <stage> <status> <summary> [artifact]`.
   - `exit_status` defaults to `"unverified"`: exit 0 is recorded as `handed_off`, and a non-zero
-    exit is retried.
+    exit is ambiguous and uses the bounded reminder budget.
   - Set `"verified"` only for a program whose exit status really reflects delivery.
   - The program gets the notifier's environment. It reads its own credentials; cli-relay never
     sees them.
@@ -123,6 +132,20 @@ The HTTP adapter also sends `cli_relay`, a structured copy:
  "events": [{"event_id": "e-…", "task_id": "t-…", "attempt_no": 1, "kind": "terminal",
              "outcome": "succeeded", "key": "…", "result_excerpt": "…"}]}
 ```
+
+### Earlier v0.2 candidate ledgers
+
+Run `migrate` when upgrading an earlier candidate as well as v0.1. The core schema stays 1;
+the additive notifier extension is now 2. A consistent backup is taken before adding the
+owner fields and the original notification cutoff is preserved.
+
+Old records do not prove who originally owned a task. They appear as `owner_state=manual_restore`
+and are not silently assigned to today's default. For a task that needs notification, confirm
+its original route, consumer and chat from existing evidence, then use `notify bind-owner` with
+those explicit values. It rejects a route that contradicts recorded task or transport history.
+If a notification is already `failed`, use `notify retry --event E` after restoring its owner;
+this gives it a new bounded budget, so first check whether the consumer already processed it.
+Stored results and ACKs remain readable throughout. New tasks bind normally.
 
 ## Using it from a Grok Bot routine
 
@@ -156,11 +179,12 @@ outcomes, batches what is due, and stops after `max_wakes`. It never polls the B
 | Command | Does |
 |---|---|
 | `cli-relay migrate [--backfill]` | add the notifier tables to an existing ledger, after a consistent SQLite backup in `<home>/backups/`; events from before the migration are not notified unless `--backfill` |
-| `cli-relay notify flush` | one pass: enqueue new events, record ACKs, recover dead passes, schedule reminders, send what is due |
+| `cli-relay notify flush` | one pass: enqueue events, recover abandoned passes, record ACKs, schedule reminders, send what is due |
 | `cli-relay notify run [--interval 60]` | a pass every interval until SIGTERM (for launchd or systemd); one log line per pass in `<home>/notifier.log` |
 | `cli-relay notify status [--task T] [--event E]` | per notification: state, attempts, wake-ups, `transport_accepted`, `consumer_acked`, last result |
 | `cli-relay notify retry --event E` | operator action: a failed or unacknowledged notification gets a new budget |
-| `cli-relay submit … --notify-route NAME` | the route of this task (routing metadata, not part of the payload) |
+| `cli-relay submit … --notify-route NAME` | fixed route and owner for this task (routing metadata, not part of the payload) |
+| `cli-relay notify bind-owner --task T --route R --consumer C --chat LABEL` | explicitly restore a migrated task's missing original owner; never change a bound owner or contradict a recorded route |
 | `cli-relay ack … --ledger-id L [--source-id S]` | refuse unless the event belongs to this ledger or machine |
 
 When a keeper commits a terminal event, and when a reconciling command closes an attempt, a
@@ -169,33 +193,49 @@ reminders, and it catches up after a restart.
 
 ## Install (per machine)
 
-1. **Back up.** Copy the existing notifier script or configuration aside, and take a consistent
-   copy of the ledger: `cli-relay migrate` writes one itself, or use
-   `sqlite3 <home>/ledger.db ".backup <file>"`. Do not copy the live `ledger.db`/`-wal` files.
-2. **Install this version** (`pip install .` from the tagged checkout, or run in place).
-3. **Migrate.** Run `cli-relay migrate` once per existing ledger. A new ledger already has the
-   tables.
-4. **Configure.** Write `<home>/notifier.json` for this machine (its own `source_id`, the route to
-   its notifier) and `chmod 600` it.
-5. **Start the periodic pass**, for example as a launchd agent running
+1. **Back up.** Save the current notifier script, service definition and private configuration.
+   Take a consistent SQLite backup, using `cli-relay migrate` or
+   `sqlite3 <home>/ledger.db ".backup <file>"`; do not copy a live DB/WAL pair.
+2. **Stop the old notification path first.** Disable its periodic watcher and any completion
+   hooks that send the same task endings. Wait for already-started sends to finish. Do not stop
+   coding tasks. Results can accumulate in the ledger during this switch.
+3. **Install the reviewed version**, from a fixed commit or tag. Run `cli-relay migrate` on each
+   existing ledger, including a ledger made by an earlier v0.2 candidate. A new ledger already
+   has the current additive extension. Keep the existing ledger and its ACKs.
+4. **Configure only after the old sender has stopped.** Write `<home>/notifier.json` for this
+   machine, with its own `source_id` and destination, and make it owner-readable only. Once the
+   file exists, a completing keeper can start an immediate pass even before the periodic service
+   starts. Preserve existing credentials; do not publish the configuration.
+5. **Start the periodic pass**, for example a launchd agent running
    `cli-relay --home <home> notify run --interval 60` with `KeepAlive`.
-6. **Retire the old path.** Make sure no other watcher sends the same task endings. Two notifiers
-   for one event mean two wake-ups.
-7. **Check.** Run one low-risk task with `--notify-route`. Confirm one wake-up arrives and that the
-   Bot reports in the right chat and ACKs. Then confirm `notify status` shows `acked`.
+6. **Check one real task per machine.** Confirm the correct original chat receives its result,
+   then the consumer ACK appears in `notify status`. Record source, ledger, task, event, transport
+   result and chat evidence separately. A 2xx response alone does not pass this check.
 
 ## Rollback
 
-1. Stop `notify run`, for example `launchctl bootout` of its agent. This is the only change needed
-   to stop notifications.
-2. Re-enable the previous notifier path, if there was one.
-3. The ledger stays as it is:
-   - v0.1.0 opens a migrated ledger, because `schema_version` is still 1 and the new tables and
-     the nullable `tasks.notify_route` column are ignored;
-   - running tasks, results, events and ACKs are untouched;
-   - unsent notifications stay in `notifications`, for a later version to send.
-4. Restore the pre-migration backup only if the migrated file itself is suspect. Everything
-   recorded since the migration would be lost; nothing is re-run either way.
+The normal rollback changes code and notification configuration, **not the ledger**.
+
+1. Disable new immediate sends by moving `<home>/notifier.json` to a private backup name outside
+   that path. Stop the periodic `notify run` service and any scheduler that can restart it.
+2. A pass that already read the configuration may still send. Wait for all in-flight passes for
+   this ledger to exit before enabling another sender. Stopping `notify run` alone does not stop
+   the detached passes started by keepers or reconciliation. Do not stop unrelated processes or
+   running coding tasks.
+3. Switch back to the previous code and notifier configuration, then enable only that sender.
+   v0.1.0 can open the additive migrated ledger: core `schema_version` remains 1, and it ignores
+   the new columns and tables. Keep results, events, ACKs and unsent notification rows intact.
+4. Verify one sender is active and reconcile its backlog. A response lost before rollback may
+   already have caused a Bot run; preserving ACKs and checking existing events avoids blindly
+   sending all history again. Exactly-once notification is not guaranteed.
+
+**Restoring an old database backup is a separate manual recovery, not normal rollback.** It
+loses every task transition and ACK recorded since that backup. In particular a task that is
+pending in the backup may have completed since: `status`, `events` or `wait` can start it again.
+Before restoring, stop new submissions, recovery commands and senders; preserve the current DB,
+WAL and attempt artifacts, and account for every post-backup task and its external effects. Do
+not resume normal commands until a reconciled ledger is available. An old backup and an exit
+file alone do not prevent duplicate execution.
 
 ## Limits
 

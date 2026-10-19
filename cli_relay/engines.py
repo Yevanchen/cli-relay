@@ -147,6 +147,12 @@ def claude_config_dir(env: Dict[str, str]) -> Path:
     return Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else _home(env) / ".claude"
 
 
+def codex_system_requirements_paths(env: Dict[str, str]) -> List[Path]:
+    user_name = env.get("USER") or os.environ.get("USER") or ""
+    return [*CODEX_REQUIREMENTS,
+            Path("/Library/Managed Preferences") / user_name / "com.openai.codex.plist"]
+
+
 def _dirs_up(cwd: Optional[str]) -> List[Path]:
     """The task directory and all of its parents, outermost first."""
     if not cwd:
@@ -180,10 +186,7 @@ def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tup
     configuration cannot be confirmed, the run is blocked. Only key names are reported."""
     home = codex_home(env)
     problems: List[str] = []
-    user_name = env.get("USER") or os.environ.get("USER") or ""
-    requirements = [*CODEX_REQUIREMENTS, home / "requirements.toml",
-                    Path("/Library/Managed Preferences") / user_name / "com.openai.codex.plist"]
-    if any(p.exists() for p in requirements):
+    if any(p.exists() for p in [*codex_system_requirements_paths(env), home / "requirements.toml"]):
         problems.append("requirements")
 
     def load(profile_file: Optional[Path]) -> Tuple[Dict[str, Any], List[str], List[str]]:
@@ -323,6 +326,18 @@ def codex_rollout(env: Dict[str, str], thread_id: str) -> Optional[Path]:
     return Path(sorted(matches)[0]) if matches else None
 
 
+def codex_permission_checkpoint(env: Dict[str, str], session_id: str) -> Dict[str, Any]:
+    """Capture the existing thread boundary before a resumed CLI can append its turn."""
+    path = codex_rollout(env, session_id)
+    if path is None:
+        return {"missing": "rollout"}
+    try:
+        stat = path.stat()
+        return {"path": str(path.resolve()), "dev": stat.st_dev, "ino": stat.st_ino, "offset": stat.st_size}
+    except OSError as exc:
+        return {"error": type(exc).__name__}
+
+
 def provider_violation(engine: str, env: Dict[str, str], session_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """After a run: Codex records the provider that served a thread in the thread's own rollout
     (``session_meta.model_provider``). Anything but the built-in ``openai`` provider, or a thread
@@ -335,7 +350,8 @@ def provider_violation(engine: str, env: Dict[str, str], session_id: Optional[st
         return {"reason": "provider_unverified", "missing": "rollout"}
     for ev in iter_json_lines(path):
         if ev.get("type") == "session_meta":
-            provider = (ev.get("payload") or {}).get("model_provider")
+            payload = ev.get("payload")
+            provider = payload.get("model_provider") if isinstance(payload, dict) else None
             if provider == "openai":
                 return None
             return {"reason": "provider_not_subscription", "model_provider": provider}
@@ -349,23 +365,44 @@ def requested_sandbox(engine: str, payload: Dict[str, Any]) -> Optional[str]:
 
 
 def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[str],
-                         sandbox: Optional[str]) -> Optional[Dict[str, Any]]:
+                         sandbox: Optional[str], *, permission_checkpoint: Optional[Dict[str, Any]] = None,
+                         resume_session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """After a run: Codex records each turn's effective sandbox and any active named permission
     profile in the thread's rollout (``turn_context``). Every turn must have run in the requested
     sandbox or a narrower one, with no named profile; a thread without that record is not shown
     to have kept the requested permissions."""
-    if engine != "codex" or not session_id:
+    if engine != "codex":
+        return None
+    if resume_session_id and session_id != resume_session_id:
+        return {"reason": "permissions_unverified", "missing": "resumed_session"}
+    if not session_id:
         return None
     path = codex_rollout(env, session_id)
     if path is None:
         return {"reason": "permissions_unverified", "missing": "rollout"}
+    if resume_session_id:
+        checkpoint = permission_checkpoint
+        if (not isinstance(checkpoint, dict) or not isinstance(checkpoint.get("path"), str)
+                or any(type(checkpoint.get(k)) is not int or checkpoint[k] < 0 for k in ("dev", "ino", "offset"))):
+            return {"reason": "permissions_unverified", "missing": "permission_checkpoint"}
+        try:
+            stat = path.stat()
+            unchanged = (str(path.resolve()) == checkpoint["path"] and stat.st_dev == checkpoint["dev"]
+                         and stat.st_ino == checkpoint["ino"] and stat.st_size >= checkpoint["offset"])
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            return {"reason": "permissions_unverified", "missing": "unchanged_rollout"}
+        # An old safe turn cannot certify a resumed attempt whose own context is absent.
+        if not any(ev.get("type") == "turn_context" for ev in iter_json_lines(path, offset=checkpoint["offset"])):
+            return {"reason": "permissions_unverified", "missing": "current_turn_context"}
     turns = []
     for ev in iter_json_lines(path):
         if ev.get("type") == "turn_context":
             payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
             policy = payload.get("sandbox_policy")
-            turns.append((policy.get("type") if isinstance(policy, dict) else None,
-                          payload.get("active_permission_profile")))
+            kind = policy.get("type") if isinstance(policy, dict) else None
+            turns.append((kind if isinstance(kind, str) else None, payload.get("active_permission_profile")))
     if not turns:
         return {"reason": "permissions_unverified", "missing": "turn_context"}
     allowed = {"read-only"} if sandbox in (None, "read-only") else {"read-only", "workspace-write"}
@@ -452,12 +489,13 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
 
 
 # ---------------------------------------------------------------------------- output parsing
-def iter_json_lines(path: Path) -> Iterable[Dict[str, Any]]:
+def iter_json_lines(path: Path, *, offset: int = 0) -> Iterable[Dict[str, Any]]:
     try:
         f = open(path, "rb")
     except OSError:
         return
     with f:
+        f.seek(offset)
         for raw in f:
             raw = raw.strip()
             if not raw:
@@ -611,7 +649,9 @@ def classify(native: Optional[Dict[str, Any]], *, exit_code: Optional[int], exit
 
 def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_id: Optional[str],
            exit_code: Optional[int], exit_signal: Optional[int], exit_known: bool, cancel_requested: bool,
-           guard: Optional[Dict[str, Any]] = None, sandbox: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+           guard: Optional[Dict[str, Any]] = None, sandbox: Optional[str] = None,
+           permission_checkpoint: Optional[Dict[str, Any]] = None,
+           resume_session_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
     """Name an attempt's outcome from what the run left behind; returns (outcome, evidence).
 
     The keeper and reconciliation both call this, so the outcome does not depend on which of
@@ -627,7 +667,8 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
     provider = provider_violation(engine, env, session_id)
     if provider is not None:
         return "blocked", {"provider_check": provider}
-    permissions = permission_violation(engine, env, session_id, sandbox)
+    permissions = permission_violation(engine, env, session_id, sandbox,
+                                       permission_checkpoint=permission_checkpoint, resume_session_id=resume_session_id)
     if permissions is not None:
         return "blocked", {"permission_check": permissions}
     return classify(parsed.get("native"), exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,

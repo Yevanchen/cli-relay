@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env
+from helpers import RelayTestCase, base_env, needs_clean_cli_config
 
 from cli_relay import engines
 
@@ -44,6 +44,7 @@ def fake_claude(dirpath: Path) -> Path:
     return path
 
 
+@needs_clean_cli_config
 class ProviderConfigPreflight(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="cli-relay-a03-"))
@@ -97,6 +98,7 @@ class ProviderConfigPreflight(unittest.TestCase):
         self.assertFalse(engines.preflight("claude", self.env, cwd=str(self.work)).ok)
 
 
+@needs_clean_cli_config
 class ProviderGuardsAtRunTime(RelayTestCase):
     def setUp(self) -> None:
         super().setUp()

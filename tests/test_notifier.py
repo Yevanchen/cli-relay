@@ -217,7 +217,7 @@ class NetworkFaults(NotifierCase):
     def test_retries_are_bounded(self) -> None:
         self.finish_task("k-n10")
         hook = self.webhook(["500"] * 10)
-        write_config(self.home, http_config(self.tmp, hook.url, max_attempts=3))
+        write_config(self.home, http_config(self.tmp, hook.url, max_attempts=3, max_wakes=10))
         for _ in range(8):
             self.flush()
             time.sleep(0.6)
@@ -438,6 +438,12 @@ class MigrationAndRollback(unittest.TestCase):
         self.assertEqual(backup.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
         backup.close()
         self.assertFalse(run_cli(self.home, "migrate")[1]["migrated"], "idempotent")
+        ledger = sqlite3.connect(str(self.home / "ledger.db"))
+        try:
+            self.assertEqual(ledger.execute("SELECT notify_bound FROM tasks WHERE task_id=?", (old_task,)).fetchone()[0], -1,
+                             "migration cannot infer the historical chat owner")
+        finally:
+            ledger.close()
         hook = FakeWebhook()
         try:
             write_config(self.home, http_config(self.tmp, hook.url))
@@ -456,6 +462,8 @@ class MigrationAndRollback(unittest.TestCase):
         hook = FakeWebhook()
         try:
             write_config(self.home, http_config(self.tmp, hook.url))
+            self.assertEqual(run_cli(self.home, "notify", "bind-owner", "--task", old_task, "--route", "bot",
+                                     "--consumer", "bot", "--chat", "bot chat")[0], 0)
             run_cli(self.home, "notify", "flush")
             self.assertEqual([b["cli_relay"]["events"][0]["task_id"] for b in hook.bodies()], [old_task])
         finally:

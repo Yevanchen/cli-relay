@@ -12,10 +12,11 @@ Status words: **PASS**, **FAIL**, **NOT RUN** (with the reason), **RUNNING**.
 
 ## Code under test
 
-- Branch `v0.2.0`; product code, scripts and tests as of the commit named in section 2.4.
+- Branch `v0.2.0`; original candidate evidence is in section 2.4; subsequent independent-review
+  fixes and their separate verification are in section 2.5.
   - It adds the notifier ([`notifier.md`](notifier.md), [`decisions.md`](decisions.md) D12).
   - It fixes the findings of the independent audit of v0.1.0 (D13).
-  - Later commits change documentation only.
+  - The independent-review fixes change code and tests; earlier real-CLI results are historical.
 - macOS (Darwin 25.2.0, arm64), Python 3.14.3, SQLite 3.52.0.
 - Claude Code 2.1.301 (subscription login), Codex CLI 0.163.0 (ChatGPT login).
 - Linux and Python 3.11 / 3.12 / 3.14 are covered by CI
@@ -140,7 +141,7 @@ every schedule.
 | # | Requirement | Evidence | Result |
 |---|---|---|---|
 | I1 | The soak verdict fails a run without events, and a run with one attempt missing its event | `test_zero_events_acks_and_deliveries_fail`, `test_one_attempt_without_its_event_fails`, `test_the_same_run_with_its_events_delivered_and_acked_passes` | PASS |
-| I2 | Codex permissions: permission settings, requirements, selected profile file block the run; after it, a wider sandbox, a named profile or a missing record blocks | `test_ind_02_codex_permissions` (10 tests) | PASS |
+| I2 | Codex permissions: permission settings, requirements, unsafe or unreadable selected profiles block the run; after it, a wider sandbox, a named profile or a missing record blocks | `test_ind_02_codex_permissions` (10 tests) | PASS |
 | I3 | Cancel racing reconciliation converges to `cancelled` | `test_cancel_after_the_snapshot_is_seen_by_the_closing_write`, `test_an_attempt_already_stuck_in_unknown_with_a_cancel_converges` | PASS |
 | I4 | A SIGTERM-ignoring descendant in the group is stopped before the cancelled state is committed | `test_a_term_ignoring_descendant_is_stopped_before_the_commit`, `test_lists_live_members_of_a_group` | PASS |
 | I5 | A missing identity part is unverifiable | `test_ind_05_linux_empty_boot_id` (4 tests) | PASS |
@@ -148,13 +149,13 @@ every schedule.
 | I7 | Tests do not depend on the host environment | `test_base_env_carries_no_billing_variable_or_host_configuration`, `test_guard_tests_pass_with_billing_variables_and_hostile_user_settings_on_the_host` | PASS |
 | I8 | The events-query efficiency statement matches the evidence | D6 above (wording corrected) | PASS (documentation) |
 
-### 2.4 Recorded short-test results
+### 2.4 Historical short-test results (candidate `d27b849`)
 
-All of these are short tests. None of them is a long-run result.
+All of these are short tests on the original candidate, before the fixes in D14. They do not
+certify the revised code and none is a long-run result.
 
 - **Code.** The product code (`cli_relay/`, `scripts/`, `pyproject.toml`, CI) is identical in
-  every run below; later commits change tests' example names and documentation only. The commit
-  ids are in the pull request.
+  every run below. Subsequent D14 repairs change code; the following results remain historical.
 - **Fault-injection suite with the notifier scenarios.** 156 tests: the v0.1 suite, the
   regression tests for both audits, and 24 notifier scenarios against a local fake webhook.
   - **156/156 passed in each of two consecutive rounds** on the final tests (209.8 s and
@@ -181,11 +182,17 @@ All of these are short tests. None of them is a long-run result.
 - **Raw reports.** They are kept locally and not committed, because they contain local paths
   and session ids.
 
+### 2.5 Independent-review repair verification
+
+The D14 code changes are awaiting the final fixed-commit local suite and CI. Do not reuse
+section 2.4 as a PASS for them. No real model or Grok calls are part of the repair tests.
+Real two-host notification, model/Max settings and the 30-minute window remain **NOT RUN**.
+
 ## 3. Real 25-hour soak
 
 | Run | Code | Status |
 |---|---|---|
-| 25 h soak started 2026-10-19 03:28 UTC+8 | `b72618d` (v0.1 before both audits) | RUNNING (planned end 2026-10-20 ≈04:30 UTC+8). Its own summary uses the old verdict rules; evaluate it with `soak.py verdict` from this version. The result is about `b72618d` only |
+| 25 h soak started 2026-10-19 03:28 UTC+8 | `b72618d` (v0.1 before both audits) | Historical run; current status not rechecked (planned end 2026-10-20 ≈04:30 UTC+8). Its own summary uses the old verdict rules; evaluate it with `soak.py verdict` from this version. The result is about `b72618d` only |
 | 25 h soak on v0.1.0 | `a431845` | NOT RUN |
 | 25 h soak on v0.2.0 | this branch | **Not completed. Does not block this controlled rollout.** Nothing here is claimed to have run for 25 hours |
 
@@ -202,6 +209,6 @@ All of these are short tests. None of them is a long-run result.
 
 - Exactly-once external side effects. They are not claimed.
 - Delivery to any chat bot, phone or person. The relay stores results and re-delivers them;
-  notification is out of scope and not guaranteed.
+  transport notification is implemented, but actual chat delivery still requires the deployment checks above.
 - Behaviour across real machine sleep, power loss, reboot or a full disk.
 - That every possible CLI configuration is recognised by the subscription check.

@@ -5,6 +5,7 @@ way must converge to `cancelled` once its processes are provably gone."""
 
 from __future__ import annotations
 
+import json
 import shutil
 import socket
 import sqlite3
@@ -13,6 +14,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from helpers import run_cli
 
@@ -57,12 +59,61 @@ class CancelAndReconcileRace(unittest.TestCase):
         result, _, _ = self.ledger.request_cancel(self.task_id)  # lands before the closing write
         self.assertEqual(result, "cancel_requested")
         self.ledger.mark_unknown(self.att["attempt_id"], from_states=("running",),
-                                 evidence={"unknown_reason": "no_exit_status_and_no_native_result"})
+                                 evidence={"unknown_reason": "no_exit_status_and_no_native_result"},
+                                 processes_stopped=True)
         att = self.ledger.get_attempt(self.att["attempt_id"])
         self.assertEqual((att["state"], att["outcome"]), ("finished", "cancelled"))
         self.assertEqual(self.ledger.get_task(self.task_id)["state"], "cancelled")
         kinds = [e["kind"] for e in self.ledger.events_of_task(self.task_id)]
         self.assertEqual(kinds, ["terminal"], "one terminal event, no unknown event")
+
+    def reconcile_with_group(self, alive):
+        with patch.object(procs, "same_process_alive", return_value=False), \
+             patch.object(procs, "group_alive", return_value=alive), \
+             patch.object(procs.os, "killpg") as killpg:
+            result = reconcile.reconcile_task(self.ledger, self.task_id, kick=False, spawn=None)
+        killpg.assert_not_called()
+        return result
+
+    def test_cancel_waits_for_group_proof_without_repeating_unknown_events(self) -> None:
+        self.ledger.request_cancel(self.task_id)
+        for group_alive in (True, None, True):
+            self.reconcile_with_group(group_alive)
+            self.assertEqual(self.ledger.get_task(self.task_id)["state"], "unknown")
+            self.assertEqual([e["kind"] for e in self.ledger.events_of_task(self.task_id)], ["unknown"])
+        self.reconcile_with_group(False)
+        self.assertEqual(self.ledger.get_task(self.task_id)["state"], "cancelled")
+        self.assertEqual([e["kind"] for e in self.ledger.events_of_task(self.task_id)], ["unknown", "terminal"])
+
+    def test_exit_record_does_not_override_a_live_group_after_cancel(self) -> None:
+        self.ledger.request_cancel(self.task_id)
+        run_dir = self.ledger.run_dir(self.task_id, 1)
+        run_dir.mkdir(parents=True)
+        (run_dir / "exit.json").write_text(json.dumps({"exit_code": None, "signal": 15,
+                                                      "process_group_cleanup": {"remaining": 0}}))
+        self.reconcile_with_group(True)
+        self.assertEqual(self.ledger.get_task(self.task_id)["state"], "unknown")
+        self.reconcile_with_group(False)
+        self.assertEqual(self.ledger.get_task(self.task_id)["state"], "cancelled")
+        evidence = json.loads(self.ledger.get_attempt(self.att["attempt_id"])["evidence_json"])
+        self.assertEqual(evidence["process_group_cleanup"]["remaining"], 0)
+        self.assertIs(evidence["processes_stopped"], True)
+        self.assertIs(evidence["process_group_alive"], False)
+
+    def test_guard_without_exit_record_finishes_only_after_group_stops(self) -> None:
+        with patch.object(reconcile.engines, "decide", return_value=("blocked", {"guard": "fixture"})):
+            self.reconcile_with_group(True)
+            self.assertEqual(self.ledger.get_task(self.task_id)["state"], "unknown")
+            self.reconcile_with_group(False)
+        self.assertEqual(self.ledger.get_task(self.task_id)["state"], "blocked")
+
+    def test_unverifiable_cli_identity_is_not_stopped_even_with_empty_group(self) -> None:
+        self.ledger.request_cancel(self.task_id)
+        att = self.ledger.get_attempt(self.att["attempt_id"])
+        with patch.object(procs, "same_process_alive", side_effect=[False, None]), \
+             patch.object(procs, "group_alive", return_value=False):
+            reconcile.reconcile_attempt(self.ledger, att, kick=False, spawn=None)
+        self.assertEqual(self.ledger.get_task(self.task_id)["state"], "unknown")
 
     def test_an_attempt_already_stuck_in_unknown_with_a_cancel_converges(self) -> None:
         # State left behind by the race in a ledger written by an earlier version.

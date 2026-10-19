@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helpers import REPO, base_env, needs_clean_cli_config
+from helpers import REPO, base_env, host_system_cli_config, needs_clean_cli_config
 
 from cli_relay import engines
 
@@ -24,6 +24,14 @@ MODULES = ["test_audit_03_provider_bypass", "test_audit_08_billing_violation_aft
 
 
 class TestEnvironmentIsBuiltFromScratch(unittest.TestCase):
+    def test_per_user_managed_preferences_are_in_the_skip_inventory(self) -> None:
+        target = Path("/Library/Managed Preferences/review-test-user/com.openai.codex.plist")
+        with mock.patch.dict(os.environ, {"USER": "review-test-user"}), \
+                mock.patch.object(Path, "exists", lambda p: p == target):
+            self.assertEqual(host_system_cli_config(), [str(target)])
+            problems, _ = engines.codex_config_problems({"HOME": "/nonexistent-test-home"})
+            self.assertIn("requirements", problems)
+
     def test_base_env_carries_no_billing_variable_or_host_configuration(self) -> None:
         hostile = {name: "x" for names in engines.BILLING_ENV.values() for name in names}
         hostile.update(HOME="/nonexistent-host-home", CODEX_HOME="/nonexistent-codex", CLAUDE_CONFIG_DIR="/nonexistent")

@@ -154,20 +154,33 @@ def cmd_submit(args: argparse.Namespace) -> int:
     options = engines.validate_options(engine, _parse_options(args.option))
     payload = {"engine": engine, "cwd": cwd, "prompt": prompt, "options": options}
     ledger = Ledger(args.home, integrity=True)
+    existing = None
     try:
-        ledger.find_task(scope, key)
+        existing = ledger.find_task(scope, key)
     except NotFound:
         # Preconditions for new work only: a caller re-sending a known key (e.g. after a lost
         # reply) must get its task back even if the directory is gone or the disk is nearly full.
         if not os.path.isdir(cwd):
             raise UsageError("--cwd must be an existing directory")
         ledger.check_disk()
-    route = None
-    if args.notify_route is not None:
-        route = _check_route(args.home, args.notify_route)
+    route = consumer = chat = None
+    bound = False
+    if existing is None:
+        # A retry recovers its first receipt, even if the route was removed or the
+        # notifier configuration changed after the original transaction committed.
+        cfg = notify.load_config(args.home) if notify.configured(args.home) else None
+        if args.notify_route is not None:
+            route = _check_route(args.notify_route, cfg)
+        if cfg is not None:
+            route = route if route is not None else cfg["default_route"]
+            if route is not None:
+                owner = cfg["routes"][route]
+                consumer, chat = owner["consumer"], owner["chat"]
+            bound = True
     native_sid = str(uuid.uuid4()) if engine in ("claude", "fixture") else None
     status, task, sha = ledger.submit(scope=scope, key=key, payload=payload, prompt=prompt,
-                                      native_session_id=native_sid, notify_route=route)
+                                      native_session_id=native_sid, notify_route=route,
+                                      notify_consumer=consumer, notify_chat=chat, notify_bound=bound)
     _hook("submit_after_commit")  # fault injection: committed, keeper not yet started, no response sent
     keeper = "already_started"
     att = ledger.current_attempt(task["task_id"])
@@ -187,15 +200,18 @@ def cmd_submit(args: argparse.Namespace) -> int:
     emit({"ok": True, "accepted": True, "status": status, "task_id": task["task_id"], "state": task["state"],
           "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
           "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper,
-          "notify_route": task.get("notify_route"), "ledger_id": ledger.ledger_id})
+          "notify_route": task.get("notify_route"), "notify_consumer": task.get("notify_consumer"),
+          "notify_chat": task.get("notify_chat"), "notify_bound": task.get("notify_bound") == 1,
+          "notify_owner_state": "manual_restore" if task.get("notify_bound") == -1 else
+          ("bound" if task.get("notify_bound") == 1 else "unbound"),
+          "ledger_id": ledger.ledger_id})
     return 0
 
 
-def _check_route(home: Path, route: str) -> str:
+def _check_route(route: str, cfg: Optional[Dict[str, Any]] = None) -> str:
     if not notify.ROUTE_RE.match(route or ""):
         raise UsageError("invalid --notify-route: use 1-32 chars of [A-Za-z0-9._-]")
-    if notify.configured(home):
-        cfg = notify.load_config(home)
+    if cfg is not None:
         if route not in cfg["routes"]:
             raise UsageError("--notify-route is not one of the routes in notifier.json", allowed=sorted(cfg["routes"]))
     return route
@@ -247,6 +263,13 @@ def cmd_wait(args: argparse.Namespace) -> int:
 def cmd_events(args: argparse.Namespace) -> int:
     consumer = _check_name("consumer", args.consumer)
     ledger = Ledger(args.home)
+    if ledger.has_notifier() and notify.configured(args.home):
+        try:
+            cfg = notify.load_config(args.home)
+        except RelayError:
+            pass  # Stored results and ownership remain readable with an invalid notifier config.
+        else:
+            ledger.bind_notification_owners(cfg)
     if not args.no_reconcile:
         # Polling is the recovery path too: an attempt that provably never started is kicked here.
         if args.task:
@@ -260,13 +283,18 @@ def cmd_events(args: argparse.Namespace) -> int:
     except RelayError as exc:  # delivery bookkeeping is best effort; never hide events because of it
         counts, warning = {}, exc.code
     source = _source(args.home, ledger)
-    routes = ledger.task_routes([r["task_id"] for r in rows])
-    default_route = source.pop("default_route")
+    owners = ledger.task_notification_owners([r["task_id"] for r in rows])
+    source.pop("default_route")
     # Every event names its machine, its ledger and its route, so two hosts are never mixed up.
     events = [{"event_id": r["event_id"], "task_id": r["task_id"], "attempt_no": r["attempt_no"], "kind": r["kind"],
                "created_at": r["created_at"], "acked_at": r["acked_at"],
                "superseded": r["attempt_no"] < r["current_attempt"], "delivery_count": counts.get(r["event_id"]),
-               **source, "route": routes.get(r["task_id"]) or default_route, "body": _loads(r["body_json"])} for r in rows]
+               **source, "route": owners.get(r["task_id"], {}).get("route"),
+               "owner_consumer": owners.get(r["task_id"], {}).get("consumer"),
+               "owner_chat": owners.get(r["task_id"], {}).get("chat"),
+               "route_bound": owners.get(r["task_id"], {}).get("bound", False),
+               "owner_state": owners.get(r["task_id"], {}).get("binding_state", "manual_restore"),
+               "body": _loads(r["body_json"])} for r in rows]
     out: Dict[str, Any] = {"ok": True, "consumer": consumer, **source, "events": events}
     if warning:
         out["warning"] = warning
@@ -458,6 +486,20 @@ def cmd_notify_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_notify_bind_owner(args: argparse.Namespace) -> int:
+    route = _check_route(args.route)
+    consumer = _check_name("consumer", args.consumer)
+    if len(args.chat) > 80:
+        raise UsageError("--chat must be a label of at most 80 characters")
+    ledger = Ledger(args.home)
+    try:
+        result = ledger.restore_notification_owner(args.task, route=route, consumer=consumer, chat=args.chat)
+    finally:
+        ledger.close()
+    emit({"ok": True, **result})
+    return 0
+
+
 # ------------------------------------------------------------------------------- parser
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # type: ignore[override]
@@ -555,6 +597,12 @@ def build_parser() -> argparse.ArgumentParser:
     nt = nsub.add_parser("retry", help="give a failed or unacknowledged notification a new budget")
     nt.add_argument("--event", required=True)
     nt.set_defaults(func=cmd_notify_retry)
+    nb = nsub.add_parser("bind-owner", help="explicitly restore the original owner of a migrated task")
+    nb.add_argument("--task", required=True)
+    nb.add_argument("--route", required=True)
+    nb.add_argument("--consumer", required=True)
+    nb.add_argument("--chat", required=True)
+    nb.set_defaults(func=cmd_notify_bind_owner)
 
     k = sub.add_parser("_keeper", help="(internal) supervise one attempt")
     k.add_argument("task_id")

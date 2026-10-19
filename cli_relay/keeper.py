@@ -131,8 +131,16 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         log(f"preflight blocked: {pf.reason}")
         close("blocked", {"preflight": {"reason": pf.reason, **pf.detail}})
         return 0
+    permission_checkpoint = None
     if engine == "codex":  # reconciliation must look for the thread record where this run writes it
         ledger.add_evidence(attempt_id, {"codex_home": str(engines.codex_home(env))})
+        if att["resume_session_id"]:
+            permission_checkpoint = engines.codex_permission_checkpoint(env, att["resume_session_id"])
+            ledger.add_evidence(attempt_id, {"codex_permission_checkpoint": permission_checkpoint})
+            if "offset" not in permission_checkpoint:
+                close("blocked", {"permission_check": {"reason": "permissions_unverified",
+                                                        "missing": "permission_checkpoint"}})
+                return 0
     try:
         spec = engines.build(engine, payload=payload, attempt=att, run_dir=run_dir,
                              fixture_state_dir=str(Path(home) / "fixture-sessions"), env=env)
@@ -197,28 +205,27 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         else:  # every process of the attempt, not just the direct child
             cleanup["killed"] += _signal_all(others, signal.SIGKILL)
 
-    def stop_group() -> None:
-        """After a cancel or a guard stop nothing of the attempt may keep running: the other members
-        of the group get SIGTERM, then SIGKILL after the grace. The terminal state is committed
-        only after this, and records what was left."""
+    def stop_group() -> bool:
+        """Return proof that the keeper's group is empty after a cancel or guard stop."""
         others = others_in_group()
         if others is None:
             cleanup["enumeration"] = "unavailable"
-            return
+            return False
         if others:
             cleanup["terminated"] += _signal_all(others, signal.SIGTERM)
             deadline = time.monotonic() + grace
             while others and time.monotonic() < deadline:
                 time.sleep(0.1)
-                others = others_in_group() or []
+                others = others_in_group()
             if others:
                 log(f"grace expired: SIGKILL to {len(others)} remaining process(es) of the group")
                 cleanup["killed"] += _signal_all(others, signal.SIGKILL)
                 deadline = time.monotonic() + 5.0
-                while (others_in_group() or []) and time.monotonic() < deadline:
+                while others_in_group() and time.monotonic() < deadline:
                     time.sleep(0.05)
         remaining = others_in_group()
         cleanup["remaining"] = None if remaining is None else len(remaining)
+        return remaining == []
 
     watcher = engines.StreamWatcher(stdout_path)
     recorded_sid: Optional[str] = att["native_session_id"]
@@ -264,20 +271,10 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
             kill_cli()
             killed = True
     inspect(watcher.poll())
-    if signalled_at is not None:
-        stop_group()
-    else:
-        lingering = others_in_group()
-        if lingering:  # a normal exit leaves them alone, but the record says they exist
-            cleanup["remaining_after_normal_exit"] = len(lingering)
-
     exit_info: Dict[str, Any] = {"exit_code": rc if rc >= 0 else None, "signal": -rc if rc < 0 else None,
                                  "ended_at": now_iso(), "cli_pid": child.pid}
     if violation is not None:
         exit_info["billing_guard"] = violation  # survives a keeper that dies before the commit below
-    atomic_write_text(run_dir / "exit.json", canonical_json(exit_info) + "\n")
-    _hook("after_exit_before_commit")
-
     last_message = Path(spec.last_message_path) if spec.last_message_path else None
     parsed = engines.parse_output(engine, stdout_path, last_message)
     if parsed["session_id"] and parsed["session_id"] != recorded_sid:
@@ -286,10 +283,25 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     outcome, decided = engines.decide(engine, parsed, env=env, session_id=parsed["session_id"] or recorded_sid,
                                       exit_code=exit_info["exit_code"], exit_signal=exit_info["signal"],
                                       exit_known=True, cancel_requested=cancel_requested, guard=violation,
-                                      sandbox=engines.requested_sandbox(engine, payload))
+                                      sandbox=engines.requested_sandbox(engine, payload),
+                                      permission_checkpoint=permission_checkpoint,
+                                      resume_session_id=att["resume_session_id"])
+    cleanup_stopped = True
+    if signalled_at is not None or outcome in ("cancelled", "blocked"):
+        cleanup_stopped = stop_group()
+        exit_info["process_group_cleanup"] = cleanup
+    else:
+        lingering = others_in_group()
+        if lingering:  # a normal exit leaves them alone, but the record says they exist
+            cleanup["remaining_after_normal_exit"] = len(lingering)
+    atomic_write_text(run_dir / "exit.json", canonical_json(exit_info) + "\n")
+    _hook("after_exit_before_commit")
+
     evidence: Dict[str, Any] = {"exit_source": "keeper_waitpid", **decided}
-    if signalled_at is not None or "remaining_after_normal_exit" in cleanup:
+    if "process_group_cleanup" in exit_info or "remaining_after_normal_exit" in cleanup:
         evidence["process_group_cleanup"] = cleanup
+    if "process_group_cleanup" in exit_info:
+        evidence["processes_stopped"] = cleanup_stopped
     if violation is not None:
         evidence["terminated"] = violation
     elif cancel_requested and outcome != "cancelled":
@@ -297,10 +309,15 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     if parsed["init"]:
         evidence["init"] = parsed["init"]
     _hook("before_finish_commit")
-    ledger.finish(attempt_id, from_states=("running", "claimed", "unknown"), outcome=outcome,
-                  exit_code=exit_info["exit_code"], exit_signal=exit_info["signal"], exit_known=True,
-                  native=parsed["native"], evidence=evidence, source="keeper")
-    log(f"finished outcome={outcome} exit={exit_info}")
+    if cleanup_stopped:
+        ledger.finish(attempt_id, from_states=("running", "claimed", "unknown"), outcome=outcome,
+                      exit_code=exit_info["exit_code"], exit_signal=exit_info["signal"], exit_known=True,
+                      native=parsed["native"], evidence=evidence, source="keeper")
+        log(f"finished outcome={outcome} exit={exit_info}")
+    else:
+        ledger.mark_unknown(attempt_id, from_states=("running", "claimed"), processes_stopped=False,
+                            evidence={**evidence, "unknown_reason": "process_group_not_stopped"})
+        log(f"process group stop unverified: {cleanup}")
     _hook("after_commit")
     notify_pass()
     return 0
