@@ -1,8 +1,8 @@
 """Engine adapters for the official CLIs (and a deterministic fixture).
 
 Each adapter: validates options, builds argv (never via a shell), checks the auth path
-before spawning, and parses the CLI's own machine-readable output. No adapter adds a
-permission-relaxing flag; ``assert_safe`` re-checks every argv before it is used.
+before spawning, and parses the CLI's own machine-readable output. Codex full access
+requires an explicit task opt-in; ``assert_safe`` re-checks every argv before it is used.
 """
 
 from __future__ import annotations
@@ -46,13 +46,15 @@ _FORBIDDEN = {
 
 _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
     "claude": {"model": (str,), "effort": (str,)},
-    "codex": {"model": (str,), "effort": (str,), "sandbox": (str,), "skip_git_repo_check": (bool,)},
+    "codex": {"model": (str,), "effort": (str,), "sandbox": (str,), "allow_full_access": (bool,),
+              "skip_git_repo_check": (bool,)},
     "fixture": {"duration_s": (int, float), "exit_code": (int,), "result": (str,), "side_effect_file": (str,),
                 "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,),
                 "descendant_s": (int, float), "descendant_pid_file": (str,)},
 }
 
 CODEX_SANDBOXES = ("read-only", "workspace-write")
+CODEX_FULL_ACCESS = "danger-full-access"
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 # One adapter contract: preflight, argv and runtime verification must agree. This only tightens
 # the session default; existing allow/ask/deny rules and managed settings remain loaded.
@@ -106,9 +108,15 @@ def validate_options(engine: str, options: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(value, types):
             raise UsageError(f"option {key!r} has the wrong type")
         clean[key] = value
-    if engine == "codex" and "sandbox" in clean and clean["sandbox"] not in CODEX_SANDBOXES:
-        raise UsageError("codex sandbox must be read-only or workspace-write (danger-full-access is never used)",
-                         allowed=list(CODEX_SANDBOXES))
+    if engine == "codex":
+        sandboxes = (*CODEX_SANDBOXES, CODEX_FULL_ACCESS)
+        if "sandbox" in clean and clean["sandbox"] not in sandboxes:
+            raise UsageError("codex sandbox must be read-only, workspace-write or danger-full-access "
+                             "(danger-full-access requires --option allow_full_access=true)",
+                             allowed=list(sandboxes))
+        if clean.get("sandbox") == CODEX_FULL_ACCESS and clean.get("allow_full_access") is not True:
+            raise UsageError("codex sandbox danger-full-access requires --option allow_full_access=true; "
+                             "full access disables the Codex sandbox and is off by default")
     if "effort" in clean and clean["effort"] not in EFFORT_LEVELS:
         raise UsageError("effort must be low, medium, high, xhigh or max", allowed=list(EFFORT_LEVELS))
     for key in ("side_effect_file", "descendant_pid_file"):
@@ -396,15 +404,31 @@ def requested_sandbox(engine: str, payload: Dict[str, Any]) -> Optional[str]:
     return (payload.get("options") or {}).get("sandbox") or "read-only"
 
 
+def full_access_enabled(engine: str, payload: Dict[str, Any]) -> bool:
+    """Both task options are required; a truthy string or integer is never an opt-in."""
+    return (engine == "codex" and requested_sandbox(engine, payload) == CODEX_FULL_ACCESS
+            and (payload.get("options") or {}).get("allow_full_access") is True)
+
+
+def sandbox_details(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Requested permissions for receipts and events, not proof that an attempt ran."""
+    if engine != "codex":
+        return {}
+    return {"sandbox": requested_sandbox(engine, payload), "full_access": full_access_enabled(engine, payload)}
+
+
 def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[str],
                          sandbox: Optional[str], *, permission_checkpoint: Optional[Dict[str, Any]] = None,
-                         resume_session_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                         resume_session_id: Optional[str] = None,
+                         allow_full_access: bool = False) -> Optional[Dict[str, Any]]:
     """After a run: Codex records each turn's effective sandbox and any active named permission
     profile in the thread's rollout (``turn_context``). Every turn must have run in the requested
     sandbox or a narrower one, with no named profile; a thread without that record is not shown
     to have kept the requested permissions."""
     if engine != "codex":
         return None
+    if sandbox == CODEX_FULL_ACCESS and allow_full_access is not True:
+        return {"reason": "full_access_not_opted_in", "requested": sandbox}
     if resume_session_id and session_id != resume_session_id:
         return {"reason": "permissions_unverified", "missing": "resumed_session"}
     if not session_id:
@@ -438,6 +462,8 @@ def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[
     if not turns:
         return {"reason": "permissions_unverified", "missing": "turn_context"}
     allowed = {"read-only"} if sandbox in (None, "read-only") else {"read-only", "workspace-write"}
+    if sandbox == CODEX_FULL_ACCESS and allow_full_access is True:
+        allowed.add(CODEX_FULL_ACCESS)
     wider = sorted({str(kind) for kind, _ in turns if kind not in allowed})
     if wider:
         return {"reason": "sandbox_not_as_requested", "requested": sandbox or "read-only", "observed": wider}
@@ -446,25 +472,44 @@ def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[
     return None
 
 
-def assert_safe(engine: str, argv: Iterable[str]) -> None:
+def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str, Any]] = None) -> None:
     args = list(argv)
     bad = sorted(set(args) & _FORBIDDEN[engine])
+    if engine == "codex":
+        bad = sorted({arg for arg in args if arg.partition("=")[0] in _FORBIDDEN[engine]})
     if bad:
         raise RuntimeError(f"refusing to run {engine} with forbidden flags {bad}")
+    sandboxes = set(CODEX_SANDBOXES)
+    if full_access_enabled(engine, {"options": options}):
+        sandboxes.add(CODEX_FULL_ACCESS)
     if engine == "claude":
         modes = [args[i + 1] if i + 1 < len(args) else None for i, arg in enumerate(args)
                  if arg == "--permission-mode"]
         if modes != [CLAUDE_PERMISSION_MODE] or any(arg.startswith("--permission-mode=") for arg in args):
             raise RuntimeError("refusing to run claude without the explicit dontAsk permission mode")
     for i, arg in enumerate(args):
-        if arg in ("--sandbox", "-s") and i + 1 < len(args) and args[i + 1] not in CODEX_SANDBOXES:
-            raise RuntimeError("refusing to run codex with a sandbox other than read-only/workspace-write")
-        if engine == "codex" and arg in ("-c", "--config") and i + 1 < len(args):
-            override = args[i + 1].replace(" ", "")
-            allowed = {f'sandbox_mode="{s}"' for s in CODEX_SANDBOXES}
+        sandbox = override = None
+        if arg in ("--sandbox", "-s") and (i + 1 < len(args) or engine == "codex"):
+            sandbox = args[i + 1] if i + 1 < len(args) else ""
+        elif engine == "codex" and arg.startswith("--sandbox="):
+            sandbox = arg.partition("=")[2]
+        elif engine == "codex" and arg.startswith("-s") and not arg.startswith("--"):
+            sandbox = arg[2:]
+        if sandbox is not None and sandbox not in sandboxes:
+            raise RuntimeError("refusing an unapproved codex sandbox; danger-full-access requires "
+                               "sandbox=danger-full-access and allow_full_access=true on the task")
+        if engine == "codex":
+            if arg in ("-c", "--config"):
+                override = args[i + 1] if i + 1 < len(args) else ""
+            elif arg.startswith("--config="):
+                override = arg.partition("=")[2]
+            elif arg.startswith("-c") and not arg.startswith("--"):
+                override = arg[2:]
+        if override is not None:
+            allowed = {f'sandbox_mode="{s}"' for s in sandboxes}
             allowed.update(f'model_reasoning_effort="{e}"' for e in EFFORT_LEVELS)
-            if override not in allowed:
-                raise RuntimeError("refusing a codex config override other than a safe sandbox or validated effort")
+            if override.replace(" ", "") not in allowed:
+                raise RuntimeError("refusing a codex config override other than an approved sandbox or validated effort")
         if engine == "claude" and arg == "--settings":
             try:
                 setting = json.loads(args[i + 1])
@@ -539,7 +584,7 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
         cenv["CLI_RELAY_ATTEMPT_ID"] = attempt["attempt_id"]
     if not argv[0]:
         raise RuntimeError(f"{engine} CLI not found")
-    assert_safe(engine, argv)
+    assert_safe(engine, argv, options=opts)
     return Spec(argv=argv, env=cenv, cwd=cwd, last_message_path=last_message)
 
 
@@ -709,7 +754,8 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
            exit_code: Optional[int], exit_signal: Optional[int], exit_known: bool, cancel_requested: bool,
            guard: Optional[Dict[str, Any]] = None, sandbox: Optional[str] = None,
            permission_checkpoint: Optional[Dict[str, Any]] = None,
-           resume_session_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+           resume_session_id: Optional[str] = None,
+           allow_full_access: bool = False) -> Tuple[str, Dict[str, Any]]:
     """Name an attempt's outcome from what the run left behind; returns (outcome, evidence).
 
     The keeper and reconciliation both call this, so the outcome does not depend on which of
@@ -728,7 +774,8 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
     if provider is not None:
         return "blocked", {"provider_check": provider}
     permissions = permission_violation(engine, env, session_id, sandbox,
-                                       permission_checkpoint=permission_checkpoint, resume_session_id=resume_session_id)
+                                       permission_checkpoint=permission_checkpoint, resume_session_id=resume_session_id,
+                                       allow_full_access=allow_full_access)
     if permissions is not None:
         return "blocked", {"permission_check": permissions}
     return classify(parsed.get("native"), exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,

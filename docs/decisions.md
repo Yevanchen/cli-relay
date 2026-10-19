@@ -131,7 +131,7 @@ Constraints we accept:
   - *Not* `--bg`: background sessions do not hand back the CLI exit code or the final `result` event to the caller.
   - The native supervisor may restart sessions on its own, so relay-level submit counts would not bound native executions.
   - `claude agents --help` needed interactive approval on the target machine, so that interface could not be verified there.
-- **Codex:** `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, with the prompt on stdin. `<s>` is `read-only` unless the task asks for `workspace-write`.
+- **Codex:** `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, with the prompt on stdin. `<s>` defaults to `read-only`; `workspace-write` or explicitly opted-in `danger-full-access` may be requested (D8).
   - Resume uses `codex exec --sandbox <s> resume -c sandbox_mode="<s>" --json -o <file> <exact uuid> -`; never `--last`.
   - `codex exec resume` has no sandbox option of its own. Without the pin it takes the sandbox from the configuration of the moment (Codex 0.163.0; audit #2). The exec-level `--sandbox` before `resume` is accepted by the installed CLI.
   - *Not* the app-server: it would need a resident server, which is the Agenvo route.
@@ -159,11 +159,32 @@ provably never started, once that attempt has been pending for 5 s.
 
 ## D8. Permissions and billing
 
-cli-relay never adds a permission-relaxing flag:
+cli-relay keeps permission bypass flags forbidden:
 - no `--dangerously-*`;
 - no `bypassPermissions`;
 - no `--approve-for-me`;
-- `--sandbox danger-full-access` is rejected.
+- no `--yolo` or `--full-auto`.
+
+Codex full access is off by default. `sandbox="danger-full-access"` is rejected with a usage
+error unless the same task also supplies the typed boolean `allow_full_access=true`:
+`--option 'sandbox="danger-full-access"' --option allow_full_access=true`. Strings such as
+`"true"` and numbers such as `1` are not accepted as booleans. The boolean alone is harmless:
+it neither selects a sandbox nor changes the `read-only` default.
+
+This is an explicit acceptance of risk: `danger-full-access` disables the Codex sandbox, so
+commands can access files outside the task directory and use the network, subject to host
+permissions. The adapter passes the real `--sandbox danger-full-access`, including on exact
+resume, whose `sandbox_mode` override is pinned too. Argv checks require the stored pair of
+options; keeper and crash recovery accept full-access runtime evidence only for opted-in
+tasks. Runtime checks still require permission evidence and reject named permission profiles.
+Codex config-layer permission checks and all subscription/billing checks stay in force.
+
+Both options remain in the original task payload, including its hash, so duplicate submits
+recover the same choice and changed options conflict under the same key. Exact resumes and
+fresh reruns reuse that payload. Receipts, `status`/`wait`, terminal/unknown events and
+notifications expose `sandbox` and `full_access` as requested permissions, including for
+attempts blocked before spawn. `doctor` explains the opt-in, default, and risk. No schema
+migration, dedupe, ACK, or notifier transport change is needed.
 
 Permission prompts that no host can answer are denied (`--permission-prompts none`).
 A Claude run with structured denials ends as `needs_input`, even if it also reports an

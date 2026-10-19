@@ -105,11 +105,11 @@ plain text. Exit codes:
 | Engine | Runs | Resume |
 |---|---|---|
 | `claude` | `claude -p --output-format stream-json --verbose --session-id <uuid> --permission-mode dontAsk --permission-prompts none` (prompt on stdin) | `--resume <exact uuid>` (same permission mode) |
-| `codex` | `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, where `<s>` is `read-only` unless the task asks for `workspace-write` | `codex exec --sandbox <s> resume -c sandbox_mode="<s>" --json -o <file> <exact id> -` (same `<s>`) |
+| `codex` | `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, where `<s>` defaults to `read-only`; `workspace-write` or explicitly opted-in `danger-full-access` may be requested | `codex exec --sandbox <s> resume -c sandbox_mode="<s>" --json -o <file> <exact id> -` (same `<s>`) |
 | `fixture` | a deterministic local stand-in used by tests and the soak run | same, against its own state |
 
-Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--sandbox
-danger-full-access`, `--continue`, `--last`, `--bare`.
+Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--yolo`, `--full-auto`,
+`--continue`, `--last`, `--bare`.
 - The Codex sandbox is always passed explicitly, so neither the first run nor a resume takes it
   from the configuration of the moment.
 - Claude always pins `dontAsk` for the task, including resume. This overrides a user/project
@@ -131,11 +131,33 @@ danger-full-access`, `--continue`, `--last`, `--bare`.
   - a login that is not a subscription.
 - It also stops the run if the CLI itself reports an API-key source.
 - After a Codex run, the thread's own record must name the built-in `openai` provider, and
-  every turn must have run in the requested sandbox with no named permission profile. An exact
-  resume also needs a new turn record after its saved pre-run file boundary; old history alone
+  every turn must have run in the requested sandbox (or a narrower one) with no named permission
+  profile. An exact resume also needs a new turn record after its saved pre-run file boundary; old history alone
   cannot verify that attempt. Before the run, a Codex permission setting, requirements layer, or an unsafe or unreadable selected profile blocks it.
 - These outcomes do not depend on whether the keeper survived: reconciliation applies the same
   checks. See [`docs/reliability.md`](docs/reliability.md) for the exact layers and limits.
+
+Codex **full access is off by default**. Requesting `sandbox="danger-full-access"` alone is a
+usage error. To opt in for one task, supply both options:
+
+```sh
+cli-relay submit --key full-access-1 --engine codex --cwd ~/code/app --prompt "Run the maintenance task" \
+  --option 'sandbox="danger-full-access"' --option allow_full_access=true
+```
+
+`allow_full_access` is a typed boolean: use `true`, not the JSON string `"true"` or the number
+`1`. It is harmless without `sandbox="danger-full-access"`: the requested sandbox stays in
+effect, or defaults to `read-only`. Full access disables the Codex sandbox, allowing commands
+to access files outside the task directory and use the network, subject to host permissions.
+Only opt in when you accept that risk. Config-layer permission checks, subscription/billing
+checks, and the forbidden flags above still apply. `doctor` reports this policy and risk.
+
+The options are stored in the task payload and included in `payload_sha256`; changing the
+opt-in under the same key is a payload conflict. Exact resume and fresh reruns reuse the stored
+choice. Submit/resume receipts, `status`/`wait` task records, and new terminal/unknown event
+bodies report `sandbox` and `full_access`; `status` also exposes the stored `options`.
+These fields describe the requested permissions even if the attempt is blocked before spawn.
+Notifications carry the choice too; see [`docs/notifier.md`](docs/notifier.md).
 
 Model and effort can be pinned per task, without changing either CLI's global configuration:
 

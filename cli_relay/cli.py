@@ -115,9 +115,12 @@ def attempt_view(a: Dict[str, Any], probe: bool = True) -> Dict[str, Any]:
 
 def task_view(ledger: Ledger, task_id: str, probe: bool = True) -> Dict[str, Any]:
     t = ledger.get_task(task_id)
+    payload = json.loads(t["payload_json"])
     return {
         "task": {k: t[k] for k in ("task_id", "scope", "engine", "cwd", "state", "current_attempt", "submit_count",
-                                   "payload_sha256", "created_at", "updated_at")} | {"key": t["request_key"]},
+                                   "payload_sha256", "created_at", "updated_at")} | {
+                                       "key": t["request_key"], "options": payload.get("options", {}),
+                                       **engines.sandbox_details(t["engine"], payload)},
         "attempts": [attempt_view(a, probe) for a in ledger.attempts(task_id)],
         "events": [{"event_id": e["event_id"], "attempt_no": e["attempt_no"], "kind": e["kind"],
                     "created_at": e["created_at"], "acked_by": e["acked_by"], "body": _loads(e["body_json"])}
@@ -200,6 +203,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     emit({"ok": True, "accepted": True, "status": status, "task_id": task["task_id"], "state": task["state"],
           "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
           "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper,
+          **engines.sandbox_details(task["engine"], json.loads(task["payload_json"])),
           "notify_route": task.get("notify_route"), "notify_consumer": task.get("notify_consumer"),
           "notify_chat": task.get("notify_chat"), "notify_bound": task.get("notify_bound") == 1,
           "notify_owner_state": "manual_restore" if task.get("notify_bound") == -1 else
@@ -409,7 +413,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
     except SpawnFailed:
         keeper = "spawn_failed_run_reconcile"
     emit({"ok": True, "task_id": task_id, "attempt_no": new["attempt_no"], "attempt_id": new["attempt_id"],
-          "reason": reason, "resume_session_id": resume_sid, "previous_attempt_stopped": proof, "keeper": keeper})
+          "reason": reason, "resume_session_id": resume_sid, "previous_attempt_stopped": proof, "keeper": keeper,
+          **engines.sandbox_details(task["engine"], json.loads(task["payload_json"]))})
     return 0
 
 
@@ -428,6 +433,14 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 def cmd_doctor(args: argparse.Namespace) -> int:
     out: Dict[str, Any] = {"ok": True, "version": __version__, "python": platform.python_version(),
                            "platform": platform.system()}
+    out["codex_sandbox_policy"] = {
+        "default_sandbox": "read-only", "full_access_default": False,
+        "full_access_opt_in": '--option sandbox="danger-full-access" --option allow_full_access=true',
+        "allow_full_access_without_sandbox": "harmless; keeps the requested sandbox or the read-only default",
+        "risk": "danger-full-access disables the Codex sandbox: commands can access files outside the task "
+                "directory and use the network, subject to host permissions",
+        "checks": "config-layer permission checks, forbidden flags and subscription/billing checks still apply",
+    }
     try:
         ledger = Ledger(args.home, integrity=True)
         out["ledger"] = {"home": str(args.home), "integrity": "ok"}
