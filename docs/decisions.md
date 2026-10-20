@@ -127,7 +127,7 @@ Constraints we accept:
 
 ## D6. One execution backend per engine
 
-- **Claude Code:** `claude -p --output-format stream-json --verbose --session-id <uuid> --permission-prompts none`, with the prompt on stdin. Resume uses `--resume <exact uuid>`; never `--continue`.
+- **Claude Code:** `claude -p --output-format stream-json --verbose --session-id <uuid> --permission-prompts none`, with the prompt on stdin, plus `--allowedTools` only for the tools a task explicitly opts in to (D8). Resume uses `--resume <exact uuid>`; never `--continue`.
   - *Not* `--bg`: background sessions do not hand back the CLI exit code or the final `result` event to the caller.
   - The native supervisor may restart sessions on its own, so relay-level submit counts would not bound native executions.
   - `claude agents --help` needed interactive approval on the target machine, so that interface could not be verified there.
@@ -185,6 +185,32 @@ fresh reruns reuse that payload. Receipts, `status`/`wait`, terminal/unknown eve
 notifications expose `sandbox` and `full_access` as requested permissions, including for
 attempts blocked before spawn. `doctor` explains the opt-in, default, and risk. No schema
 migration, dedupe, ACK, or notifier transport change is needed.
+
+Claude adds no tool by default. `WebSearch` and `WebFetch` need permission, so under `dontAsk`
+a research task without an allow rule for them ends `needs_input` with a structured denial
+(issue #6). A task may opt in with the typed list `allowed_tools`, for example
+`--option 'allowed_tools=["WebSearch","WebFetch"]'`. Only exact names from a fixed allowlist,
+`WebSearch` and `WebFetch`, are accepted. A string, another tool, a rule pattern such as
+`WebFetch(domain:…)` or `Bash(…)`, a wildcard or a repeated name is a usage error. Widening the
+allowlist is a code change, not an option. The list is stored sorted, so its order is not part
+of the request, and like every option it cannot be changed by a resume.
+
+The adapter passes the tools as one `--allowedTools` value, including on exact resume; argv
+checks accept that flag only with the stored list, and only in that form, since a further value
+of the variadic flag would be one more allow rule. It never passes them through `--settings`,
+never changes the permission mode and never writes a settings file. Claude's own precedence
+therefore still holds: deny and ask rules from every settings layer are evaluated before allow
+rules, a managed deny cannot be overridden by `--allowedTools`, and managed
+`allowManagedPermissionRulesOnly` ignores it. A tool that stays denied is still a structured
+denial, so the task ends `needs_input` rather than being retried or widened. The preflight does
+not block on such rules; the CLI enforces them.
+
+The list is part of the payload and its hash, like the Codex options. Receipts, `status`/`wait`,
+terminal/unknown events and notifications expose `allowed_tools` as requested permissions
+(`[]` by default). `doctor` explains the opt-in and its risk: these tools reach the network, so
+fetched pages are untrusted input and a fetched URL can carry data out. With `--engine claude`
+it also reports whether the checked settings layers already allow, ask for or deny each
+allowable tool, by tool name and boolean only.
 
 Permission prompts that no host can answer are denied (`--permission-prompts none`).
 A Claude run with structured denials ends as `needs_input`, even if it also reports an

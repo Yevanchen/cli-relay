@@ -116,7 +116,8 @@ Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--yolo`
   bypass default while retaining their settings, permission rules and subscription login.
   A conflicting managed mode, a stricter `plan` default, malformed checked settings, and a
   missing/mismatched runtime mode still block the run. `dontAsk` permits tools already allowed
-  by the existing rules; it is not a no-tools mode or a filesystem sandbox.
+  by the existing rules, plus the `allowed_tools` a task opts in to (see below); it is not a
+  no-tools mode or a filesystem sandbox.
 - Claude: permission prompts that nobody can answer are denied by the CLI. A result that lists
   permission denials ends as `needs_input`, even if the CLI also reports an error.
 - Codex: the `codex exec --json` events that cli-relay reads carry no structured permission
@@ -158,6 +159,53 @@ choice. Submit/resume receipts, `status`/`wait` task records, and new terminal/u
 bodies report `sandbox` and `full_access`; `status` also exposes the stored `options`.
 These fields describe the requested permissions even if the attempt is blocked before spawn.
 Notifications carry the choice too; see [`docs/notifier.md`](docs/notifier.md).
+
+Claude **adds no tool by default**. Under `dontAsk`, a tool that needs permission and is not
+already allowed by your settings is denied, so a research task that tries `WebSearch` or
+`WebFetch` ends `needs_input` with that permission denial. To allow them for one task, name them:
+
+```sh
+cli-relay submit --key research-1 --engine claude --cwd ~/code/app --prompt "Compare the current options for X" \
+  --option 'allowed_tools=["WebSearch","WebFetch"]'
+```
+
+`allowed_tools` is a JSON list of exact tool names from a fixed allowlist: `WebSearch` and
+`WebFetch` (either one alone is fine). A plain string such as `"WebSearch"`, any other tool, a
+rule pattern such as `WebFetch(domain:example.com)` or `Bash(curl *)`, a wildcard, or a repeated
+name is a usage error, and no task is created. The list is stored sorted, so its order is not
+part of the request.
+
+- The adapter adds `--allowedTools WebFetch,WebSearch` (only the named tools) for that task,
+  including exact resume and fresh reruns. Nothing else changes: the permission mode stays
+  `dontAsk`, no `--settings` layer is added and no settings file is written. Argv checks accept
+  `--allowedTools` only with the task's stored list.
+- Claude's own rules still decide. It evaluates deny, then ask, then allow rules, so a deny or
+  ask rule in any settings layer wins over the option. A managed deny cannot be overridden by
+  `--allowedTools`, and managed `allowManagedPermissionRulesOnly` ignores `--allowedTools`
+  altogether. A tool that is still denied ends the task `needs_input`, as before.
+- These tools reach the network: fetched pages are untrusted input, and a fetched URL can carry
+  data out of the task. Only opt in for tasks that need it.
+- Like every option, `allowed_tools` is part of the payload and `payload_sha256`, so another
+  list under the same key is a payload conflict. `resume` cannot change it either: to rerun a
+  task that ended `needs_input` with the tools, submit it again under a new key with the
+  option. Submit/resume receipts, `status`/`wait` task records, new terminal/unknown event
+  bodies and notifications report `allowed_tools` (`[]` by default). Like `sandbox`, it states
+  the requested permissions, not proof that a tool ran.
+- `doctor` describes this policy in `claude_tool_policy`. `doctor --engine claude --cwd DIR`
+  also reports, in `engine.network_tools`, what this machine's checked settings layers already
+  say about these tools, before any task option. It reports tool names and booleans only, never
+  other settings content:
+
+  ```json
+  {"allowed_by_default": false, "default_allowed": [], "ask": [], "denied": ["WebFetch"],
+   "managed_rules_only": false, "complete": true}
+  ```
+
+  `default_allowed` lists tools that a bare allow rule allows and no ask or deny rule names.
+  `ask` and `denied` list tools that an ask or deny rule names, even if the rule only covers
+  some calls (for example `WebFetch(domain:…)`); the option cannot lift those. If
+  `managed_rules_only` is true, the option has no effect on this machine. If `complete` is
+  false, a checked layer could not be read, so a rule may be missing from the lists.
 
 Model and effort can be pinned per task, without changing either CLI's global configuration:
 

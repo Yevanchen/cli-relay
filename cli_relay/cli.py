@@ -120,7 +120,7 @@ def task_view(ledger: Ledger, task_id: str, probe: bool = True) -> Dict[str, Any
         "task": {k: t[k] for k in ("task_id", "scope", "engine", "cwd", "state", "current_attempt", "submit_count",
                                    "payload_sha256", "created_at", "updated_at")} | {
                                        "key": t["request_key"], "options": payload.get("options", {}),
-                                       **engines.sandbox_details(t["engine"], payload)},
+                                       **engines.permission_details(t["engine"], payload)},
         "attempts": [attempt_view(a, probe) for a in ledger.attempts(task_id)],
         "events": [{"event_id": e["event_id"], "attempt_no": e["attempt_no"], "kind": e["kind"],
                     "created_at": e["created_at"], "acked_by": e["acked_by"], "body": _loads(e["body_json"])}
@@ -203,7 +203,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     emit({"ok": True, "accepted": True, "status": status, "task_id": task["task_id"], "state": task["state"],
           "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
           "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper,
-          **engines.sandbox_details(task["engine"], json.loads(task["payload_json"])),
+          **engines.permission_details(task["engine"], json.loads(task["payload_json"])),
           "notify_route": task.get("notify_route"), "notify_consumer": task.get("notify_consumer"),
           "notify_chat": task.get("notify_chat"), "notify_bound": task.get("notify_bound") == 1,
           "notify_owner_state": "manual_restore" if task.get("notify_bound") == -1 else
@@ -414,7 +414,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         keeper = "spawn_failed_run_reconcile"
     emit({"ok": True, "task_id": task_id, "attempt_no": new["attempt_no"], "attempt_id": new["attempt_id"],
           "reason": reason, "resume_session_id": resume_sid, "previous_attempt_stopped": proof, "keeper": keeper,
-          **engines.sandbox_details(task["engine"], json.loads(task["payload_json"]))})
+          **engines.permission_details(task["engine"], json.loads(task["payload_json"]))})
     return 0
 
 
@@ -441,6 +441,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "directory and use the network, subject to host permissions",
         "checks": "config-layer permission checks, forbidden flags and subscription/billing checks still apply",
     }
+    out["claude_tool_policy"] = {
+        "default_allowed_tools": [], "allowable_tools": list(engines.CLAUDE_ALLOWABLE_TOOLS),
+        "opt_in": "--option 'allowed_tools=[\"WebSearch\",\"WebFetch\"]'",
+        "effect": "adds --allowedTools for that task only; the permission mode stays dontAsk and no "
+                  "--settings layer or settings file is changed",
+        "precedence": "deny and ask rules of every settings layer, managed included, still win, and managed "
+                      "allowManagedPermissionRulesOnly ignores --allowedTools; a tool still denied ends the "
+                      "task needs_input",
+        "risk": "WebSearch and WebFetch reach the network: fetched pages are untrusted input, and a fetched "
+                "URL can carry data out of the task",
+        "machine_defaults": "doctor --engine claude reports engine.network_tools for --cwd: tool names and "
+                            "booleans only",
+    }
     try:
         ledger = Ledger(args.home, integrity=True)
         out["ledger"] = {"home": str(args.home), "integrity": "ok"}
@@ -454,8 +467,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         out["ok"] = False
         out["ledger"] = {"home": str(args.home), "error": exc.code, "message": exc.message}
     if args.engine:
-        pf = engines.preflight(engines.validate_engine(args.engine), dict(os.environ), cwd=args.cwd or os.getcwd())
+        cwd = args.cwd or os.getcwd()
+        pf = engines.preflight(engines.validate_engine(args.engine), dict(os.environ), cwd=cwd)
         out["engine"] = {"name": args.engine, "ok": pf.ok, "reason": pf.reason, **pf.detail}
+        if args.engine == "claude":  # informational: never changes ok
+            out["engine"]["network_tools"] = engines.claude_tool_rules(dict(os.environ), cwd)
         out["ok"] = out["ok"] and pf.ok
     emit(out)
     return 0 if out["ok"] else 6

@@ -149,6 +149,13 @@ event in the batch opted in, so the choice is also visible through the command a
 five fields. For a batch, inspect the individual events or task records to identify those tasks.
 This metadata does not change delivery, retries, routing, or ACK semantics.
 
+New Claude event bodies and each corresponding `cli_relay.events` entry include
+`allowed_tools`: the extra tools the task opted in to with
+`--option 'allowed_tools=["WebSearch","WebFetch"]'`, `[]` by default. Like `full_access`, it
+describes requested permissions, not tool use, and is absent from historical events and other
+engines. A summary contains `allowed_tools=WebFetch,WebSearch` (the tools of the whole batch)
+if any event in the batch opted in.
+
 ### Earlier v0.2 candidate ledgers
 
 Run `migrate` when upgrading an earlier candidate as well as v0.1. The core schema stays 1;

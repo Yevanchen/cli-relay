@@ -1,12 +1,14 @@
 """Engine adapters for the official CLIs (and a deterministic fixture).
 
 Each adapter: validates options, builds argv (never via a shell), checks the auth path
-before spawning, and parses the CLI's own machine-readable output. Codex full access
-requires an explicit task opt-in; ``assert_safe`` re-checks every argv before it is used.
+before spawning, and parses the CLI's own machine-readable output. Codex full access and
+extra Claude tools require an explicit task opt-in; ``assert_safe`` re-checks every argv
+before it is used.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import glob
 import json
 import os
@@ -45,7 +47,7 @@ _FORBIDDEN = {
 }
 
 _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
-    "claude": {"model": (str,), "effort": (str,)},
+    "claude": {"model": (str,), "effort": (str,), "allowed_tools": (list,)},
     "codex": {"model": (str,), "effort": (str,), "sandbox": (str,), "allow_full_access": (bool,),
               "skip_git_repo_check": (bool,)},
     "fixture": {"duration_s": (int, float), "exit_code": (int,), "result": (str,), "side_effect_file": (str,),
@@ -61,6 +63,10 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_PERMISSION_MODE = "dontAsk"
 CLAUDE_PERMISSION_MODES = ("default", "manual", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan")
 CLAUDE_EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
+# Tools a Claude task may add with ``allowed_tools``: exact names only, never a rule pattern, a
+# wildcard or another tool. Both need permission, so dontAsk denies them unless a rule allows them.
+CLAUDE_ALLOWABLE_TOOLS = ("WebFetch", "WebSearch")
+CLAUDE_ALLOWED_TOOLS_FLAGS = ("--allowedTools", "--allowed-tools")
 
 # Configuration layers outside the user's own files that the CLIs also read.
 CODEX_SYSTEM_CONFIG = (Path("/etc/codex/config.toml"),)
@@ -117,6 +123,15 @@ def validate_options(engine: str, options: Dict[str, Any]) -> Dict[str, Any]:
         if clean.get("sandbox") == CODEX_FULL_ACCESS and clean.get("allow_full_access") is not True:
             raise UsageError("codex sandbox danger-full-access requires --option allow_full_access=true; "
                              "full access disables the Codex sandbox and is off by default")
+    if engine == "claude" and "allowed_tools" in clean:
+        tools = clean["allowed_tools"]
+        if not all(isinstance(tool, str) and tool in CLAUDE_ALLOWABLE_TOOLS for tool in tools):
+            raise UsageError("allowed_tools accepts only the exact tool names WebFetch and WebSearch; "
+                             "rule patterns, wildcards and other tools are not accepted",
+                             allowed=list(CLAUDE_ALLOWABLE_TOOLS))
+        if len(set(tools)) != len(tools):
+            raise UsageError("allowed_tools names a tool more than once")
+        clean["allowed_tools"] = sorted(tools)  # a set of tools: the order is not part of the request
     if "effort" in clean and clean["effort"] not in EFFORT_LEVELS:
         raise UsageError("effort must be low, medium, high, xhigh or max", allowed=list(EFFORT_LEVELS))
     for key in ("side_effect_file", "descendant_pid_file"):
@@ -265,19 +280,25 @@ def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tup
     return problems, read
 
 
+def _claude_layers(env: Dict[str, str], cwd: Optional[str]) -> List[Tuple[str, Path]]:
+    """The Claude settings files that exist for ``cwd``: user, the project files of every directory
+    from the filesystem root down to the task directory, and managed."""
+    layers = [("user", claude_config_dir(env) / "settings.json")]
+    for d in _dirs_up(cwd):
+        layers += [("project", d / ".claude" / "settings.json"), ("project", d / ".claude" / "settings.local.json")]
+    layers += [("managed", p) for p in CLAUDE_MANAGED_SETTINGS]
+    return _existing_once(layers)
+
+
 def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None, *,
                              permission_mode: Optional[str] = None,
                              effort: Optional[str] = None) -> Tuple[List[str], List[str]]:
     """Check subscription routing and permission/effort constraints in the Claude settings layers.
     ``permission_mode`` is the adapter's known CLI override, not permission to skip settings.
     Without it a bypass default is unsafe. Only key and variable names are reported."""
-    layers = [("user", claude_config_dir(env) / "settings.json")]
-    for d in _dirs_up(cwd):
-        layers += [("project", d / ".claude" / "settings.json"), ("project", d / ".claude" / "settings.local.json")]
-    layers += [("managed", p) for p in CLAUDE_MANAGED_SETTINGS]
     problems: List[str] = []
     read: List[str] = []
-    for layer, path in _existing_once(layers):
+    for layer, path in _claude_layers(env, cwd):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -318,6 +339,47 @@ def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None, *,
             if cap is not None and (cap not in EFFORT_LEVELS or EFFORT_LEVELS.index(cap) < EFFORT_LEVELS.index(effort)):
                 problems.append(f"{layer}:maxEffortLevel")
     return problems, read
+
+
+def claude_tool_rules(env: Dict[str, str], cwd: Optional[str] = None) -> Dict[str, Any]:
+    """For doctor: what the checked Claude settings layers say about the allowable tools before any
+    task option. Claude evaluates deny, then ask, then allow, and dontAsk denies an ask, so a deny
+    or ask rule naming a tool (with or without a specifier, ``*`` matching in the tool name) still
+    wins over ``allowed_tools``; only a bare allow rule allows a whole tool. Managed
+    ``allowManagedPermissionRulesOnly`` drops every other source of rules, ``--allowedTools``
+    included. Only the allowable tool names and booleans are reported, never settings content."""
+    layers: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+    complete = True
+    for layer, path in _claude_layers(env, cwd):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        permissions = data.get("permissions", {}) if isinstance(data, dict) else None
+        if not isinstance(permissions, dict):
+            complete = False
+            continue
+        layers.append((layer, data, permissions))
+    # Only managed settings can set it; a value that cannot be read as false is the restrictive one.
+    flags = [data.get("allowManagedPermissionRulesOnly") for layer, data, _ in layers if layer == "managed"]
+    managed_only = any(flag is not None and flag is not False for flag in flags)
+    found: Dict[str, set] = {"allow": set(), "ask": set(), "deny": set()}
+    for layer, _, permissions in layers:
+        if managed_only and layer != "managed":
+            continue
+        for kind, names in found.items():
+            rules = permissions.get(kind, [])
+            if not isinstance(rules, list) or not all(isinstance(rule, str) for rule in rules):
+                complete = False
+                rules = [rule for rule in rules if isinstance(rule, str)] if isinstance(rules, list) else []
+            for tool in CLAUDE_ALLOWABLE_TOOLS:
+                if (tool in rules if kind == "allow" else
+                        any(fnmatch.fnmatchcase(tool, rule.split("(", 1)[0].strip()) for rule in rules)):
+                    names.add(tool)
+    allowed = [tool for tool in CLAUDE_ALLOWABLE_TOOLS if tool in found["allow"] - found["ask"] - found["deny"]]
+    return {"allowed_by_default": allowed == list(CLAUDE_ALLOWABLE_TOOLS), "default_allowed": allowed,
+            "ask": sorted(found["ask"]), "denied": sorted(found["deny"]), "managed_rules_only": managed_only,
+            "complete": complete}
 
 
 def preflight(engine: str, env: Dict[str, str], cwd: Optional[str] = None, *,
@@ -410,11 +472,21 @@ def full_access_enabled(engine: str, payload: Dict[str, Any]) -> bool:
             and (payload.get("options") or {}).get("allow_full_access") is True)
 
 
-def sandbox_details(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def requested_tools(engine: str, payload: Dict[str, Any]) -> List[str]:
+    """The extra Claude tools of a task; only allowable names in a list count, never a string."""
+    tools = (payload.get("options") or {}).get("allowed_tools") if engine == "claude" else None
+    if not isinstance(tools, list):
+        return []
+    return sorted({tool for tool in tools if isinstance(tool, str) and tool in CLAUDE_ALLOWABLE_TOOLS})
+
+
+def permission_details(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Requested permissions for receipts and events, not proof that an attempt ran."""
-    if engine != "codex":
-        return {}
-    return {"sandbox": requested_sandbox(engine, payload), "full_access": full_access_enabled(engine, payload)}
+    if engine == "codex":
+        return {"sandbox": requested_sandbox(engine, payload), "full_access": full_access_enabled(engine, payload)}
+    if engine == "claude":
+        return {"allowed_tools": requested_tools(engine, payload)}
+    return {}
 
 
 def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[str],
@@ -482,6 +554,7 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
     sandboxes = set(CODEX_SANDBOXES)
     if full_access_enabled(engine, {"options": options}):
         sandboxes.add(CODEX_FULL_ACCESS)
+    tools = ",".join(requested_tools(engine, {"options": options}))
     if engine == "claude":
         modes = [args[i + 1] if i + 1 < len(args) else None for i, arg in enumerate(args)
                  if arg == "--permission-mode"]
@@ -520,6 +593,12 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
         if engine == "claude" and arg == "--effort":
             if i + 1 == len(args) or args[i + 1] not in EFFORT_LEVELS:
                 raise RuntimeError("refusing an unvalidated claude effort")
+        if engine == "claude" and arg.partition("=")[0] in CLAUDE_ALLOWED_TOOLS_FLAGS:
+            # Only the one value built from the task's validated list. The flag is variadic, so a
+            # further value right after it would be one more allow rule.
+            if (not tools or arg not in CLAUDE_ALLOWED_TOOLS_FLAGS or args[i + 1:i + 2] != [tools]
+                    or any(not a.startswith("--") for a in args[i + 2:i + 3])):
+                raise RuntimeError("refusing claude allowed tools other than the task's validated allowed_tools")
 
 
 def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_dir: Path,
@@ -534,6 +613,10 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
         argv = [binary, "-p", "--output-format", "stream-json", "--verbose"]
         argv += ["--resume", resume] if resume else ["--session-id", attempt["native_session_id"]]
         argv += ["--permission-mode", CLAUDE_PERMISSION_MODE, "--permission-prompts", "none"]
+        if opts.get("allowed_tools"):
+            # Allow rules for this session only: deny and ask rules of every settings layer, managed
+            # included, still win; the mode, the settings files and their sources stay as they are.
+            argv += ["--allowedTools", ",".join(opts["allowed_tools"])]
         if opts.get("model"):
             argv += ["--model", opts["model"]]
         if opts.get("effort"):

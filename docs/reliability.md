@@ -173,7 +173,13 @@ Permission posture does not depend on the CLIs' configuration of the moment:
   skip setting sources, or bypass approvals. Existing allowed tools can still run.
   Every Claude run must report `permissionMode: dontAsk` in its init event; a mismatch or missing
   init blocks, including when reconciliation closes the attempt after a keeper crash.
-- Argv checks reject `danger-full-access` unless both task options opt in. Every permission-bypass
+- A Claude task adds no tool unless it opts in with `allowed_tools`, a list of exact names from a
+  fixed allowlist (`WebSearch`, `WebFetch`). That adds one `--allowedTools` value for the task,
+  on every attempt, and changes neither the mode nor any settings layer. Deny and ask rules of
+  every layer, and managed `allowManagedPermissionRulesOnly`, still win; a tool that stays denied
+  ends the task `needs_input`.
+- Argv checks reject `danger-full-access` unless both task options opt in, and Claude
+  `--allowedTools` unless it carries exactly the task's stored list. Every permission-bypass
   flag, including `--dangerously-bypass-approvals-and-sandbox`, `--yolo` and `--full-auto`, stays forbidden.
 - `--sandbox` is not the only thing that decides a Codex run's permissions: named permission
   profiles and requirements can take precedence. Codex runs, including opted-in full-access runs,
