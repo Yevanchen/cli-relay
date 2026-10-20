@@ -185,17 +185,20 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
     body = json.loads(row["body_json"])
     return {"event_id": row["event_id"], "task_id": row["task_id"], "attempt_no": row["attempt_no"],
             "kind": row["kind"], "outcome": body.get("outcome") or row["kind"], "key": row.get("request_key"),
+            **{key: body[key] for key in ("sandbox", "full_access") if key in body},
             "result_excerpt": _clean(body.get("result_excerpt"), EXCERPT_MAX)}
 
 
 def build_payload(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, refs: List[Dict[str, Any]],
                   reminder: bool) -> Dict[str, Any]:
-    """The five notify.sh fields plus the structured record. Only identifiers and a short
-    excerpt are sent: the consumer reads everything else from the ledger by task id."""
+    """The five notify.sh fields plus the structured record. Identifiers, requested sandbox and
+    a short excerpt are sent: the consumer reads everything else from the ledger by task id."""
     single = refs[0] if len(refs) == 1 else None
     status = single["outcome"] if single else "multiple"
     head = (f"cli-relay {'reminder ' if reminder else ''}source={cfg['source_id']} ledger={ledger_id} "
             f"route={route['name']} events={len(refs)}")
+    if any(r.get("full_access") is True for r in refs):
+        head += " full_access=true"  # also visible through the five-field command adapter
     parts = [f"{r['event_id']} {r['task_id']}#{r['attempt_no']} {r['outcome']}" for r in refs[:3]]
     if len(refs) > 3:
         parts.append(f"+{len(refs) - 3} more")

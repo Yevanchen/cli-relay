@@ -159,8 +159,11 @@ Concurrency rules:
 ## Subscription-only and permission guards
 
 Permission posture does not depend on the CLIs' configuration of the moment:
-- Codex always gets an explicit sandbox: `read-only` unless the task asks for
-  `workspace-write`. The same sandbox is passed on resume, both as the exec-level option and
+- Codex always gets an explicit sandbox: `read-only` by default, `workspace-write` when requested,
+  or `danger-full-access` only with the additional typed boolean `allow_full_access=true`.
+  Full access is off by default and disables the Codex sandbox, allowing access outside the task
+  directory and network use subject to host permissions. The boolean alone is harmless.
+  The same sandbox is passed on resume, both as the exec-level option and
   as a `sandbox_mode` override, because `codex exec resume` has no sandbox option of its own.
 - Claude always gets `--permission-mode dontAsk --permission-prompts none`, including resume.
   Preflight only accepts a user/project bypass default because that fixed CLI override replaces
@@ -170,9 +173,11 @@ Permission posture does not depend on the CLIs' configuration of the moment:
   skip setting sources, or bypass approvals. Existing allowed tools can still run.
   Every Claude run must report `permissionMode: dontAsk` in its init event; a mismatch or missing
   init blocks, including when reconciliation closes the attempt after a keeper crash.
-- `danger-full-access` and every permission-bypass flag are rejected in argv.
+- Argv checks reject `danger-full-access` unless both task options opt in. Every permission-bypass
+  flag, including `--dangerously-bypass-approvals-and-sandbox`, `--yolo` and `--full-auto`, stays forbidden.
 - `--sandbox` is not the only thing that decides a Codex run's permissions: named permission
-  profiles and requirements can take precedence. Codex runs are checked on both sides:
+  profiles and requirements can take precedence. Codex runs, including opted-in full-access runs,
+  are checked on both sides:
   - before the run, a permission setting, a requirements or managed-preference layer, or an unsafe or
     unreadable config-profile selected by `profile` blocks the run; benign profiles are parsed;
   - after the run, every `turn_context` in the thread's rollout must show the requested sandbox

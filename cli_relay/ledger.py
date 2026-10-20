@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
+from . import engines
 from .errors import (
     AckMismatch,
     Conflict,
@@ -694,7 +695,8 @@ class Ledger:
              _merge_json(att["evidence_json"], evidence), now, now, att["attempt_id"], att["state"]))
         if cur.rowcount != 1:
             raise LedgerWriteFailed("attempt changed concurrently", attempt_id=att["attempt_id"])
-        task = c.execute("SELECT current_attempt FROM tasks WHERE task_id=?", (att["task_id"],)).fetchone()
+        task = c.execute("SELECT current_attempt, engine, payload_json FROM tasks WHERE task_id=?",
+                         (att["task_id"],)).fetchone()
         if task["current_attempt"] == att["attempt_no"]:
             c.execute("UPDATE tasks SET state=?, updated_at=? WHERE task_id=?",
                       (task_state_for(new_state, outcome), now, att["task_id"]))
@@ -713,6 +715,7 @@ class Ledger:
             "native_ok": None if native is None else native.get("ok"),
             "result_excerpt": excerpt,
             "source": source,
+            **engines.sandbox_details(task["engine"], json.loads(task["payload_json"])),
         }
         event_id = new_id("e")
         c.execute("INSERT INTO events (event_id, task_id, attempt_no, kind, body_json, created_at) "

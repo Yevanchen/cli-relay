@@ -69,6 +69,7 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
 
     task = ledger.get_task(att["task_id"])
     engine = task["engine"]
+    payload = json.loads(task["payload_json"])
     run_dir = ledger.run_dir(att["task_id"], att["attempt_no"])
     exit_info = _read_exit(run_dir)
     parsed = engines.parse_output(engine, run_dir / "stdout.jsonl", run_dir / "last_message.txt")
@@ -85,7 +86,8 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
         return engines.decide(engine, parsed, env=env, session_id=parsed["session_id"] or att["native_session_id"],
                               exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,
                               cancel_requested=cancel_requested, guard=(exit_info or {}).get("billing_guard"),
-                              sandbox=engines.requested_sandbox(engine, json.loads(task["payload_json"])),
+                              sandbox=engines.requested_sandbox(engine, payload),
+                              allow_full_access=engines.full_access_enabled(engine, payload),
                               permission_checkpoint=_evidence(att).get("codex_permission_checkpoint"),
                               resume_session_id=att["resume_session_id"])
 

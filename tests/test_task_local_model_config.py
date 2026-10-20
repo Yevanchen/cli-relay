@@ -171,7 +171,10 @@ class TaskLocalOptions(unittest.TestCase):
         project.mkdir(parents=True)
         user.symlink_to(managed)
         (project / "settings.json").symlink_to(managed)
-        with patch.object(engines, "CLAUDE_MANAGED_SETTINGS", (managed,)):
+        # TMPDIR may be inside a checkout with ancestor settings; this test checks only its
+        # three aliases, not the host's project configuration.
+        with patch.object(engines, "CLAUDE_MANAGED_SETTINGS", (managed,)), \
+                patch.object(engines, "_dirs_up", return_value=[project.parent]):
             for data, key in (({"permissions": {"defaultMode": "bypassPermissions"}}, "permissions.defaultMode"),
                               ({"env": {engines.CLAUDE_EFFORT_ENV: "high"}}, "env." + engines.CLAUDE_EFFORT_ENV)):
                 with self.subTest(settings=data):

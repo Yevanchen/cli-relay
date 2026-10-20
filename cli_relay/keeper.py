@@ -284,6 +284,7 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
                                       exit_code=exit_info["exit_code"], exit_signal=exit_info["signal"],
                                       exit_known=True, cancel_requested=cancel_requested, guard=violation,
                                       sandbox=engines.requested_sandbox(engine, payload),
+                                      allow_full_access=engines.full_access_enabled(engine, payload),
                                       permission_checkpoint=permission_checkpoint,
                                       resume_session_id=att["resume_session_id"])
     cleanup_stopped = True

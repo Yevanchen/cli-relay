@@ -130,8 +130,24 @@ The HTTP adapter also sends `cli_relay`, a structured copy:
 {"schema": "cli-relay.notify.v1", "source_id": "host-a", "ledger_id": "l-…", "route": "bot",
  "chat": "Bot chat", "consumer": "bot", "reminder": false, "count": 1,
  "events": [{"event_id": "e-…", "task_id": "t-…", "attempt_no": 1, "kind": "terminal",
-             "outcome": "succeeded", "key": "…", "result_excerpt": "…"}]}
+             "outcome": "succeeded", "key": "…", "result_excerpt": "…",
+             "sandbox": "danger-full-access", "full_access": true}]}
 ```
+
+New Codex event bodies and each corresponding `cli_relay.events` entry include `sandbox` and
+`full_access`. Full access is **off by default** and requires both
+`--option 'sandbox="danger-full-access"' --option allow_full_access=true` at submit time.
+The typed boolean alone is harmless and does not change the sandbox. Full access disables the
+Codex sandbox: commands can access files outside the task directory and use the network,
+subject to host permissions. Config-layer permission and subscription/billing checks still apply.
+
+`full_access` describes the task's requested permissions, including when a run was blocked
+before it started; it does not certify that commands ran. The default is `sandbox: "read-only"`
+and `full_access: false`. Historical events and other engines may omit these fields; use
+`status` to inspect the stored task options. A summary contains `full_access=true` if any
+event in the batch opted in, so the choice is also visible through the command adapter's
+five fields. For a batch, inspect the individual events or task records to identify those tasks.
+This metadata does not change delivery, retries, routing, or ACK semantics.
 
 ### Earlier v0.2 candidate ledgers
 
