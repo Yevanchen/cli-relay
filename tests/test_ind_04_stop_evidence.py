@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import ExitStack
 from itertools import count
@@ -79,6 +80,9 @@ class KeeperStopEvidence(unittest.TestCase):
                 reconcile.reconcile_task(self.ledger, self.task_id, kick=False, spawn=None)
         killpg.assert_not_called()
         self.assertEqual([e["kind"] for e in self.ledger.events_of_task(self.task_id)], ["unknown"])
+        # Events are listed by millisecond timestamp, then by their random id. In-process, both
+        # events can fall into one millisecond, so let the real clock move on before the close.
+        time.sleep(0.002)
         with patch.object(procs, "same_process_alive", return_value=False), \
              patch.object(procs, "group_alive", return_value=False):
             reconcile.reconcile_task(self.ledger, self.task_id, kick=False, spawn=None)
