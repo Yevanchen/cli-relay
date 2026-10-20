@@ -715,7 +715,7 @@ class Ledger:
             "native_ok": None if native is None else native.get("ok"),
             "result_excerpt": excerpt,
             "source": source,
-            **engines.sandbox_details(task["engine"], json.loads(task["payload_json"])),
+            **engines.permission_details(task["engine"], json.loads(task["payload_json"])),
         }
         event_id = new_id("e")
         c.execute("INSERT INTO events (event_id, task_id, attempt_no, kind, body_json, created_at) "
