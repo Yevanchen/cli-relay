@@ -105,13 +105,13 @@ plain text. Exit codes:
 | Engine | Runs | Resume |
 |---|---|---|
 | `claude` | `claude -p --output-format stream-json --verbose --session-id <uuid> --permission-mode dontAsk --permission-prompts none` (prompt on stdin) | `--resume <exact uuid>` (same permission mode) |
-| `codex` | `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, where `<s>` defaults to `read-only`; `workspace-write` or explicitly opted-in `danger-full-access` may be requested | `codex exec --sandbox <s> resume -c sandbox_mode="<s>" --json -o <file> <exact id> -` (same `<s>`) |
+| `codex` | `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, where `<s>` defaults to `read-only`; `workspace-write` or explicitly opted-in `danger-full-access` may be requested. `workspace-write` also gets `-c sandbox_workspace_write.network_access=<n>`: `false` unless the task opts in with `allow_network=true` | `codex exec --sandbox <s> resume -c sandbox_mode="<s>" [-c sandbox_workspace_write.network_access=<n>] --json -o <file> <exact id> -` (same `<s>` and `<n>`) |
 | `fixture` | a deterministic local stand-in used by tests and the soak run | same, against its own state |
 
 Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--yolo`, `--full-auto`,
 `--continue`, `--last`, `--bare`.
 - The Codex sandbox is always passed explicitly, so neither the first run nor a resume takes it
-  from the configuration of the moment.
+  from the configuration of the moment. The same holds for the network access of `workspace-write`.
 - Claude always pins `dontAsk` for the task, including resume. This overrides a user/project
   bypass default while retaining their settings, permission rules and subscription login.
   A conflicting managed mode, a stricter `plan` default, malformed checked settings, and a
@@ -122,8 +122,9 @@ Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--yolo`
   permission denials ends as `needs_input`, even if the CLI also reports an error.
 - Codex: the `codex exec --json` events that cli-relay reads carry no structured permission
   denial. A command refused by the sandbox reaches the model as a failed command, and the
-  outcome follows Codex's own result, so `needs_input` is never reported for Codex. Read the
-  result text.
+  outcome follows Codex's own result: a run whose commands were refused still ends `succeeded`
+  if Codex ended its turn normally. Read the result text, or let the task require the
+  [completion marker](#when-the-cli-finished-is-not-the-task-is-done-the-completion-marker).
 - The keeper refuses a run (`blocked`) before the CLI starts if it finds any of these:
   - API-key or gateway variables (only their names are reported);
   - a configuration layer that applies to the task directory and routes away from the
@@ -132,8 +133,8 @@ Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--yolo`
   - a login that is not a subscription.
 - It also stops the run if the CLI itself reports an API-key source.
 - After a Codex run, the thread's own record must name the built-in `openai` provider, and
-  every turn must have run in the requested sandbox (or a narrower one) with no named permission
-  profile. An exact resume also needs a new turn record after its saved pre-run file boundary; old history alone
+  every turn must have run in the requested sandbox (or a narrower one), without network access
+  unless the task opted in, and with no named permission profile. An exact resume also needs a new turn record after its saved pre-run file boundary; old history alone
   cannot verify that attempt. Before the run, a Codex permission setting, requirements layer, or an unsafe or unreadable selected profile blocks it.
 - These outcomes do not depend on whether the keeper survived: reconciliation applies the same
   checks. See [`docs/reliability.md`](docs/reliability.md) for the exact layers and limits.
@@ -159,6 +160,47 @@ choice. Submit/resume receipts, `status`/`wait` task records, and new terminal/u
 bodies report `sandbox` and `full_access`; `status` also exposes the stored `options`.
 These fields describe the requested permissions even if the attempt is blocked before spawn.
 Notifications carry the choice too; see [`docs/notifier.md`](docs/notifier.md).
+
+Codex **network access in `workspace-write` is off by default, loopback included**. In that sandbox
+commands cannot open any network connection, not even to `127.0.0.1`, so a test suite that starts
+a local server (for example a fake webhook) fails inside it. On Codex 0.163.0 (macOS Seatbelt) a
+bind to `127.0.0.1` fails with `Operation not permitted` in `read-only` and in `workspace-write`, and
+works in `workspace-write` with `sandbox_workspace_write.network_access=true`. To allow it for one
+task, without full access:
+
+```sh
+cli-relay submit --key tests-1 --engine codex --cwd ~/code/app --prompt "Run the full test suite" \
+  --option 'sandbox="workspace-write"' --option allow_network=true
+```
+
+- `allow_network` is a typed boolean (`true`, not `"true"` or `1`) and is accepted only together with
+  `sandbox="workspace-write"`. With `read-only`, the default, which never has network access, it is a
+  usage error. With `danger-full-access` it is a usage error too: full access already runs without
+  the sandbox, network included. No task is created in either case.
+- The adapter adds `-c sandbox_workspace_write.network_access=true` to the first run and to every
+  exact resume; the sandbox stays `workspace-write`. A `workspace-write` task without the opt-in gets
+  `-c sandbox_workspace_write.network_access=false`, so a user, project or profile configuration that
+  enables the network does not reach relay tasks. Argv checks accept only the one value built from
+  the task's options; no other `-c` override is accepted, and no option passes arbitrary config.
+- Codex has no loopback-only setting: the opt-in allows all network access from the sandbox, so
+  commands can also reach other hosts and send data out. File writes stay limited to the workspace.
+  Only opt in for tasks that need it.
+- After the run, every turn in the thread's own record must show no network access unless the task
+  opted in. A turn with network access the task did not ask for makes it `blocked`
+  (`permission_check.reason: network_not_as_requested`).
+- Like every option, it is part of the payload and `payload_sha256` (another value under the same
+  key is a conflict) and cannot be changed by `resume`. Submit/resume receipts, `status`/`wait` task
+  records, new terminal/unknown event bodies and notifications report `network_access`: `true` for
+  `workspace-write` with the opt-in and for opted-in full access, otherwise `false`. It states the
+  requested permission, not that a connection was made.
+- `doctor` describes this in `codex_sandbox_policy`. `doctor --engine codex --cwd DIR` also reports,
+  in `engine.workspace_network`, what the checked configuration layers set for
+  `sandbox_workspace_write.network_access`, which is what a direct `codex` run there would get. It
+  reports the boolean, layer names and whether every layer was readable, nothing else:
+
+  ```json
+  {"config_network_access": true, "set_by_layers": ["user"], "complete": true}
+  ```
 
 Claude **adds no tool by default**. Under `dontAsk`, a tool that needs permission and is not
 already allowed by your settings is denied, so a research task that tries `WebSearch` or
@@ -226,6 +268,38 @@ effort constraints remain in force: a conflicting managed environment value or a
 server-delivered caps and the actual served model still require real-CLI acceptance evidence.
 These options record requested configuration, not proof of the provider's effective effort.
 
+### When "the CLI finished" is not "the task is done": the completion marker
+
+`succeeded` means that the CLI ended its turn without an error (and exited 0). It does not mean
+that the task's goal was reached: a test run whose tests could not start still ends `succeeded` when
+the CLI writes that into its result and finishes normally. A dispatcher that needs more can require
+the CLI's own completion report for a task, on any engine:
+
+```sh
+cli-relay submit --key tests-2 --engine codex --cwd ~/code/app \
+  --option 'sandbox="workspace-write"' --option allow_network=true --option require_completion_marker=true \
+  --prompt "Run the full test suite and fix what fails. End your final message with the line
+CLI-RELAY-STATUS: complete if everything asked is done and verified, otherwise with the line
+CLI-RELAY-STATUS: incomplete."
+```
+
+- With the opt-in, a run that would end `succeeded` does so only if the last non-empty line of the
+  CLI's final message is exactly `CLI-RELAY-STATUS: complete` (surrounding whitespace aside).
+  `CLI-RELAY-STATUS: incomplete`, any other last line (backticks, bold or a trailing period included)
+  and no final message end it `needs_input`. `failed`, `blocked`, `cancelled` and the `needs_input` of
+  a Claude permission denial are never changed: the marker cannot turn a failure into a success.
+- The relay never edits a prompt: ask for the line in the task prompt, and again in resume prompts.
+  Each attempt is judged by its own final message, so a `needs_input` task can be continued with
+  `resume`.
+- The attempt's evidence records the check, for example `"completion_check": {"marker":
+  "incomplete", "downgraded_from": "succeeded"}`. Receipts, task records, event bodies and
+  notifications carry `completion_marker_required`; when it is `true`, event bodies and notifications
+  also carry `completion_marker` (`complete`, `incomplete` or `null`), because the line is usually
+  past the result excerpt. The option is part of the payload and its hash.
+- It is the CLI's self-report, not a verification: the relay runs no command of its own and reads no
+  other text of the result, so a CLI can still claim `complete` wrongly. Without the opt-in nothing
+  changes. `doctor` describes the contract in `completion_marker_policy`.
+
 ## How a consumer (e.g. a chat bot calling over SSH) should use it
 
 1. Submit with a key derived from the request. If the reply is lost or uncertain, submit the
@@ -234,7 +308,9 @@ These options record requested configuration, not proof of the provider's effect
    the recovery path: a task whose keeper never started is started by `status`, `events` or
    `wait` once it has been pending for 5 s.
 3. Read `events --consumer <you>`. After the result has reached its destination, `ack` the event.
-   Until then the event is delivered again on every read, with the same id.
+   Until then the event is delivered again on every read, with the same id. `succeeded` only says
+   that the CLI finished without an error; for tasks such as test runs, require the completion
+   marker (above) so that a run the CLI itself reports unfinished ends `needs_input`.
 4. If a task is `unknown` (the relay could not prove what happened), a human decides:
    - `resume` continues the exact native session;
    - `resume --fresh --confirm-rerun` starts over and may repeat side effects.

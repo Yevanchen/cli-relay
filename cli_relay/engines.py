@@ -1,9 +1,9 @@
 """Engine adapters for the official CLIs (and a deterministic fixture).
 
 Each adapter: validates options, builds argv (never via a shell), checks the auth path
-before spawning, and parses the CLI's own machine-readable output. Codex full access and
-extra Claude tools require an explicit task opt-in; ``assert_safe`` re-checks every argv
-before it is used.
+before spawning, and parses the CLI's own machine-readable output. Codex full access, Codex
+workspace network access and extra Claude tools require an explicit task opt-in;
+``assert_safe`` re-checks every argv before it is used.
 """
 
 from __future__ import annotations
@@ -47,17 +47,27 @@ _FORBIDDEN = {
 }
 
 _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
-    "claude": {"model": (str,), "effort": (str,), "allowed_tools": (list,)},
+    "claude": {"model": (str,), "effort": (str,), "allowed_tools": (list,), "require_completion_marker": (bool,)},
     "codex": {"model": (str,), "effort": (str,), "sandbox": (str,), "allow_full_access": (bool,),
-              "skip_git_repo_check": (bool,)},
+              "allow_network": (bool,), "skip_git_repo_check": (bool,), "require_completion_marker": (bool,)},
     "fixture": {"duration_s": (int, float), "exit_code": (int,), "result": (str,), "side_effect_file": (str,),
                 "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,),
-                "descendant_s": (int, float), "descendant_pid_file": (str,)},
+                "descendant_s": (int, float), "descendant_pid_file": (str,), "require_completion_marker": (bool,)},
 }
 
 CODEX_SANDBOXES = ("read-only", "workspace-write")
 CODEX_FULL_ACCESS = "danger-full-access"
+CODEX_WORKSPACE_WRITE = "workspace-write"
+# Network access inside workspace-write, loopback included: without it Seatbelt refuses even a bind
+# to 127.0.0.1 (Codex 0.163.0, `[sandbox_workspace_write] network_access`). Every workspace-write run
+# gets it explicitly, true only for a task with allow_network=true, so no config layer decides it.
+CODEX_NETWORK_SETTING = "sandbox_workspace_write.network_access"
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# With require_completion_marker=true (any engine) a run only ends succeeded when the last non-empty
+# line of the CLI's final message is exactly COMPLETION_LINE_PREFIX + "complete". The relay reads
+# that one line of the CLI's own result, never any other text of it.
+COMPLETION_LINE_PREFIX = "CLI-RELAY-STATUS: "
+COMPLETION_MARKERS = ("complete", "incomplete")
 # One adapter contract: preflight, argv and runtime verification must agree. This only tightens
 # the session default; existing allow/ask/deny rules and managed settings remain loaded.
 CLAUDE_PERMISSION_MODE = "dontAsk"
@@ -123,6 +133,14 @@ def validate_options(engine: str, options: Dict[str, Any]) -> Dict[str, Any]:
         if clean.get("sandbox") == CODEX_FULL_ACCESS and clean.get("allow_full_access") is not True:
             raise UsageError("codex sandbox danger-full-access requires --option allow_full_access=true; "
                              "full access disables the Codex sandbox and is off by default")
+        if "allow_network" in clean and clean.get("sandbox") != CODEX_WORKSPACE_WRITE:
+            if clean.get("sandbox") == CODEX_FULL_ACCESS:
+                raise UsageError('allow_network is redundant with sandbox danger-full-access: full access already '
+                                 'runs commands without the Codex sandbox, network included; drop allow_network '
+                                 '(or use sandbox="workspace-write")')
+            raise UsageError('allow_network applies only to sandbox="workspace-write" (add --option '
+                             'sandbox="workspace-write"); the read-only sandbox, the default, has no network '
+                             'access and allow_network does not change that', allowed=[CODEX_WORKSPACE_WRITE])
     if engine == "claude" and "allowed_tools" in clean:
         tools = clean["allowed_tools"]
         if not all(isinstance(tool, str) and tool in CLAUDE_ALLOWABLE_TOOLS for tool in tools):
@@ -211,6 +229,43 @@ def _merge(base: Dict[str, Any], top: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _merged(layers: Iterable[Tuple[str, Dict[str, Any]]]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for _, data in layers:
+        merged = _merge(merged, data)
+    return merged
+
+
+def _codex_layers(env: Dict[str, str], cwd: Optional[str]
+                  ) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[str], Optional[Path]]:
+    """The parsed Codex configuration layers for ``cwd``, lowest precedence first (system, user, the
+    config-profile file the configuration selects, every ``.codex/config.toml`` from the filesystem
+    root down to the task directory, managed), the layers that cannot be read, and the profile file."""
+    home = codex_home(env)
+
+    def load(profile_file: Optional[Path]) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[str]]:
+        paths = [("system", p) for p in CODEX_SYSTEM_CONFIG] + [("user", home / "config.toml")]
+        if profile_file is not None:  # Codex 0.163: `profile = X` layers $CODEX_HOME/X.config.toml on the user config
+            paths.append(("profile_file", profile_file))
+        paths += [("project", d / ".codex" / "config.toml") for d in _dirs_up(cwd)]
+        paths += [("managed", p) for p in CODEX_MANAGED_CONFIG]
+        layers: List[Tuple[str, Dict[str, Any]]] = []
+        bad: List[str] = []
+        for layer, path in _existing_once(paths):
+            try:
+                layers.append((layer, tomllib.loads(path.read_text(encoding="utf-8"))))
+            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+                bad.append(f"{layer}:unreadable")
+        return layers, bad
+
+    layers, bad = load(None)
+    profile = _merged(layers).get("profile")
+    if isinstance(profile, str) and (home / f"{profile}.config.toml").is_file():
+        profile_file = home / f"{profile}.config.toml"
+        return (*load(profile_file), profile_file)
+    return layers, bad, None
+
+
 def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tuple[List[str], List[str]]:
     """Merge the Codex configuration layers (system, user, every ``.codex/config.toml`` from the
     filesystem root down to the task directory, managed) and name every setting that could serve the
@@ -221,31 +276,8 @@ def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tup
     problems: List[str] = []
     if any(p.exists() for p in [*codex_system_requirements_paths(env), home / "requirements.toml"]):
         problems.append("requirements")
-
-    def load(profile_file: Optional[Path]) -> Tuple[Dict[str, Any], List[str], List[str]]:
-        layers = [("system", p) for p in CODEX_SYSTEM_CONFIG] + [("user", home / "config.toml")]
-        if profile_file is not None:  # Codex 0.163: `profile = X` layers $CODEX_HOME/X.config.toml on the user config
-            layers.append(("profile_file", profile_file))
-        layers += [("project", d / ".codex" / "config.toml") for d in _dirs_up(cwd)]
-        layers += [("managed", p) for p in CODEX_MANAGED_CONFIG]
-        merged: Dict[str, Any] = {}
-        bad: List[str] = []
-        read: List[str] = []
-        for layer, path in _existing_once(layers):
-            try:
-                data = tomllib.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-                bad.append(f"{layer}:unreadable")
-                continue
-            read.append(layer)
-            merged = _merge(merged, data)
-        return merged, bad, read
-
-    merged, bad, read = load(None)
-    profile_file = None
-    if isinstance(merged.get("profile"), str) and (home / f"{merged['profile']}.config.toml").is_file():
-        profile_file = home / f"{merged['profile']}.config.toml"
-        merged, bad, read = load(profile_file)
+    layers, bad, profile_file = _codex_layers(env, cwd)
+    merged, read = _merged(layers), [layer for layer, _ in layers]
     problems += bad
     # Every value is type-checked: a structure this check does not expect is itself a problem, so
     # an unusual file blocks the run instead of making the check fail (independent audit 6).
@@ -278,6 +310,27 @@ def codex_config_problems(env: Dict[str, str], cwd: Optional[str] = None) -> Tup
     elif "openai" in providers:
         problems.append("model_providers.openai")
     return problems, read
+
+
+def codex_workspace_network(env: Dict[str, str], cwd: Optional[str] = None) -> Dict[str, Any]:
+    """For doctor: what the checked Codex configuration layers set for network access in the
+    workspace-write sandbox. A relay task never takes it from there (every workspace-write run gets
+    the task's own value, off unless allow_network=true); this is what a direct ``codex`` run in
+    ``cwd`` would get. Only layer names and booleans are reported, never other settings content."""
+    layers, bad, _ = _codex_layers(env, cwd)
+    setting, complete = set(), not bad
+    for layer, data in layers:
+        table = data.get("sandbox_workspace_write")
+        if table is None:
+            continue
+        if not isinstance(table, dict) or not isinstance(table.get("network_access", False), bool):
+            complete = False
+        elif "network_access" in table:
+            setting.add(layer)
+    table = _merged(layers).get("sandbox_workspace_write")
+    value = table.get("network_access") if isinstance(table, dict) else None
+    return {"config_network_access": value if isinstance(value, bool) else None, "set_by_layers": sorted(setting),
+            "complete": complete}
 
 
 def _claude_layers(env: Dict[str, str], cwd: Optional[str]) -> List[Tuple[str, Path]]:
@@ -472,6 +525,33 @@ def full_access_enabled(engine: str, payload: Dict[str, Any]) -> bool:
             and (payload.get("options") or {}).get("allow_full_access") is True)
 
 
+def network_enabled(engine: str, payload: Dict[str, Any]) -> bool:
+    """Network in the workspace-write sandbox needs both options, as full access does."""
+    return (engine == "codex" and requested_sandbox(engine, payload) == CODEX_WORKSPACE_WRITE
+            and (payload.get("options") or {}).get("allow_network") is True)
+
+
+def codex_network_override(engine: str, payload: Dict[str, Any]) -> Optional[str]:
+    """The one network setting a workspace-write run gets from its task; nothing for other sandboxes."""
+    if engine != "codex" or requested_sandbox(engine, payload) != CODEX_WORKSPACE_WRITE:
+        return None
+    return f"{CODEX_NETWORK_SETTING}={'true' if network_enabled(engine, payload) else 'false'}"
+
+
+def completion_marker_required(payload: Dict[str, Any]) -> bool:
+    return (payload.get("options") or {}).get("require_completion_marker") is True
+
+
+def completion_marker(result: Any) -> Optional[str]:
+    """The CLI's own completion report: ``complete`` or ``incomplete`` if the last non-empty line of
+    its final message is exactly that marker line (surrounding whitespace aside), else None."""
+    lines = [line.strip() for line in result.splitlines() if line.strip()] if isinstance(result, str) else []
+    for marker in COMPLETION_MARKERS:
+        if lines and lines[-1] == COMPLETION_LINE_PREFIX + marker:
+            return marker
+    return None
+
+
 def requested_tools(engine: str, payload: Dict[str, Any]) -> List[str]:
     """The extra Claude tools of a task; only allowable names in a list count, never a string."""
     tools = (payload.get("options") or {}).get("allowed_tools") if engine == "claude" else None
@@ -483,20 +563,28 @@ def requested_tools(engine: str, payload: Dict[str, Any]) -> List[str]:
 def permission_details(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Requested permissions for receipts and events, not proof that an attempt ran."""
     if engine == "codex":
-        return {"sandbox": requested_sandbox(engine, payload), "full_access": full_access_enabled(engine, payload)}
+        full = full_access_enabled(engine, payload)  # no sandbox at all, so the network too
+        return {"sandbox": requested_sandbox(engine, payload), "full_access": full,
+                "network_access": full or network_enabled(engine, payload)}
     if engine == "claude":
         return {"allowed_tools": requested_tools(engine, payload)}
     return {}
 
 
+def request_details(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """What a task asked for, for receipts, status and events: its permissions and whether success
+    needs the completion marker."""
+    return {**permission_details(engine, payload), "completion_marker_required": completion_marker_required(payload)}
+
+
 def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[str],
                          sandbox: Optional[str], *, permission_checkpoint: Optional[Dict[str, Any]] = None,
                          resume_session_id: Optional[str] = None,
-                         allow_full_access: bool = False) -> Optional[Dict[str, Any]]:
+                         allow_full_access: bool = False, allow_network: bool = False) -> Optional[Dict[str, Any]]:
     """After a run: Codex records each turn's effective sandbox and any active named permission
     profile in the thread's rollout (``turn_context``). Every turn must have run in the requested
-    sandbox or a narrower one, with no named profile; a thread without that record is not shown
-    to have kept the requested permissions."""
+    sandbox or a narrower one, without network access unless the task opted in, and with no named
+    profile; a thread without that record is not shown to have kept the requested permissions."""
     if engine != "codex":
         return None
     if sandbox == CODEX_FULL_ACCESS and allow_full_access is not True:
@@ -530,16 +618,25 @@ def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[
             payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
             policy = payload.get("sandbox_policy")
             kind = policy.get("type") if isinstance(policy, dict) else None
-            turns.append((kind if isinstance(kind, str) else None, payload.get("active_permission_profile")))
+            # Codex 0.163.0 records workspace-write network access as a boolean and none for read-only
+            # or full access. A missing key or false is "off"; no other value is taken for it.
+            network = policy.get("network_access", False) if isinstance(policy, dict) else False
+            turns.append((kind if isinstance(kind, str) else None, payload.get("active_permission_profile"), network))
     if not turns:
         return {"reason": "permissions_unverified", "missing": "turn_context"}
     allowed = {"read-only"} if sandbox in (None, "read-only") else {"read-only", "workspace-write"}
     if sandbox == CODEX_FULL_ACCESS and allow_full_access is True:
         allowed.add(CODEX_FULL_ACCESS)
-    wider = sorted({str(kind) for kind, _ in turns if kind not in allowed})
+    wider = sorted({str(kind) for kind, _, _ in turns if kind not in allowed})
     if wider:
         return {"reason": "sandbox_not_as_requested", "requested": sandbox or "read-only", "observed": wider}
-    if any(profile not in (None, "") for _, profile in turns):
+    network_requested = ((sandbox == CODEX_WORKSPACE_WRITE and allow_network is True)
+                         or (sandbox == CODEX_FULL_ACCESS and allow_full_access is True))
+    with_network = sorted({str(kind) for kind, _, network in turns if network is not False})
+    if with_network and not network_requested:
+        return {"reason": "network_not_as_requested", "requested": sandbox or "read-only", "network_access": False,
+                "observed": with_network}
+    if any(profile not in (None, "") for _, profile, _ in turns):
         return {"reason": "named_permission_profile_active", "requested": sandbox or "read-only"}
     return None
 
@@ -554,6 +651,7 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
     sandboxes = set(CODEX_SANDBOXES)
     if full_access_enabled(engine, {"options": options}):
         sandboxes.add(CODEX_FULL_ACCESS)
+    network = codex_network_override(engine, {"options": options})
     tools = ",".join(requested_tools(engine, {"options": options}))
     if engine == "claude":
         modes = [args[i + 1] if i + 1 < len(args) else None for i, arg in enumerate(args)
@@ -581,8 +679,11 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
         if override is not None:
             allowed = {f'sandbox_mode="{s}"' for s in sandboxes}
             allowed.update(f'model_reasoning_effort="{e}"' for e in EFFORT_LEVELS)
+            if network:  # only the value built from the task's validated options, never another one
+                allowed.add(network)
             if override.replace(" ", "") not in allowed:
-                raise RuntimeError("refusing a codex config override other than an approved sandbox or validated effort")
+                raise RuntimeError("refusing a codex config override other than an approved sandbox, a validated "
+                                   "effort or the task's own workspace network setting")
         if engine == "claude" and arg == "--settings":
             try:
                 setting = json.loads(args[i + 1])
@@ -627,16 +728,18 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
     elif engine == "codex":
         binary = resolve_bin(engine, env)
         last_message = str(run_dir / "last_message.txt")
-        # Always explicit, so neither the first run nor a resume takes the sandbox from whatever
-        # the configuration says at that moment.
+        # Always explicit, so neither the first run nor a resume takes the sandbox (or the network
+        # access of workspace-write) from whatever the configuration says at that moment.
         sandbox = opts.get("sandbox") or "read-only"
+        network = codex_network_override(engine, {"options": opts})
+        network_args = ["-c", network] if network else []
         if resume:
             # `codex exec resume` has no --sandbox of its own: pin it both as the exec-level option
             # and as a config override for the resumed thread.
             argv = [binary, "exec", "--sandbox", sandbox, "resume", "-c", f'sandbox_mode="{sandbox}"',
-                    "--json", "-o", last_message]
+                    *network_args, "--json", "-o", last_message]
         else:
-            argv = [binary, "exec", "--json", "-C", cwd, "-o", last_message, "--sandbox", sandbox]
+            argv = [binary, "exec", "--json", "-C", cwd, "-o", last_message, "--sandbox", sandbox, *network_args]
         if opts.get("skip_git_repo_check"):
             argv.append("--skip-git-repo-check")
         if opts.get("model"):
@@ -838,7 +941,8 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
            guard: Optional[Dict[str, Any]] = None, sandbox: Optional[str] = None,
            permission_checkpoint: Optional[Dict[str, Any]] = None,
            resume_session_id: Optional[str] = None,
-           allow_full_access: bool = False) -> Tuple[str, Dict[str, Any]]:
+           allow_full_access: bool = False, allow_network: bool = False,
+           require_completion_marker: bool = False) -> Tuple[str, Dict[str, Any]]:
     """Name an attempt's outcome from what the run left behind; returns (outcome, evidence).
 
     The keeper and reconciliation both call this, so the outcome does not depend on which of
@@ -846,7 +950,12 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
     have kept the requested sandbox, is ``blocked`` whatever else happened: ``guard`` is what
     the keeper saw while the run was live (also persisted in exit.json); the init event of the
     saved output and the Codex thread record are re-read here, so the fact survives a keeper
-    that died before committing."""
+    that died before committing.
+
+    With ``require_completion_marker`` a run that would be ``succeeded`` is ``needs_input``
+    unless the CLI's own final message ends with the complete marker line: the incomplete
+    line, any other last line and no final message all mean the CLI did not report the task
+    done. The marker never changes any other outcome."""
     if guard is None and engine in ("claude", "fixture") and parsed.get("init"):
         guard = billing_violation(engine, {"type": "system", "subtype": "init", **parsed["init"]})
     if guard is not None:
@@ -858,11 +967,18 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
         return "blocked", {"provider_check": provider}
     permissions = permission_violation(engine, env, session_id, sandbox,
                                        permission_checkpoint=permission_checkpoint, resume_session_id=resume_session_id,
-                                       allow_full_access=allow_full_access)
+                                       allow_full_access=allow_full_access, allow_network=allow_network)
     if permissions is not None:
         return "blocked", {"permission_check": permissions}
-    return classify(parsed.get("native"), exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,
-                    cancel_requested=cancel_requested), {}
+    native = parsed.get("native")
+    outcome = classify(native, exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,
+                       cancel_requested=cancel_requested)
+    if require_completion_marker is not True:
+        return outcome, {}
+    check: Dict[str, Any] = {"marker": completion_marker((native or {}).get("result"))}
+    if outcome == "succeeded" and check["marker"] != "complete":
+        return "needs_input", {"completion_check": {**check, "downgraded_from": "succeeded"}}
+    return outcome, {"completion_check": check}
 
 
 def native_trace_exists(engine: str, session_id: Optional[str]) -> Optional[bool]:

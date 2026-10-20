@@ -703,6 +703,10 @@ class Ledger:
         excerpt = None
         if native and isinstance(native.get("result"), str):
             excerpt = native["result"][:RESULT_EXCERPT_CHARS]
+        details = engines.request_details(task["engine"], json.loads(task["payload_json"]))
+        if details["completion_marker_required"]:
+            # The marker line sits at the end of the result, often past the excerpt: name it here.
+            details["completion_marker"] = engines.completion_marker((native or {}).get("result"))
         body = {
             "task_id": att["task_id"],
             "attempt_no": att["attempt_no"],
@@ -715,7 +719,7 @@ class Ledger:
             "native_ok": None if native is None else native.get("ok"),
             "result_excerpt": excerpt,
             "source": source,
-            **engines.permission_details(task["engine"], json.loads(task["payload_json"])),
+            **details,
         }
         event_id = new_id("e")
         c.execute("INSERT INTO events (event_id, task_id, attempt_no, kind, body_json, created_at) "

@@ -102,6 +102,8 @@ every schedule.
 | G1 | `danger-full-access` rejected without explicit opt-in; bypass flags remain forbidden; Claude permission guards unchanged | `test_claude_argv`, `test_codex_argv`, `test_forbidden_flags_and_full_access_are_rejected`, `test_user_settings`, `test_project_settings_of_the_task_directory`, `test_the_run_is_stopped_and_blocked`, `test_still_blocked_when_the_keeper_died_before_committing` | PASS |
 | G1a | Codex full access requires both typed options; receipt/status/event/notification expose the choice; resume and crash recovery retain it | `test_full_access_rejected_without_explicit_true`, `test_argv_recheck_requires_both_stored_options_for_all_flag_forms`, `test_opt_in_is_stored_and_visible_in_receipt_status_events_and_notification`, `test_opt_in_survives_exact_resume_and_keeper_crash` | PASS (fake Codex; no model calls) |
 | G1b | Claude adds no tool by default; `allowed_tools` accepts only exact allowlisted names (`WebSearch`, `WebFetch`) and adds only `--allowedTools`, keeping `dontAsk` and every settings layer; payload hash, receipt/status/event/notification, exact resume, fresh rerun and crash recovery retain it; a deny rule still ends `needs_input`; doctor reports machine defaults by tool name and boolean only | `test_only_exact_allowlisted_names_in_a_list_are_accepted`, `test_default_adds_no_tool_and_keeps_dont_ask`, `test_argv_recheck_accepts_only_the_tasks_validated_tools`, `test_opt_in_is_stored_visible_and_lets_the_task_use_the_tools`, `test_opt_in_survives_exact_resume_a_keeper_crash_and_a_fresh_rerun`, `test_a_deny_rule_still_wins_and_the_task_ends_needs_input`, `test_deny_and_ask_rules_of_any_layer_win_over_allow_rules`, `test_doctor_reports_the_policy_and_this_machines_defaults_by_name_only` | PASS (fake Claude; no model calls; deny precedence itself is the CLI's) |
+| G1c | Codex `workspace-write` network (loopback included) is off by default and pinned off even where a config layer enables it; `allow_network` is a typed boolean accepted only with `workspace-write` (usage error with read-only/default and danger-full-access); it adds exactly `-c sandbox_workspace_write.network_access=true` on the first run and on exact resume, never full access; argv checks accept only the value built from the options; payload hash, receipt/status/event/notification report `network_access`; a recorded turn with network but no opt-in is `blocked`; doctor reports names and booleans only | `test_opt_in_is_a_typed_bool_for_workspace_write_only`, `test_default_is_off_and_pinned_on_every_workspace_write_run`, `test_opt_in_adds_exactly_the_network_setting_on_new_and_resumed_runs`, `test_argv_recheck_accepts_only_the_setting_built_from_the_options`, `test_a_turn_with_network_needs_the_opt_in`, `test_opt_in_is_stored_visible_everywhere_and_lets_the_tests_bind_localhost`, `test_default_has_no_network_even_where_the_user_config_enables_it`, `test_opt_in_survives_exact_resume_and_a_keeper_crash`, `test_a_recorded_turn_with_network_but_no_opt_in_is_blocked`, `test_doctor_explains_the_default_and_the_opt_in_and_reports_names_and_booleans_only` | PASS (fake Codex; no model calls). The Codex setting itself: section 2.6 |
+| G1d | With `require_completion_marker=true`, `succeeded` needs the exact last line `CLI-RELAY-STATUS: complete`; `incomplete`, another last line or no final message give `needs_input`; other outcomes never change; a keeper crash gives the same outcome; each attempt is judged by its own message; evidence, events and notifications name the marker; without the opt-in nothing changes | `test_only_an_exact_last_line_is_a_marker`, `test_success_needs_the_complete_line_on_every_engine`, `test_the_marker_never_changes_another_outcome`, `test_without_the_opt_in_nothing_changes`, `test_an_incomplete_or_missing_marker_ends_needs_input_with_the_reason_on_record`, `test_a_keeper_crash_reaches_the_same_outcome_through_reconciliation`, `test_each_attempt_is_judged_by_its_own_final_message`, `test_a_test_task_that_could_not_finish_is_not_succeeded_with_the_marker` | PASS (fixture and fake Codex; no model calls) |
 | G2 | API-key/gateway variables block the run before spawn; values never printed | `test_billing_env_blocks_and_never_reports_values`, `test_billing_env_blocks_a_real_run_before_spawn` | PASS |
 | G3 | Non-subscription login refused; init event reporting an API-key source stops the run | `test_auth_must_be_the_subscription_login`, `test_api_key_source_reported_by_the_cli_stops_the_run` | PASS |
 | G4 | Configuration that routes away from the subscription blocks before the CLI starts (Codex custom provider + `env_key`, profile, project config of the task directory; Claude `apiKeyHelper`, settings `env`); the Codex thread record must name `openai` | `test_codex_custom_provider_with_its_own_key_is_blocked`, `test_codex_profile_selecting_a_custom_provider_is_blocked`, `test_codex_project_configuration_in_the_task_cwd_is_checked`, `test_claude_api_key_helper_in_settings_is_blocked`, `test_claude_gateway_in_settings_env_is_blocked`, `test_default_configuration_passes`, `test_custom_provider_blocks_before_the_cli_starts`, `test_provider_recorded_by_the_run_is_verified` | PASS (fake CLIs; known keys only, see `reliability.md`) |
@@ -201,6 +203,23 @@ A stopped keeper can leave a live CLI briefly in `unknown` before it finishes as
 The billing-guard regression waits for `attempt.state=finished` before asserting the final
 outcome; it must not mistake this observable intermediate state for a completed cancellation.
 Real two-host notification, model/Max settings and the 30-minute window remain **NOT RUN**.
+
+### 2.6 Issue #7: loopback in the Codex sandbox (real Codex sandbox, no model call)
+
+On the target machine (Codex 0.163.0, macOS Seatbelt), `codex sandbox -c sandbox_mode=…
+[-c sandbox_workspace_write.network_access=…] -- python3 -c …` ran a probe that binds
+`127.0.0.1`, connects and echoes:
+
+| Sandbox | `sandbox_workspace_write.network_access` | Loopback |
+|---|---|---|
+| `read-only` | not set, or `true` | blocked (`PermissionError`, EPERM) |
+| `workspace-write` | not set | blocked (EPERM) |
+| `workspace-write` | `false` | blocked (EPERM) |
+| `workspace-write` | `true` | works |
+
+This shows the Codex setting and its effect. It is not a `codex exec` run of the relay's argv,
+which needs a model call: a real Codex test task with `allow_network=true` is **NOT RUN** and
+remains a deployment check, as does a real task that ends with the completion marker.
 
 ## 3. Real 25-hour soak
 
