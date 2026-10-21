@@ -703,7 +703,10 @@ class Ledger:
         excerpt = None
         if native and isinstance(native.get("result"), str):
             excerpt = native["result"][:RESULT_EXCERPT_CHARS]
-        details = engines.request_details(task["engine"], json.loads(task["payload_json"]))
+        payload = json.loads(task["payload_json"])
+        details = engines.request_details(task["engine"], payload)
+        if "origin" in payload:
+            details["origin"] = payload["origin"]
         if details["completion_marker_required"]:
             # The marker line sits at the end of the result, often past the excerpt: name it here.
             details["completion_marker"] = engines.completion_marker((native or {}).get("result"))

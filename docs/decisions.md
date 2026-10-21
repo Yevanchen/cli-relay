@@ -1,4 +1,4 @@
-# Design decisions (v0.1, experimental)
+# Design decisions (experimental)
 
 Status: accepted for v0.1. Each decision lists the evidence it rests on. Anything we
 could not verify on the target machine is stated as such and re-checked in
@@ -523,3 +523,80 @@ Details and limits:
   the dispatcher asks for the line, in resume prompts too.
 - A self-report is not a verification. A CLI can claim `complete` wrongly, and the relay still does not
   decide business acceptance (D9). The marker only lets the CLI's own "not done" stop a `succeeded`.
+
+## D16. Issue #4: registered routes, visible-message proof and origin
+
+**Problem.** Per-task route selection existed, but adding a route required manual configuration
+on each machine, no route carried acceptance evidence, and task payloads lacked caller identity.
+An HTTP 2xx means only transport acceptance; it cannot prove a message reached the origin chat.
+The issue describes earlier Friday and GitHub-bot delivery experiments. This implementation
+does not repeat those experiments or draw a reliability conclusion from them.
+
+**Decision: keep routing, execution identity and delivery evidence separate.**
+
+- `route add/list/remove/set-default/verify` is the supported local workflow. Registration only
+  accepts credential references (environment names or existing private absolute paths), never
+  inline credentials. It is an atomic, mode-0600 update of home-local notifier.json, serialized
+  with an advisory lock. Identical registration is a no-op and retains proof and budgets;
+  changing owner or adapter requires explicit remove/add. The `source_id` is immutable through
+  registration. No global settings or remote receiver are provisioned by these commands.
+- **Fail closed, no unproven task opt-in.** New routes and legacy configurations without receipts
+  are unproven. Both default selection and explicit new-task submission require proof. We chose
+  refusal over `--allow-unproven`, because that flag would turn ordinary task completion into an
+  accidental acceptance experiment. Even a manually configured unproven default is refused at
+  submit. This is a deliberate upgrade restriction: approve and verify existing receivers first.
+  A duplicate known scope/key still recovers its committed receipt despite missing/broken route
+  configuration; historical route reservations are retained. Omitting origin does not change
+  payload hashes or introduce an origin field.
+- **A separate probe, not a fixture task.** Verification sends an explicit visible-message test
+  using `cli-relay.route-verify.v1`. The receiver must send to the selected chat, obtain a message
+  id, then respond with `visible: true`, the id and matching verification/source/ledger/route/
+  consumer/chat identities. No 2xx-only or process-exit-only shortcut is accepted. Existing command
+  adapters can implement the same protocol on stdin/stdout during verify. HTTP and command task
+  notification behavior stays as in D12; ordinary task ACKs still belong to their consumer.
+- **Persist before send and after evidence.** The probe's id, attempts, possible wakes and next
+  deadline live in `routes.NAME.verification`. `sending` is durable before I/O; after a crash it
+  consumes a possible wake and waits for the ACK timeout. Only a validated message receipt can
+  produce `acked`, `message_id`, `acked_at` and derived `proven=true`. The proof is bound to its
+  ledger id and the non-secret source, route/owner and normalized adapter settings/reference names. Changing them
+  invalidates it; rotating values behind the same references does not. Copied receipts are not
+  trusted in a different ledger. This is operator-owned
+  state, not protection against an operator forging a receipt or a receiver falsely claiming
+  it sent a message. It proves neither future reliability nor that a person read the message.
+- **One due probe per invocation.** Verification is a deliberate operation, separate from the
+  automatic notifier. It never creates a task/attempt/event in the execution ledger, starts a
+  native CLI, or ACKs a task. Repeat it at `next_at`; repeated early calls spend no budget. The
+  receiver deduplicates by `(source_id, ledger_id, verification_id)`. A lost reply may have left
+  a visible message, so no immediate resend or fresh id is generated automatically. After
+  failure/exhaustion, `route verify --retry` explicitly grants a new budget and id; it may cause
+  another visible message. A proven route returns its receipt without sending again.
+- **Reuse bounded delivery transitions.** Defaults: at most 6 attempts, exponential delays of
+  30/60/120/240/480 seconds (cap 1800 seconds), at most 2 possible wakes, ACK timeout 1800 seconds.
+  `Retry-After` remains a lower bound, even beyond the cap. Connection failures do not consume a
+  wake; HTTP error responses, missing proof on 2xx and ambiguous sends do. These settings are
+  shared, but probes and each task event have separate counters. An unproven task route consumes
+  bounded readiness checks with that backoff and **zero adapter calls**. On exhaustion the event
+  remains `failed`; missing task ACKs remain `unacknowledged`. Proof obtained after exhaustion
+  does not reset a notification budget: the operator uses `notify retry --event`. None of this
+  creates another task attempt or reruns completed work.
+- **Origin is part of execution identity, route choice is not.** Optional `--origin` is JSON with
+  exactly string `bot` and `chat`: bot 1–64 restricted identifier characters; chat 1–256 printable
+  characters with no edge whitespace; whole input at most 4096 UTF-8 bytes. Duplicate/unknown keys
+  and other types are errors. The canonical object is stored in the payload and therefore changes
+  its SHA-256: changing caller identity for a known key conflicts. Origin is exposed in receipts,
+  status and terminal/unknown events, including each HTTP notification entry and resumed attempts.
+  It never chooses a route, authenticates a caller or overrides the task's first committed owner.
+  Route choice continues to be immutable metadata outside the payload hash (D14).
+- **Diagnostic output is narrow.** List displays non-secret references and the current receipt;
+  doctor reports route names, proven state and boolean secret resolution only. HTTP response bodies
+  and exception text are discarded, and a credential echoed as a message id is rejected. Removal
+  clears a selected default but does not delete tasks, events, notifications or task ACKs. An
+  already-running notifier pass can still complete using its configuration snapshot.
+
+**Evidence and limits.** New tests use mocks and a deterministic fixture only, including crash
+recovery, concurrent registration/verification, secret scans of every generated ledger file,
+origin/hash propagation, no unproven bypass, exhausted budgets and a completed task's single
+side effect. Existing transport tests now start from explicitly synthetic proof fixtures. The
+manual acceptance script's local fake receiver implements the same protocol. No real route
+verification was performed for this change; new webhooks are not approved. The 25-hour soak
+remains outside this issue and no new long-run reliability claim is made.

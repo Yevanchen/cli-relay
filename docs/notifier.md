@@ -44,7 +44,8 @@ consumer (Bot) reads the task by id, reports in its chat, then `cli-relay ack` �
 
   Pull reads (`events`) are counted in `deliveries` and are never counted as sends.
 - **Bounds.** Every number is configurable.
-  - At most `retry.max_attempts` adapter calls per event (default 6).
+  - At most `retry.max_attempts` attempts per event (default 6). An attempt either calls the
+    adapter or records a failed readiness check for an unproven route, without sending.
   - Backoff doubles from `retry.base_delay_s` (default 30 s) up to `retry.max_delay_s` (default
     30 min). `Retry-After` is a lower bound applied after that cap, so it may require a longer wait.
   - At most `reminder.max_wakes` calls that may have reached the consumer (default 2). HTTP
@@ -74,7 +75,6 @@ Private to each machine. Never commit it. Keep it readable only by its owner (`c
 ```json
 {
   "source_id": "host-a",
-  "default_route": "bot",
   "routes": {
     "bot": {
       "consumer": "bot",
@@ -96,7 +96,8 @@ Private to each machine. Never commit it. Keep it readable only by its owner (`c
   - With neither it is not notified.
   - The effective route, consumer and chat are stored once; changing the default cannot move
     an existing task. If no configuration existed at submit, the first configured pass binds
-    it once. An explicit route can wait for its configuration.
+    it once. Historical explicit route reservations can wait for their configuration; new
+    submissions with `--notify-route` require a registered, proven route.
   - Credentials may rotate without changing the owner. If a route name is reused with a new
     consumer or chat, old tasks fail with `route_owner_changed`; their owner is not rewritten.
     Restore the original route identity before an explicit `notify retry`.
@@ -111,6 +112,95 @@ Private to each machine. Never commit it. Keep it readable only by its owner (`c
   token come from exactly one of `url_env` / `url_file` and one of `token_env` / `token_file`
   (absolute paths). They are read at send time and never printed or logged.
 - An invalid file is refused as a whole (exit 2, key names only) and nothing is sent.
+
+The example above is **unproven** until `route verify bot` succeeds. No configuration without a
+verification receipt is grandfathered in as proven. Set its default with `route set-default bot`
+only afterwards. Existing command adapters must implement the verification response below;
+ordinary `notify.sh` exit 0 cannot verify a route. Task sends still use the original five-field
+interface and their transport acceptance remains separate from the task consumer's ACK.
+
+### Registration and visible-message verification
+
+`route add NAME --consumer C --chat LABEL --url-env URL_VARIABLE --token-env TOKEN_VARIABLE`
+registers an HTTP route in `<home>/notifier.json`. The first registration additionally requires
+`--source-id SOURCE`. Each reference can instead be `--url-file /absolute/private/file` or
+`--token-file /absolute/private/file`. File references must already be owner-only regular files
+owned by the current user. Registration checks the reference, not its contents, and makes no
+network call. `--timeout` sets the adapter timeout (1–600 seconds, default 20).
+
+- Identical registrations do not rewrite the configuration or reset verification/retry state.
+  Changes to an existing registration are refused; remove and re-add deliberately. Removing the
+  last route leaves an empty route map, and removing a default clears that default. Task ownership
+  is never rewritten. In-flight notifier passes may still finish using their previous snapshot.
+- All managed writes are atomic (file and directory fsync) with mode `0600`. A home-local
+  `.notifier.lock` serializes registration, removal, default changes and verification; a symlink
+  `notifier.json` is refused for these mutations. Verification holds this lock through the send.
+- Only non-secret settings, credential reference names/paths and the latest verification receipt
+  are stored. URL/token values and raw receiver responses never enter the configuration, receipt,
+  log or CLI output. `route list` shows references and proof state without resolving secrets.
+  `doctor` shows each name, `proven`, and `secret_resolved: {"url": true, "token": false}` for
+  HTTP routes, with booleans only. Command adapters own their credentials, so that map is empty.
+  Unproven routes are informational unless configured as a default; an unusable default or an
+  unresolved HTTP credential reference makes doctor exit 6.
+- `route set-default NAME` and new `submit --notify-route NAME` require a proven route; new
+  submissions also refuse a manually configured unproven default before committing any task.
+  No `--allow-unproven` escape hatch is provided. `--origin` never bypasses the routing gate.
+
+`route verify NAME` is an **explicit visible send**. Approve the receiver/chat first. It performs
+at most one due attempt, prints a JSON receipt and exits 0 only for proven, otherwise 6. It does
+not create a task, run a CLI, poll a Bot or alter task ACKs. The five fields use `status=route_verify`
+and a visible `summary` naming a fresh verification id. The additional request object is:
+
+```json
+{"schema":"cli-relay.route-verify.v1","verification_id":"v-<32 hex digits>",
+ "source_id":"mac-a","ledger_id":"l-...","route":"github",
+ "consumer":"github-bot","chat":"github-original-chat"}
+```
+
+The receiver must send the summary as a visible test message to the specified chat, obtain the
+platform's message id, **then** return HTTP 2xx with this JSON body, copying the six identity fields
+exactly. A bare 2xx, job/run id, asynchronous enqueue acknowledgement, missing/invalid message id,
+or mismatched identity is insufficient:
+
+```json
+{"verification_id":"v-<32 hex digits>","source_id":"mac-a","ledger_id":"l-...",
+ "route":"github","consumer":"github-bot","chat":"github-original-chat",
+ "visible":true,"message_id":"platform-message-id"}
+```
+
+Message ids must be strings of 1–256 characters from `[A-Za-z0-9._:@/+-]`. Responses are read up
+to 65536 bytes; other fields are ignored. The HTTP adapter rejects a credential echoed as the
+message id. Command adapters receive the same full JSON request on stdin **only during verify**
+and must return the same receipt on stdout with exit 0; they must keep credentials out of their
+output. Their `exit_status=verified` setting alone is not sufficient. A receiver that only
+returns a run id needs a bridge implementing this protocol; this change does not install one.
+
+After validating the receipt, the relay records `state=acked`, `message_id` and `acked_at`, then
+the route becomes proven. This is the probe's ACK, not an ACK of any task event. The receipt is
+in `routes.NAME.verification` in notifier.json and in the command output. `proven` is derived
+from that receipt, its ledger id, and a SHA-256 of the source, route name, owner and adapter references/settings.
+Editing any of those invalidates the proof. Rotating secret contents behind unchanged references
+does not invalidate it. A receipt copied to another ledger is unproven. Use distinct `source_id`s
+per machine. These files are operator-owned state, not a security boundary against that user.
+
+Repeated verify calls keep the same verification id and budget, and never send before `next_at`.
+The receiver must deduplicate by `(source_id, ledger_id, verification_id)` and return the same
+message id after a lost response. Connection failures back off by 30, 60, 120, 240, 480 seconds
+with the default six-attempt budget (the configurable cap is 1800 seconds). A request that may
+have arrived, including a 2xx without valid proof, consumes a possible wake. Default ACK timeout
+is 1800 seconds and the possible-wake budget is 2. The same `retry`/`reminder` settings govern
+probes and task notifications, but their counters are separate. A crash after the persisted
+`sending` state consumes one attempt and one possible wake; no immediate resend is allowed.
+After `failed`/`unacknowledged`, `route verify NAME --retry` explicitly starts a new id and budget.
+`notify run` does not drive verification probes: invoke verify again when the receipt is due.
+Already-proven verification is a no-send, idempotent read.
+
+For task events whose route loses proof, readiness checks consume the same exponential-backoff
+attempt budget without invoking the adapter or recording a transport send. Events remain in
+the ledger, including after the budget ends as `failed/route_unproven`. If verification finishes
+before that point, the next due check can send. After exhaustion, use `notify retry --event E`.
+An ACK timeout still ends as `unacknowledged` after bounded reminders; no route operation or
+notification retry creates a new task attempt.
 
 ### Payload
 
@@ -169,6 +259,15 @@ was submitted with `--option require_completion_marker=true`), it also includes
 that the outcome was decided on. A task that required it and did not report `complete` arrives as
 `needs_input`, which is also the `status` of the five fields.
 
+When submitted with `--origin '{"bot":"github-bot","chat":"original-chat"}'`, every terminal or
+unknown body and `cli_relay.events[]` entry also includes that `origin` object. It is part of the
+canonical task payload/hash and remains present in submit/resume receipts and status. Both
+fields are required: bot is 1–64 `[A-Za-z0-9._:@/+-]` characters, chat is 1–256 printable characters
+without surrounding whitespace; input JSON is limited to 4096 UTF-8 bytes. Unknown/duplicate
+keys and non-string values are rejected. Omitting the option adds no field and changes no hash.
+Origin describes the caller; it is not permission to choose another destination or execute text.
+In a batch, each event retains its own origin; command consumers can read it from task status.
+
 ### Earlier v0.2 candidate ledgers
 
 Run `migrate` when upgrading an earlier candidate as well as v0.1. The core schema stays 1;
@@ -219,6 +318,10 @@ outcomes, batches what is due, and stops after `max_wakes`. It never polls the B
 | `cli-relay notify run [--interval 60]` | a pass every interval until SIGTERM (for launchd or systemd); one log line per pass in `<home>/notifier.log` |
 | `cli-relay notify status [--task T] [--event E]` | per notification: state, attempts, wake-ups, `transport_accepted`, `consumer_acked`, last result |
 | `cli-relay notify retry --event E` | operator action: a failed or unacknowledged notification gets a new budget |
+| `cli-relay route add NAME --source-id S --consumer C --chat LABEL --url-env VAR --token-env VAR` | register an unproven HTTP route without reading or copying credentials; `--source-id` needed on first registration |
+| `cli-relay route list` / `route remove NAME` | inspect references/receipt or idempotently remove a route, preserving task history |
+| `cli-relay route verify NAME [--retry]` | one due visible-message probe, persisted receipt; explicit new budget after failure only |
+| `cli-relay route set-default NAME` | select a proven route for future submissions |
 | `cli-relay submit … --notify-route NAME` | fixed route and owner for this task (routing metadata, not part of the payload) |
 | `cli-relay notify bind-owner --task T --route R --consumer C --chat LABEL` | explicitly restore a migrated task's missing original owner; never change a bound owner or contradict a recorded route |
 | `cli-relay ack … --ledger-id L [--source-id S]` | refuse unless the event belongs to this ledger or machine |
@@ -241,7 +344,10 @@ reminders, and it catches up after a restart.
 4. **Configure only after the old sender has stopped.** Write `<home>/notifier.json` for this
    machine, with its own `source_id` and destination, and make it owner-readable only. Once the
    file exists, a completing keeper can start an immediate pass even before the periodic service
-   starts. Preserve existing credentials; do not publish the configuration.
+   starts. Prefer `route add` for a new HTTP route; preserve existing credential references and
+   do not publish the configuration. A new or legacy route stays unproven until its receiver
+   implements the protocol above and `route verify` passes with an approved visible test.
+   Only then select it with `route set-default` or submit tasks using `--notify-route`.
 5. **Start the periodic pass**, for example a launchd agent running
    `cli-relay --home <home> notify run --interval 60` with `KeepAlive`.
 6. **Check one real task per machine.** Confirm the correct original chat receives its result,

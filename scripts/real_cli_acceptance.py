@@ -40,7 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from cli_relay import engines  # noqa: E402
+from cli_relay import engines, routes  # noqa: E402
 
 PHRASE = "relay-ok"
 CONSUMER = "acceptance"
@@ -55,11 +55,18 @@ class LocalWebhook:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
-                outer.bodies.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0")))))
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+                record = body.get("cli_relay", {})
+                if record.get("schema") == "cli-relay.route-verify.v1":
+                    # Synthetic visible-message evidence, only for this local stand-in.
+                    response = json.dumps({**record, "visible": True, "message_id": "local-test-message"}).encode()
+                else:
+                    outer.bodies.append(body)
+                    response = b"{}"
                 self.send_response(200)
-                self.send_header("Content-Length", "2")
+                self.send_header("Content-Length", str(len(response)))
                 self.end_headers()
-                self.wfile.write(b"{}")
+                self.wfile.write(response)
 
             def log_message(self, *args: Any) -> None:
                 pass
@@ -76,6 +83,9 @@ class LocalWebhook:
                 "type": "http", "url_file": str(home / "acceptance-webhook-url"),
                 "token_file": str(home / "acceptance-webhook-token"), "timeout_s": 5}}},
             "reminder": {"ack_timeout_s": 3600, "max_wakes": 2}}))
+        (home / "notifier.json").chmod(0o600)
+        if not routes.verify(home, "local")["proven"]:
+            raise RuntimeError("local fake webhook verification failed")
 
     def stop(self) -> None:
         self.server.shutdown()

@@ -100,6 +100,60 @@ plain text. Exit codes:
 - `6` refused (a precondition does not hold)
 - `130` interrupted
 
+## Per-task routes and origin (issue #4)
+
+Register an approved receiver using **references**, never a URL or token value on the command
+line. The first registration needs a machine-specific `source_id`. The named environment
+variables must already be provided by the service environment; alternatively use `--url-file`
+and `--token-file` with existing absolute, owner-only file paths.
+
+```sh
+cli-relay --home /path/to/ledger route add github --source-id mac-a \
+  --consumer github-bot --chat github-original-chat \
+  --url-env GITHUB_RELAY_URL --token-env GITHUB_RELAY_TOKEN
+cli-relay --home /path/to/ledger route list
+cli-relay --home /path/to/ledger doctor
+
+# Only after the receiver and the visible test message are approved:
+cli-relay --home /path/to/ledger route verify github
+# Exit 0 / proven=true only after a matching visible-message receipt with message_id.
+# Exit 6 leaves it unproven; inspect verification.next_at before invoking again.
+cli-relay --home /path/to/ledger route set-default github  # optional, proven only
+
+cli-relay --home /path/to/ledger submit --key issue-4 --engine claude --cwd ~/code/app \
+  --prompt 'Implement the agreed change.' --notify-route github \
+  --origin '{"bot":"github-bot","chat":"github-original-chat"}'
+
+cli-relay --home /path/to/ledger route remove github
+# Explicit recovery after fixing a failed/exhausted verification:
+# cli-relay --home /path/to/ledger route verify github --retry
+# Explicit recovery of a failed task notification (never reruns the task):
+# cli-relay --home /path/to/ledger notify retry --event e-...
+```
+
+Registration is idempotent: identical settings keep the receipt; conflicting settings are
+refused. New routes are **unproven**, and neither explicit `--notify-route` nor default routing
+can use them for new tasks. There is no bypass flag. **Upgrade:** configurations without a
+verification receipt are also unproven; existing routes must pass the new protocol before new
+task submissions use them. A duplicate submission still recovers its original receipt even if
+the route has since disappeared. Removal clears that default, but keeps tasks, events and ACKs.
+
+`--origin` requires exactly `bot` (1–64 characters from `[A-Za-z0-9._:@/+-]`) and `chat`
+(1–256 printable characters, no surrounding whitespace), in at most 4096 UTF-8 bytes of JSON.
+It appears in the stored payload, hash, submit/resume receipts, status, terminal/unknown event
+bodies and each HTTP notification event. Changing it under the same scope/key is a conflict.
+It is descriptive metadata; the selected route determines the destination. Omit it to retain
+the previous payload/hash and omit the field from outputs.
+
+Default budgets are 6 attempts with backoff of 30, 60, 120, 240, 480 seconds (cap 1800 seconds),
+and at most 2 possible wakes, separated by a 1800-second ACK timeout. Unproven task routes consume
+bounded readiness checks without sending. Exhaustion keeps the event/receipt for inspection;
+only an explicit retry grants a new budget. See the [receiver protocol and commands](docs/notifier.md)
+and [D16](docs/decisions.md#d16-issue-4-registered-routes-visible-message-proof-and-origin).
+
+This change has only local fake/mock test evidence. No new live webhook route was approved or
+verified, and it makes no new 25-hour reliability claim.
+
 ## Engines
 
 | Engine | Runs | Resume |

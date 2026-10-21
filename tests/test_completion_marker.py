@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, wait_until
 
+from notify_helpers import write_config
 from cli_relay import engines, notify, procs
 from cli_relay.errors import UsageError
 from cli_relay.ledger import payload_hash
@@ -180,7 +181,7 @@ class MarkerRoundTrip(RelayTestCase):
 
     def test_the_notification_carries_the_outcome_and_the_marker(self) -> None:
         self.run_fixture("k-notify", f"203/235 passed\n{OPEN}")
-        (self.home / "notifier.json").write_text(json.dumps(NOTIFIER))
+        write_config(self.home, NOTIFIER)
         with patch("cli_relay.notify.send", return_value={"outcome": "handed_off"}) as send:
             notify.flush(self.home, env=base_env())
         send.assert_called_once()
