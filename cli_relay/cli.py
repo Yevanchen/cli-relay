@@ -120,7 +120,7 @@ def task_view(ledger: Ledger, task_id: str, probe: bool = True) -> Dict[str, Any
         "task": {k: t[k] for k in ("task_id", "scope", "engine", "cwd", "state", "current_attempt", "submit_count",
                                    "payload_sha256", "created_at", "updated_at")} | {
                                        "key": t["request_key"], "options": payload.get("options", {}),
-                                       **engines.permission_details(t["engine"], payload)},
+                                       **engines.request_details(t["engine"], payload)},
         "attempts": [attempt_view(a, probe) for a in ledger.attempts(task_id)],
         "events": [{"event_id": e["event_id"], "attempt_no": e["attempt_no"], "kind": e["kind"],
                     "created_at": e["created_at"], "acked_by": e["acked_by"], "body": _loads(e["body_json"])}
@@ -203,7 +203,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     emit({"ok": True, "accepted": True, "status": status, "task_id": task["task_id"], "state": task["state"],
           "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
           "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper,
-          **engines.permission_details(task["engine"], json.loads(task["payload_json"])),
+          **engines.request_details(task["engine"], json.loads(task["payload_json"])),
           "notify_route": task.get("notify_route"), "notify_consumer": task.get("notify_consumer"),
           "notify_chat": task.get("notify_chat"), "notify_bound": task.get("notify_bound") == 1,
           "notify_owner_state": "manual_restore" if task.get("notify_bound") == -1 else
@@ -414,7 +414,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
         keeper = "spawn_failed_run_reconcile"
     emit({"ok": True, "task_id": task_id, "attempt_no": new["attempt_no"], "attempt_id": new["attempt_id"],
           "reason": reason, "resume_session_id": resume_sid, "previous_attempt_stopped": proof, "keeper": keeper,
-          **engines.permission_details(task["engine"], json.loads(task["payload_json"]))})
+          **engines.request_details(task["engine"], json.loads(task["payload_json"]))})
     return 0
 
 
@@ -440,6 +440,34 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "risk": "danger-full-access disables the Codex sandbox: commands can access files outside the task "
                 "directory and use the network, subject to host permissions",
         "checks": "config-layer permission checks, forbidden flags and subscription/billing checks still apply",
+        "network_default": False,
+        "network_opt_in": '--option sandbox="workspace-write" --option allow_network=true',
+        "network_without_opt_in": "workspace-write runs get sandbox_workspace_write.network_access=false: commands "
+                                  "cannot open network connections, not even to localhost, so tests that start a "
+                                  "local server (for example a fake webhook) fail inside the sandbox",
+        "network_effect": "adds -c sandbox_workspace_write.network_access=true on the first run and on exact "
+                          "resume; the sandbox stays workspace-write, never danger-full-access, and no other "
+                          "config override is accepted",
+        "network_scope": "only with sandbox=\"workspace-write\": with read-only (the default) or "
+                         "danger-full-access, allow_network is a usage error",
+        "network_risk": "Codex has no loopback-only setting: allow_network opens all network access from the "
+                        "sandbox, so commands can reach other hosts and send data out; writes stay limited to "
+                        "the workspace",
+        "machine_defaults": "doctor --engine codex reports engine.workspace_network for --cwd: layer names and "
+                            "booleans only; a relay task never takes this setting from the configuration",
+    }
+    out["completion_marker_policy"] = {
+        "default_required": False, "opt_in": "--option require_completion_marker=true",
+        "complete_line": engines.COMPLETION_LINE_PREFIX + "complete",
+        "incomplete_line": engines.COMPLETION_LINE_PREFIX + "incomplete",
+        "rule": "with the opt-in, a run that would end succeeded ends needs_input unless the last non-empty "
+                "line of the CLI's final message is exactly the complete line; the incomplete line, any other "
+                "last line or no final message gives needs_input, and other outcomes are unchanged",
+        "prompt": "the relay never edits a prompt: ask for one of the two lines in the task prompt and in "
+                  "resume prompts, as a plain last line without formatting",
+        "limits": "a self-report, not verification: the relay runs no check of its own and reads no other "
+                  "text of the result; without the opt-in, succeeded only means the CLI ended its turn "
+                  "without an error",
     }
     out["claude_tool_policy"] = {
         "default_allowed_tools": [], "allowable_tools": list(engines.CLAUDE_ALLOWABLE_TOOLS),
@@ -472,6 +500,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         out["engine"] = {"name": args.engine, "ok": pf.ok, "reason": pf.reason, **pf.detail}
         if args.engine == "claude":  # informational: never changes ok
             out["engine"]["network_tools"] = engines.claude_tool_rules(dict(os.environ), cwd)
+        elif args.engine == "codex":  # informational: never changes ok
+            out["engine"]["workspace_network"] = engines.codex_workspace_network(dict(os.environ), cwd)
         out["ok"] = out["ok"] and pf.ok
     emit(out)
     return 0 if out["ok"] else 6

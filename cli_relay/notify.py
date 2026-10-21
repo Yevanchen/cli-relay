@@ -185,7 +185,8 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
     body = json.loads(row["body_json"])
     return {"event_id": row["event_id"], "task_id": row["task_id"], "attempt_no": row["attempt_no"],
             "kind": row["kind"], "outcome": body.get("outcome") or row["kind"], "key": row.get("request_key"),
-            **{key: body[key] for key in ("sandbox", "full_access", "allowed_tools") if key in body},
+            **{key: body[key] for key in ("sandbox", "full_access", "network_access", "allowed_tools",
+                                          "completion_marker_required", "completion_marker") if key in body},
             "result_excerpt": _clean(body.get("result_excerpt"), EXCERPT_MAX)}
 
 
@@ -199,6 +200,8 @@ def build_payload(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, re
             f"route={route['name']} events={len(refs)}")
     if any(r.get("full_access") is True for r in refs):
         head += " full_access=true"  # also visible through the five-field command adapter
+    if any(r.get("network_access") is True for r in refs):
+        head += " network_access=true"
     tools = sorted({tool for r in refs for tool in r.get("allowed_tools") or []})
     if tools:
         head += " allowed_tools=" + ",".join(tools)

@@ -115,7 +115,7 @@ class AllowedToolsOptionsAndArgv(unittest.TestCase):
             with self.subTest(options=options):
                 self.assertEqual(engines.permission_details("claude", {"options": options}), {"allowed_tools": []})
         self.assertEqual(engines.permission_details("codex", {"options": {}}),
-                         {"sandbox": "read-only", "full_access": False})
+                         {"sandbox": "read-only", "full_access": False, "network_access": False})
         self.assertEqual(engines.permission_details("fixture", {"options": {}}), {})
 
 

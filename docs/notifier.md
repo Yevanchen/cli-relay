@@ -131,7 +131,8 @@ The HTTP adapter also sends `cli_relay`, a structured copy:
  "chat": "Bot chat", "consumer": "bot", "reminder": false, "count": 1,
  "events": [{"event_id": "e-…", "task_id": "t-…", "attempt_no": 1, "kind": "terminal",
              "outcome": "succeeded", "key": "…", "result_excerpt": "…",
-             "sandbox": "danger-full-access", "full_access": true}]}
+             "sandbox": "danger-full-access", "full_access": true, "network_access": true,
+             "completion_marker_required": false}]}
 ```
 
 New Codex event bodies and each corresponding `cli_relay.events` entry include `sandbox` and
@@ -155,6 +156,18 @@ New Claude event bodies and each corresponding `cli_relay.events` entry include
 describes requested permissions, not tool use, and is absent from historical events and other
 engines. A summary contains `allowed_tools=WebFetch,WebSearch` (the tools of the whole batch)
 if any event in the batch opted in.
+
+New Codex event bodies and entries also include `network_access`: `true` when the task opted in to
+network access in `workspace-write` (`--option 'sandbox="workspace-write"' --option
+allow_network=true`) or to full access, `false` by default. Like `full_access`, it describes the
+requested permission, not a connection that was made. A summary contains `network_access=true` if
+any event in the batch has it.
+
+Every new event body and entry includes `completion_marker_required`. When it is `true` (the task
+was submitted with `--option require_completion_marker=true`), it also includes
+`completion_marker`: `complete`, `incomplete` or `null`, the last line of the CLI's final message
+that the outcome was decided on. A task that required it and did not report `complete` arrives as
+`needs_input`, which is also the `status` of the five fields.
 
 ### Earlier v0.2 candidate ledgers
 

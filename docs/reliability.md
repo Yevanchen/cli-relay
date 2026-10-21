@@ -69,7 +69,10 @@ Three facts are stored separately and never substituted for one another:
   `turn.failed` plus the last agent message. The real-CLI acceptance found Claude can report
   `subtype: "success"` with `is_error: true`, so both fields are checked.
 - **Business acceptance.** Never inferred by the relay. It is the consumer's decision; ACK
-  only means "the consumer has the event".
+  only means "the consumer has the event". A task may require the CLI's own completion marker
+  (`require_completion_marker=true`): then `succeeded` also needs the exact last line
+  `CLI-RELAY-STATUS: complete` in the CLI's final message, and a run without it is `needs_input`.
+  That is still the CLI's self-report, not acceptance ([`decisions.md`](decisions.md) D15).
 
 ## Persistence boundaries and crash windows
 
@@ -165,6 +168,11 @@ Permission posture does not depend on the CLIs' configuration of the moment:
   directory and network use subject to host permissions. The boolean alone is harmless.
   The same sandbox is passed on resume, both as the exec-level option and
   as a `sandbox_mode` override, because `codex exec resume` has no sandbox option of its own.
+- A Codex `workspace-write` run also gets an explicit `sandbox_workspace_write.network_access`,
+  on the first run and on resume: `false`, which blocks every connection including loopback, unless
+  the task opts in with the typed boolean `allow_network=true`. The option is a usage error with any
+  other sandbox and never selects full access. Codex has no loopback-only setting, so the opt-in
+  allows all network access from the sandbox; writes stay limited to the workspace.
 - Claude always gets `--permission-mode dontAsk --permission-prompts none`, including resume.
   Preflight only accepts a user/project bypass default because that fixed CLI override replaces
   it. A conflicting managed mode, a stricter `plan` default, and malformed checked settings
@@ -178,16 +186,18 @@ Permission posture does not depend on the CLIs' configuration of the moment:
   on every attempt, and changes neither the mode nor any settings layer. Deny and ask rules of
   every layer, and managed `allowManagedPermissionRulesOnly`, still win; a tool that stays denied
   ends the task `needs_input`.
-- Argv checks reject `danger-full-access` unless both task options opt in, and Claude
-  `--allowedTools` unless it carries exactly the task's stored list. Every permission-bypass
-  flag, including `--dangerously-bypass-approvals-and-sandbox`, `--yolo` and `--full-auto`, stays forbidden.
+- Argv checks reject `danger-full-access` unless both task options opt in, a workspace network
+  setting other than the one built from the task's options, and Claude `--allowedTools` unless it
+  carries exactly the task's stored list. Every permission-bypass flag, including
+  `--dangerously-bypass-approvals-and-sandbox`, `--yolo` and `--full-auto`, stays forbidden.
 - `--sandbox` is not the only thing that decides a Codex run's permissions: named permission
   profiles and requirements can take precedence. Codex runs, including opted-in full-access runs,
   are checked on both sides:
   - before the run, a permission setting, a requirements or managed-preference layer, or an unsafe or
     unreadable config-profile selected by `profile` blocks the run; benign profiles are parsed;
   - after the run, every `turn_context` in the thread's rollout must show the requested sandbox
-    (or a narrower one) and no active named permission profile. Otherwise the attempt is
+    (or a narrower one), no network access unless the task opted in (`network_access` missing or
+    `false`), and no active named permission profile. Otherwise the attempt is
     `blocked`; a thread without that record is `permissions_unverified`. Before an exact resume,
     the keeper records the rollout path, file identity and byte boundary in attempt evidence.
     A resumed attempt also needs a new `turn_context` after that boundary. Missing evidence,
@@ -218,8 +228,8 @@ away from the subscription login. It checks:
 2. **While it runs:** a Claude init event that reports an API-key source or a different permission mode
    stops the CLI.
 3. **After it ran:** the Codex thread's own record must name `openai`
-   (`session_meta.model_provider` in its rollout) and show the requested sandbox for every turn.
-   A missing record also counts as unverified.
+   (`session_meta.model_provider` in its rollout) and show the requested sandbox and network
+   access for every turn. A missing record also counts as unverified.
 
 The keeper and reconciliation name the outcome through one function. The guard result is
 therefore the same even when the keeper died before committing: the init event is re-read
@@ -280,7 +290,8 @@ Limits:
 ## Safety and liveness
 
 **Safety.** These hold on any schedule of crashes:
-- no fabricated success (an outcome needs the CLI's own result);
+- no fabricated success (an outcome needs the CLI's own result; with `require_completion_marker`,
+  `succeeded` also needs the CLI's own complete marker);
 - no loss of a committed terminal state or event (no delete paths: `test_ledger_code_never_deletes`);
 - no automatic re-run;
 - at most one CLI per attempt;

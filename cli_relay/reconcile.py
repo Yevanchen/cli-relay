@@ -88,6 +88,8 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
                               cancel_requested=cancel_requested, guard=(exit_info or {}).get("billing_guard"),
                               sandbox=engines.requested_sandbox(engine, payload),
                               allow_full_access=engines.full_access_enabled(engine, payload),
+                              allow_network=engines.network_enabled(engine, payload),
+                              require_completion_marker=engines.completion_marker_required(payload),
                               permission_checkpoint=_evidence(att).get("codex_permission_checkpoint"),
                               resume_session_id=att["resume_session_id"])
 

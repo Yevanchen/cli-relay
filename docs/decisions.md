@@ -131,8 +131,8 @@ Constraints we accept:
   - *Not* `--bg`: background sessions do not hand back the CLI exit code or the final `result` event to the caller.
   - The native supervisor may restart sessions on its own, so relay-level submit counts would not bound native executions.
   - `claude agents --help` needed interactive approval on the target machine, so that interface could not be verified there.
-- **Codex:** `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, with the prompt on stdin. `<s>` defaults to `read-only`; `workspace-write` or explicitly opted-in `danger-full-access` may be requested (D8).
-  - Resume uses `codex exec --sandbox <s> resume -c sandbox_mode="<s>" --json -o <file> <exact uuid> -`; never `--last`.
+- **Codex:** `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, with the prompt on stdin. `<s>` defaults to `read-only`; `workspace-write` or explicitly opted-in `danger-full-access` may be requested (D8). A `workspace-write` run also gets `-c sandbox_workspace_write.network_access=<n>`, `false` unless the task opts in with `allow_network=true` (D15).
+  - Resume uses `codex exec --sandbox <s> resume -c sandbox_mode="<s>" [-c sandbox_workspace_write.network_access=<n>] --json -o <file> <exact uuid> -`; never `--last`.
   - `codex exec resume` has no sandbox option of its own. Without the pin it takes the sandbox from the configuration of the moment (Codex 0.163.0; audit #2). The exec-level `--sandbox` before `resume` is accepted by the installed CLI.
   - *Not* the app-server: it would need a resident server, which is the Agenvo route.
 - **Fixture:** a deterministic local program speaking the same event format, used by tests, CI and the soak run.
@@ -186,6 +186,10 @@ notifications expose `sandbox` and `full_access` as requested permissions, inclu
 attempts blocked before spawn. `doctor` explains the opt-in, default, and risk. No schema
 migration, dedupe, ACK, or notifier transport change is needed.
 
+Network access in `workspace-write`, which a local test server needs even for loopback, has its
+own typed opt-in, `allow_network=true`, accepted only with `sandbox="workspace-write"`. It never
+selects full access; the record and the trade-offs are in D15.
+
 Claude adds no tool by default. `WebSearch` and `WebFetch` need permission, so under `dontAsk`
 a research task without an allow rule for them ends `needs_input` with a structured denial
 (issue #6). A task may opt in with the typed list `allowed_tools`, for example
@@ -216,8 +220,9 @@ Permission prompts that no host can answer are denied (`--permission-prompts non
 A Claude run with structured denials ends as `needs_input`, even if it also reports an
 error, and is never auto-approved. A Claude configuration or init event in
 `bypassPermissions` mode is blocked, because then nothing would be denied. Codex reports
-no structured denial in `exec --json`, so a Codex outcome follows its own result. The
-Codex sandbox is always explicit (`read-only` by default).
+no structured denial in `exec --json`, so a Codex outcome follows its own result, unless the
+task requires the completion marker (D15). The Codex sandbox is always explicit (`read-only` by
+default).
 
 Before spawning, the keeper refuses (`blocked`) when it sees:
 - API-key or gateway environment variables (names are reported, values never);
@@ -434,3 +439,87 @@ repairs keep the existing CLI, SQLite ledger and adapters; they add no gateway o
 Merge checks are isolated regressions, the complete suite and CI for the fixed code. Real
 Grok chat delivery, the two host installations, exact model/Max settings and the 30-minute
 window remain deployment checks. The 25-hour soak remains uncompleted and nonblocking.
+
+## D15. Issue #7: network in Codex `workspace-write`, and "not done" is not `succeeded`
+
+**Problem.** A Codex task with `sandbox="workspace-write"` ran this repository's full test suite.
+The 32 tests that start a local fake webhook could not bind `127.0.0.1` and errored (203/235).
+Codex named that as an open item in its final message but ended its turn normally, so the task was
+`succeeded`, and a consumer could take it for finished work. Such tests could only run outside the
+relay or with `danger-full-access`.
+
+**Evidence** (target machine, Codex 0.163.0; no model call was made):
+- `codex sandbox -c sandbox_mode="workspace-write" -- python3 -c <bind 127.0.0.1, connect, echo>`
+  fails with `PermissionError` (EPERM), and so does the same with
+  `-c sandbox_workspace_write.network_access=false`. With `...=true` the bind and the loopback round
+  trip work. `read-only` blocks it with or without that setting.
+- `codex exec --help` and `codex exec resume --help` both accept `-c key=value`.
+- This machine's thread rollouts record a `workspace-write` turn as
+  `{"type": "workspace-write", "network_access": false, …}` (a boolean); `read-only` and
+  `danger-full-access` turns have no network key. Only key names and value types were read.
+
+**Decision 1: a typed per-task network opt-in, explicit in both directions.**
+- `allow_network=true` with `sandbox="workspace-write"` adds
+  `-c sandbox_workspace_write.network_access=true` to the first run and to every exact resume. The
+  sandbox stays `workspace-write`; full access is never selected.
+- Without the opt-in, every `workspace-write` run gets `...=false`. Like the sandbox itself (D6, audit
+  #2), a relay task's network access does not depend on the configuration of the moment. Before this
+  change, a user, project or profile layer with `[sandbox_workspace_write] network_access = true` could
+  give every `workspace-write` task the network without the task asking. Compatibility: a machine that
+  relied on that now needs the option per task. `doctor --engine codex` shows whether a layer sets it.
+- With `read-only` (the default) and with `danger-full-access` the option is a usage error, not ignored.
+  The setting has no effect under `read-only` (shown above). Full access already includes the network,
+  and accepting `allow_network=false` there would suggest a restriction that does not exist.
+  `allow_full_access` alone is accepted as harmless (D8); `allow_network` is not, because "the network
+  was allowed, but nothing changed" is the very misunderstanding of this issue.
+- The option is named after the network, not loopback: Codex has no loopback-only setting, so the opt-in
+  also allows outbound connections. That is the risk accepted per task; writes stay limited to the
+  workspace.
+- Argv checks accept exactly the value built from the validated options: `true` with the opt-in, `false`
+  for other `workspace-write` tasks, none for the other sandboxes. Every other `-c` override is still
+  refused, and no option passes arbitrary config.
+- After the run, every turn in the rollout must show no network access unless the task asked for it (a
+  missing key or `false`; any other value counts as on); otherwise the attempt is `blocked`
+  (`network_not_as_requested`). This also catches a layer that the `-c` pin may not override, such as a
+  managed configuration. A thread whose earlier turns had the network (from before this change) blocks a
+  later resume without the opt-in, as an earlier, wider sandbox would.
+- Payload, hash, receipts, status, events and notifications follow D8. `network_access` is `true` for
+  opted-in `workspace-write` and for opted-in full access.
+
+**Decision 2: success can require the CLI's own completion marker (opt-in, any engine).**
+
+Options considered:
+1. *`verify_command`: the relay runs a command after the CLI.* Rejected. A command chosen per task is a
+   second execution path outside the CLI's sandbox and permission model, with its own side effects,
+   environment and exit-code meaning; the relay would become a CI runner.
+2. *Searching the result text for failure words* ("failed", "open item", "could not"). Rejected: it
+   guesses what the model meant. "Fixed the failing test" contains "failing", while "32 tests errored"
+   contains none of the words, and both mistakes are silent.
+3. *A negative marker* (an `incomplete` line gives `needs_input`, anything else stays as it is). Rejected
+   as fail-open: a run that forgets the line, or stops before writing it, still looks done.
+4. *Codex `--output-schema` with a fixed status schema.* Not chosen now. It is Codex-only, it turns the
+   final message into JSON for every consumer, and its behaviour on the installed CLI, resume included,
+   could not be shown without model calls. It remains a way to make the report harder to omit.
+5. **Chosen: a positive marker.** With `require_completion_marker=true`, a run that would end
+   `succeeded` does so only if the last non-empty line of the CLI's final message is exactly
+   `CLI-RELAY-STATUS: complete`. `CLI-RELAY-STATUS: incomplete`, any other last line and no final message
+   give `needs_input`. This fails closed: a forgotten line can cost a false `needs_input`, never a false
+   `succeeded`.
+
+Details and limits:
+- `needs_input`, not `failed`: the CLI ended its turn normally (`native_ok` stays true, the exit code is
+  0). What is left is a decision for the dispatcher or a person, as for a Claude permission denial;
+  `failed` keeps meaning that the CLI's own result is an error. `needs_input` wakes the consumer by
+  default, and `resume` can continue the session.
+- Only that one line is read, compared exactly after trimming whitespace: no case folding, no Markdown
+  stripping, no search anywhere else, so quoting the instruction mid-message does not count.
+- The marker never changes `failed`, `blocked`, `cancelled` or a denial's `needs_input`, and never makes
+  anything `succeeded`.
+- The keeper and reconciliation decide through the same function (as in D8), so a keeper crash gives the
+  same outcome. The evidence records `completion_check`, and event bodies name the marker, because the
+  line is usually past the 2000-character excerpt.
+- Opt-in, not a default: a default would turn every existing dispatch whose prompt does not ask for the
+  line into `needs_input`. The relay never edits a prompt (the stored prompt is the one the CLI gets), so
+  the dispatcher asks for the line, in resume prompts too.
+- A self-report is not a verification. A CLI can claim `complete` wrongly, and the relay still does not
+  decide business acceptance (D9). The marker only lets the CLI's own "not done" stop a `succeeded`.
