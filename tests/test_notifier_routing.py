@@ -15,6 +15,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from notify_helpers import write_config
 
 from cli_relay import cli, notify
 from cli_relay.ledger import FORMAT, NOTIFIER_DDL, SCHEMA, Ledger, init_ledger, now_iso
@@ -51,7 +52,7 @@ class ImmutableNotificationOwners(unittest.TestCase):
         return raw
 
     def write_config(self, raw: dict) -> None:
-        (self.home / "notifier.json").write_text(json.dumps(raw))
+        write_config(self.home, raw)
 
     def command(self, *args: str, expected=0) -> dict:
         output = io.StringIO()
@@ -149,7 +150,10 @@ class ImmutableNotificationOwners(unittest.TestCase):
         self.assertEqual(self.events()[0]["route"], "a")
 
     def test_preconfiguration_explicit_route_wins_over_later_default(self) -> None:
-        task = self.submit(route="a")
+        # Historical tasks could reserve a route before any configuration existed. New
+        # submit commands require a registered, proven route, but old reservations still bind.
+        _, task, _ = self.ledger.submit(scope="default", key="k", prompt="p", native_session_id=None,
+            payload={"engine": "fixture", "cwd": str(self.work), "prompt": "p", "options": {}}, notify_route="a")
         self.config(default="b")
         self.finish(task)
         self.assertEqual(self.events()[0]["route"], "a")

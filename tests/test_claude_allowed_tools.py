@@ -14,6 +14,7 @@ from unittest.mock import patch
 from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config
 from test_audit_03_provider_bypass import fake_claude
 
+from notify_helpers import write_config
 from cli_relay import engines, notify
 from cli_relay.errors import UsageError
 from cli_relay.ledger import payload_hash
@@ -305,9 +306,9 @@ class AllowedToolsRoundTrip(RelayTestCase):
         self.assertNotIn("--settings", call)
         self.assertEqual(self.settings.read_text(), saved, "global settings are never changed")
 
-        (self.home / "notifier.json").write_text(json.dumps({"source_id": "test-host", "default_route": "bot",
+        write_config(self.home, {"source_id": "test-host", "default_route": "bot",
             "routes": {"bot": {"consumer": "bot", "chat": "test chat",
-                               "adapter": {"type": "command", "argv": ["/usr/bin/false"]}}}}))
+                               "adapter": {"type": "command", "argv": ["/usr/bin/false"]}}}})
         with patch("cli_relay.notify.send", return_value={"outcome": "handed_off"}) as send:
             notify.flush(self.home, env=self.env)
         send.assert_called_once()

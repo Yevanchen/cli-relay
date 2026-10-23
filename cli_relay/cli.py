@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import __version__, engines, notify, procs
+from . import __version__, engines, notify, procs, routes
 from .errors import NotFound, Refused, RelayError, UsageError
 from .keeper import _hook
 from .ledger import Ledger, init_ledger
@@ -95,6 +95,35 @@ def _loads(text: Optional[str]) -> Any:
         return {"unparsable": text[:200]}
 
 
+def _parse_origin(raw: Optional[str]) -> Dict[str, Any]:
+    if raw is None:
+        return {}  # preserve the old payload, hash, and output shape byte for byte
+    if len(raw.encode("utf-8")) > 4096:
+        raise UsageError("--origin must be at most 4096 UTF-8 bytes")
+
+    def unique_pairs(pairs):
+        out = {}
+        for key, value in pairs:
+            if key in out:
+                raise ValueError("duplicate key")
+            out[key] = value
+        return out
+
+    try:
+        origin = json.loads(raw, object_pairs_hook=unique_pairs)
+    except ValueError as exc:
+        raise UsageError('--origin must be a JSON object with bot and chat') from exc
+    if not isinstance(origin, dict) or set(origin) != {"bot", "chat"}:
+        raise UsageError("--origin requires exactly bot and chat")
+    if not isinstance(origin["bot"], str) or not _NAME_RE.fullmatch(origin["bot"]):
+        raise UsageError("origin.bot must be 1-64 chars of [A-Za-z0-9._:@/+-]")
+    chat = origin["chat"]
+    if (not isinstance(chat, str) or not 1 <= len(chat) <= 256 or chat != chat.strip()
+            or any(not ch.isprintable() for ch in chat)):
+        raise UsageError("origin.chat must be 1-256 printable chars without surrounding whitespace")
+    return {"origin": origin}
+
+
 def attempt_view(a: Dict[str, Any], probe: bool = True) -> Dict[str, Any]:
     active = a["state"] in ("claimed", "running")
     keeper_alive = procs.same_process_alive(a["keeper_pid"], a["keeper_token"]) if probe and active else None
@@ -120,6 +149,7 @@ def task_view(ledger: Ledger, task_id: str, probe: bool = True) -> Dict[str, Any
         "task": {k: t[k] for k in ("task_id", "scope", "engine", "cwd", "state", "current_attempt", "submit_count",
                                    "payload_sha256", "created_at", "updated_at")} | {
                                        "key": t["request_key"], "options": payload.get("options", {}),
+                                       **({"origin": payload["origin"]} if "origin" in payload else {}),
                                        **engines.request_details(t["engine"], payload)},
         "attempts": [attempt_view(a, probe) for a in ledger.attempts(task_id)],
         "events": [{"event_id": e["event_id"], "attempt_no": e["attempt_no"], "kind": e["kind"],
@@ -155,7 +185,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     prompt = _read_prompt(args)
     cwd = os.path.realpath(args.cwd)
     options = engines.validate_options(engine, _parse_options(args.option))
-    payload = {"engine": engine, "cwd": cwd, "prompt": prompt, "options": options}
+    payload = {"engine": engine, "cwd": cwd, "prompt": prompt, "options": options, **_parse_origin(args.origin)}
     ledger = Ledger(args.home, integrity=True)
     existing = None
     try:
@@ -173,11 +203,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # notifier configuration changed after the original transaction committed.
         cfg = notify.load_config(args.home) if notify.configured(args.home) else None
         if args.notify_route is not None:
+            if cfg is None:
+                raise Refused("route_not_configured", "register and verify a route before submitting with --notify-route")
             route = _check_route(args.notify_route, cfg)
         if cfg is not None:
             route = route if route is not None else cfg["default_route"]
             if route is not None:
                 owner = cfg["routes"][route]
+                routes.require_proven(owner)
                 consumer, chat = owner["consumer"], owner["chat"]
             bound = True
     native_sid = str(uuid.uuid4()) if engine in ("claude", "fixture") else None
@@ -203,6 +236,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     emit({"ok": True, "accepted": True, "status": status, "task_id": task["task_id"], "state": task["state"],
           "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
           "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper,
+          **({"origin": payload["origin"]} if "origin" in payload else {}),
           **engines.request_details(task["engine"], json.loads(task["payload_json"])),
           "notify_route": task.get("notify_route"), "notify_consumer": task.get("notify_consumer"),
           "notify_chat": task.get("notify_chat"), "notify_bound": task.get("notify_bound") == 1,
@@ -213,7 +247,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
 
 def _check_route(route: str, cfg: Optional[Dict[str, Any]] = None) -> str:
-    if not notify.ROUTE_RE.match(route or ""):
+    if not notify.ROUTE_RE.fullmatch(route or ""):
         raise UsageError("invalid --notify-route: use 1-32 chars of [A-Za-z0-9._-]")
     if cfg is not None:
         if route not in cfg["routes"]:
@@ -412,9 +446,11 @@ def cmd_resume(args: argparse.Namespace) -> int:
         keeper = "spawned"
     except SpawnFailed:
         keeper = "spawn_failed_run_reconcile"
+    payload = json.loads(task["payload_json"])
     emit({"ok": True, "task_id": task_id, "attempt_no": new["attempt_no"], "attempt_id": new["attempt_id"],
           "reason": reason, "resume_session_id": resume_sid, "previous_attempt_stopped": proof, "keeper": keeper,
-          **engines.request_details(task["engine"], json.loads(task["payload_json"]))})
+          **({"origin": payload["origin"]} if "origin" in payload else {}),
+          **engines.request_details(task["engine"], payload)})
     return 0
 
 
@@ -494,6 +530,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except RelayError as exc:
         out["ok"] = False
         out["ledger"] = {"home": str(args.home), "error": exc.code, "message": exc.message}
+    try:
+        out["notifier"] = routes.doctor(args.home, dict(os.environ))
+        out["ok"] = out["ok"] and out["notifier"]["ok"]
+    except RelayError as exc:
+        out["ok"] = False
+        out["notifier"] = {"ok": False, "error": exc.code}
     if args.engine:
         cwd = args.cwd or os.getcwd()
         pf = engines.preflight(engines.validate_engine(args.engine), dict(os.environ), cwd=cwd)
@@ -559,6 +601,27 @@ def cmd_notify_bind_owner(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_route(args: argparse.Namespace) -> int:
+    if args.route_cmd == "add":
+        adapter = {"type": "http", "timeout_s": args.timeout}
+        adapter.update({key: getattr(args, key) for key in ("url_env", "url_file", "token_env", "token_file")
+                        if getattr(args, key) is not None})
+        result = routes.add(args.home, args.name, consumer=args.consumer, chat=args.chat,
+                            adapter=adapter, source_id=args.source_id)
+    elif args.route_cmd == "list":
+        result = routes.list_routes(args.home)
+    elif args.route_cmd == "remove":
+        result = routes.remove(args.home, args.name)
+    elif args.route_cmd == "set-default":
+        result = routes.set_default(args.home, args.name)
+    else:
+        result = routes.verify(args.home, args.name, retry=args.retry)
+        emit({"ok": result["proven"], **result})
+        return 0 if result["proven"] else 6
+    emit({"ok": True, **result})
+    return 0
+
+
 # ------------------------------------------------------------------------------- parser
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # type: ignore[override]
@@ -582,6 +645,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--prompt-file")
     s.add_argument("--option", action="append", default=[], metavar="KEY=VALUE")
     s.add_argument("--notify-route", help="route in notifier.json that is woken when the task ends")
+    s.add_argument("--origin", metavar='JSON', help='optional origin metadata: {"bot":"NAME","chat":"ID"}')
     s.set_defaults(func=cmd_submit)
 
     for name, func, helptext in (("status", cmd_status, "show a task (reconciles first)"),
@@ -662,6 +726,29 @@ def build_parser() -> argparse.ArgumentParser:
     nb.add_argument("--consumer", required=True)
     nb.add_argument("--chat", required=True)
     nb.set_defaults(func=cmd_notify_bind_owner)
+
+    route = sub.add_parser("route", help="register and verify per-task notification routes")
+    route_sub = route.add_subparsers(dest="route_cmd", required=True)
+    ra = route_sub.add_parser("add", help="idempotently register an unproven HTTP route using secret references")
+    ra.add_argument("name")
+    ra.add_argument("--source-id", help="required when creating notifier.json; unique per machine")
+    ra.add_argument("--consumer", required=True)
+    ra.add_argument("--chat", required=True)
+    for kind in ("url", "token"):
+        reference = ra.add_mutually_exclusive_group(required=True)
+        reference.add_argument(f"--{kind}-env", metavar="NAME")
+        reference.add_argument(f"--{kind}-file", metavar="ABSOLUTE_PATH")
+    ra.add_argument("--timeout", type=float, default=20, help="adapter timeout in seconds (1-600)")
+    ra.set_defaults(func=cmd_route)
+    route_sub.add_parser("list", help="list routes, references and verification receipts").set_defaults(func=cmd_route)
+    for command, helptext in (("remove", "remove a route and clear it as default; keep task events"),
+                               ("set-default", "choose a proven route as the default"),
+                               ("verify", "send one due visible-message probe; return its persisted receipt")):
+        rp = route_sub.add_parser(command, help=helptext)
+        rp.add_argument("name")
+        if command == "verify":
+            rp.add_argument("--retry", action="store_true", help="explicitly grant a failed verification a new budget/id")
+        rp.set_defaults(func=cmd_route)
 
     k = sub.add_parser("_keeper", help="(internal) supervise one attempt")
     k.add_argument("task_id")
