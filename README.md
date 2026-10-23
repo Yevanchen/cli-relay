@@ -131,12 +131,21 @@ cli-relay --home /path/to/ledger route remove github
 # cli-relay --home /path/to/ledger notify retry --event e-...
 ```
 
-Registration is idempotent: identical settings keep the receipt; conflicting settings are
+Managed registration is idempotent: identical settings keep the receipt; conflicting settings are
 refused. New routes are **unproven**, and neither explicit `--notify-route` nor default routing
-can use them for new tasks. There is no bypass flag. **Upgrade:** configurations without a
-verification receipt are also unproven; existing routes must pass the new protocol before new
-task submissions use them. A duplicate submission still recovers its original receipt even if
-the route has since disappeared. Removal clears that default, but keeps tasks, events and ACKs.
+can use them for new tasks. New routes need Evan's approval and a separate acceptance step with
+`route verify`. There is no bypass flag. A duplicate submission still recovers its original
+receipt even if the route has since disappeared. Removal clears that default, but keeps tasks,
+events and ACKs.
+
+**Upgrade:** leave the live route configuration unchanged. Routes with **no `verification` key**,
+including the installer's existing `friday` route, keep working for explicit/default submissions,
+delivery and bounded reminders. `doctor` reports `proven: true, proof: legacy_config`; loading
+the configuration does not rewrite it. No receipt or installer-template change is needed.
+An explicit `verification: null` or pending verification is **not** exempt. Re-registering a
+legacy route with `route add`, even with identical settings, drops the exemption; changing its
+settings requires remove/add and then verification. Managing another route preserves the
+untouched legacy route's exemption.
 
 `--origin` requires exactly `bot` (1–64 characters from `[A-Za-z0-9._:@/+-]`) and `chat`
 (1–256 printable characters, no surrounding whitespace), in at most 4096 UTF-8 bytes of JSON.

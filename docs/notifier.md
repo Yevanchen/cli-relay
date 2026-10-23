@@ -113,11 +113,21 @@ Private to each machine. Never commit it. Keep it readable only by its owner (`c
   (absolute paths). They are read at send time and never printed or logged.
 - An invalid file is refused as a whole (exit 2, key names only) and nothing is sent.
 
-The example above is **unproven** until `route verify bot` succeeds. No configuration without a
-verification receipt is grandfathered in as proven. Set its default with `route set-default bot`
-only afterwards. Existing command adapters must implement the verification response below;
-ordinary `notify.sh` exit 0 cannot verify a route. Task sends still use the original five-field
-interface and their transport acceptance remains separate from the task consumer's ACK.
+The example above shows the legacy layout: a route with **no `verification` key** remains usable
+for explicit/default submissions, task delivery and bounded reminders. This preserves the deployed
+installer's `friday` route without changing notifier.json's format, its file bytes or the installer
+template. Loading, listing and diagnosing the configuration do not rewrite it. Leave the live
+route configuration unchanged on upgrade; do not add a receipt or re-register it as an upgrade step.
+`doctor` reports `proven: true, proof: legacy_config`, which denotes compatibility rather than a
+new visible-message receipt. An explicit `verification: null` or any unfinished verification is
+**not** legacy and cannot bypass proof requirements.
+
+Use `route add` for new routes. It writes `verification: null`, so they remain **unproven** until
+`route verify` succeeds. New routes need Evan's approval and a separate acceptance step before
+task use or default selection. A command route using this verification flow must implement the
+response below; ordinary `notify.sh` exit 0 cannot verify it. Legacy command adapters keep working
+with their original five-field task interface. Transport acceptance remains separate from the
+task consumer's ACK.
 
 ### Registration and visible-message verification
 
@@ -128,8 +138,11 @@ registers an HTTP route in `<home>/notifier.json`. The first registration additi
 owned by the current user. Registration checks the reference, not its contents, and makes no
 network call. `--timeout` sets the adapter timeout (1–600 seconds, default 20).
 
-- Identical registrations do not rewrite the configuration or reset verification/retry state.
-  Changes to an existing registration are refused; remove and re-add deliberately. Removing the
+- Identical managed registrations do not rewrite the configuration or reset verification/retry
+  state. Re-registering a legacy route, even with identical settings, writes `verification: null`
+  and drops its exemption; it then needs verification. Changes to an existing registration are
+  refused; remove and re-add deliberately, which also requires verification. Changes to other
+  routes preserve the untouched legacy route's missing verification key and exemption. Removing the
   last route leaves an empty route map, and removing a default clears that default. Task ownership
   is never rewritten. In-flight notifier passes may still finish using their previous snapshot.
 - All managed writes are atomic (file and directory fsync) with mode `0600`. A home-local
@@ -138,8 +151,9 @@ network call. `--timeout` sets the adapter timeout (1–600 seconds, default 20)
 - Only non-secret settings, credential reference names/paths and the latest verification receipt
   are stored. URL/token values and raw receiver responses never enter the configuration, receipt,
   log or CLI output. `route list` shows references and proof state without resolving secrets.
-  `doctor` shows each name, `proven`, and `secret_resolved: {"url": true, "token": false}` for
-  HTTP routes, with booleans only. Command adapters own their credentials, so that map is empty.
+  `doctor` shows each name, `proven`, `proof` (`legacy_config`, `receipt` or `unproven`), and
+  `secret_resolved: {"url": true, "token": false}` for HTTP routes, with booleans only for secret
+  resolution. Command adapters own their credentials, so that map is empty.
   Unproven routes are informational unless configured as a default; an unusable default or an
   unresolved HTTP credential reference makes doctor exit 6.
 - `route set-default NAME` and new `submit --notify-route NAME` require a proven route; new
@@ -177,8 +191,9 @@ returns a run id needs a bridge implementing this protocol; this change does not
 
 After validating the receipt, the relay records `state=acked`, `message_id` and `acked_at`, then
 the route becomes proven. This is the probe's ACK, not an ACK of any task event. The receipt is
-in `routes.NAME.verification` in notifier.json and in the command output. `proven` is derived
-from that receipt, its ledger id, and a SHA-256 of the source, route name, owner and adapter references/settings.
+in `routes.NAME.verification` in notifier.json and in the command output. For managed routes,
+`proven` is derived from that receipt, its ledger id, and a SHA-256 of the source, route name,
+owner and adapter references/settings.
 Editing any of those invalidates the proof. Rotating secret contents behind unchanged references
 does not invalidate it. A receipt copied to another ledger is unproven. Use distinct `source_id`s
 per machine. These files are operator-owned state, not a security boundary against that user.
@@ -193,7 +208,8 @@ probes and task notifications, but their counters are separate. A crash after th
 `sending` state consumes one attempt and one possible wake; no immediate resend is allowed.
 After `failed`/`unacknowledged`, `route verify NAME --retry` explicitly starts a new id and budget.
 `notify run` does not drive verification probes: invoke verify again when the receipt is due.
-Already-proven verification is a no-send, idempotent read.
+Already-proven verification, including a legacy route, is a no-send, idempotent read; it does
+not write a receipt into a legacy configuration.
 
 For task events whose route loses proof, readiness checks consume the same exponential-backoff
 attempt budget without invoking the adapter or recording a transport send. Events remain in
@@ -345,9 +361,11 @@ reminders, and it catches up after a restart.
    machine, with its own `source_id` and destination, and make it owner-readable only. Once the
    file exists, a completing keeper can start an immediate pass even before the periodic service
    starts. Prefer `route add` for a new HTTP route; preserve existing credential references and
-   do not publish the configuration. A new or legacy route stays unproven until its receiver
-   implements the protocol above and `route verify` passes with an approved visible test.
-   Only then select it with `route set-default` or submit tasks using `--notify-route`.
+   do not publish the configuration. On upgrade, keep the existing installer-managed `friday`
+   configuration byte-for-byte unchanged: its absent `verification` key preserves current use.
+   New routes need Evan's approval and a separate acceptance step: their receiver must implement
+   the protocol above and `route verify` must pass with an approved visible test. Only then select
+   a new route with `route set-default` or submit tasks using `--notify-route`.
 5. **Start the periodic pass**, for example a launchd agent running
    `cli-relay --home <home> notify run --interval 60` with `KeepAlive`.
 6. **Check one real task per machine.** Confirm the correct original chat receives its result,

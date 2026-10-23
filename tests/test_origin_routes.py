@@ -16,7 +16,7 @@ from unittest import mock
 from helpers import RelayTestCase, db_rows, side_effects
 from notify_helpers import http_config, write_config
 from cli_relay import cli, notify, routes
-from cli_relay.ledger import Ledger, init_ledger, payload_hash
+from cli_relay.ledger import Ledger, init_ledger, now_iso, payload_hash
 
 TOKEN = "SYNTHETIC_SECRET_NEVER_PERSIST_77"
 URL = "http://127.0.0.1:1/SYNTHETIC_PRIVATE_URL_88"
@@ -152,6 +152,8 @@ class RouteAndOriginTests(unittest.TestCase):
         self.assertTrue(first["created"])
         self.assertFalse(again["created"])
         self.assertFalse(first["route"]["proven"])
+        self.assertIn("verification", self.raw()["routes"]["bot"])
+        self.assertIsNone(self.raw()["routes"]["bot"]["verification"])
         self.assertEqual((self.home / "notifier.json").read_bytes(), before)
         self.assertEqual(stat.S_IMODE((self.home / "notifier.json").stat().st_mode), 0o600)
         self.assertIsNone(self.raw()["default_route"])
@@ -201,11 +203,148 @@ class RouteAndOriginTests(unittest.TestCase):
     def test_doctor_reports_names_proof_and_only_boolean_secret_resolution(self):
         self.add()
         row = self.command("doctor")["notifier"]["routes"][0]
-        self.assertEqual(row, {"name": "bot", "proven": False, "secret_resolved": {"url": True, "token": True}})
+        self.assertEqual(row, {"name": "bot", "proven": False, "proof": "unproven",
+                               "secret_resolved": {"url": True, "token": True}})
         with mock.patch.dict(os.environ, {"ROUTE_TOKEN": ""}):
             self.assertFalse(self.command("doctor", expected=6)["notifier"]["routes"][0]["secret_resolved"]["token"])
         self.command("route", "verify", "bot")
-        self.assertTrue(self.command("doctor")["notifier"]["routes"][0]["proven"])
+        row = self.command("doctor")["notifier"]["routes"][0]
+        self.assertTrue(row["proven"])
+        self.assertEqual(row["proof"], "receipt")
+        self.no_secret_persisted()
+
+    def legacy_config(self, *, http=False):
+        # Installer layout: one Friday route, no verification key. All identifiers and
+        # references are synthetic; never load either Mac's live configuration.
+        adapter = {"type": "http", "url_env": "ROUTE_URL", "token_env": "ROUTE_TOKEN"} if http else {
+            "type": "command", "argv": ["/bin/true"], "job": "CLI_RELAY"}
+        raw = {"source_id": "mac-test", "default_route": "friday",
+               "routes": {"friday": {"consumer": "friday", "chat": "target-chat", "adapter": adapter}},
+               "notify_outcomes": ["succeeded", "failed", "blocked", "needs_input", "unknown"],
+               "retry": {"max_attempts": 6, "base_delay_s": 30, "max_delay_s": 1800},
+               "reminder": {"ack_timeout_s": 1800, "max_wakes": 2}}
+        (self.home / "notifier.json").write_text(json.dumps(raw, indent=2) + "\n")
+        return raw
+
+    def test_installer_template_friday_submits_delivers_and_keeps_config_bytes(self):
+        self.legacy_config()
+        path = self.home / "notifier.json"
+        before, mtime = path.read_bytes(), path.stat().st_mtime_ns
+        self.assertTrue(notify.load_config(self.home)["routes"]["friday"]["proven"])
+        row = self.command("doctor")["notifier"]["routes"][0]
+        self.assertEqual(row, {"name": "friday", "proven": True, "proof": "legacy_config", "secret_resolved": {}})
+        self.assertTrue(self.command("route", "list")["routes"][0]["proven"])
+        self.assertFalse(self.command("route", "set-default", "friday")["changed"])
+        self.assertFalse(self.command("route", "verify", "friday")["sent"])
+
+        tasks = [self.submit("explicit", route="friday"), self.submit("default")]
+        expected = {"engine": "fixture", "cwd": os.path.realpath(self.root), "prompt": "p", "options": {}}
+        for sub in tasks:
+            self.assertEqual((sub["notify_route"], sub["notify_consumer"], sub["notify_chat"]),
+                             ("friday", "friday", "target-chat"))
+            self.assertNotIn("origin", sub)
+            self.assertEqual(sub["payload_sha256"], payload_hash(expected))
+            self.assertEqual(json.loads(self.ledger.get_task(sub["task_id"])["payload_json"]), expected)
+        events = [self.finish(sub) for sub in tasks]
+        with mock.patch.object(notify.subprocess, "run", return_value=mock.Mock(returncode=0)) as sender, \
+                mock.patch.object(notify, "build_payload", wraps=notify.build_payload) as build:
+            first = self.command("notify", "flush")
+            self.assertEqual(first["blocked"], [])
+            self.assertEqual(first["sends"][0]["outcome"], "handed_off")
+            self.assertEqual(set(first["sends"][0]["events"]), set(events))
+            refs = build.call_args.args[3]
+            self.assertTrue(all("origin" not in ref for ref in refs))
+            self.assertEqual(sender.call_args.args[0][:3], ["/bin/true", "CLI_RELAY", "mac-test/friday"])
+            self.assertNotIn("input", sender.call_args.kwargs, "legacy task sends keep the five-field interface")
+            self.assertEqual(self.command("notify", "flush")["sends"], [])
+            # An un-ACKed event still gets its due reminder after a fresh config load.
+            with self.ledger.tx() as c:
+                c.execute("UPDATE notifications SET next_at='2000-01-01T00:00:00.000Z'")
+            self.assertEqual(len(self.command("notify", "flush")["sends"]), 1)
+            self.assertTrue(build.call_args.kwargs["reminder"])
+            for sub, event in zip(tasks, events):
+                self.command("ack", "--consumer", "friday", "--task", sub["task_id"], "--attempt", "1",
+                             "--event", event)
+            self.assertEqual(self.command("notify", "flush")["sends"], [])
+            self.assertEqual(sender.call_count, 2)
+        self.assertEqual({row["state"] for row in notify.status(self.home)}, {"acked"})
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(path.stat().st_mtime_ns, mtime)
+        self.assertEqual(self.requests, [])
+        self.no_secret_persisted()
+
+    def test_legacy_with_explicit_null_or_pending_verification_is_not_exempt(self):
+        raw = self.legacy_config()
+        legacy_route = notify.validate_config(raw)["routes"]["friday"]
+        pending = {"verification_id": "v-" + "a" * 32,
+                   "route_sha256": notify.route_fingerprint(raw["source_id"], legacy_route),
+                   "ledger_id": self.ledger.ledger_id, "state": "pending", "attempts": 0, "wakes": 0,
+                   "next_at": now_iso(), "created_at": now_iso(), "message_id": None,
+                   "acked_at": None, "last_result": None}
+        # An existing main-era task/event must also stay unsent while proof is pending.
+        payload = {"engine": "fixture", "cwd": str(self.root), "prompt": "p", "options": {}}
+        _, task, _ = self.ledger.submit(scope="default", key="existing", payload=payload, prompt="p",
+                                      native_session_id=None, notify_route="friday", notify_consumer="friday",
+                                      notify_chat="target-chat", notify_bound=True)
+        attempt = self.ledger.current_attempt(task["task_id"])
+        self.ledger.finish(attempt["attempt_id"], from_states=("pending",), outcome="succeeded")
+        for verification in (None, pending):
+            with self.subTest(verification="null" if verification is None else "pending"):
+                raw["routes"]["friday"]["verification"] = verification
+                self.save(raw)
+                before = (self.home / "notifier.json").read_bytes()
+                self.assertFalse(notify.load_config(self.home)["routes"]["friday"]["proven"])
+                self.assertEqual(self.submit(route="friday", expected=6)["error"], "route_unproven")
+                self.assertEqual(self.submit(expected=6)["error"], "route_unproven")
+                self.command("route", "set-default", "friday", expected=6)
+                self.assertEqual(self.command("doctor", expected=6)["notifier"]["routes"][0]["proof"], "unproven")
+                with self.ledger.tx() as c:
+                    c.execute("UPDATE notifications SET next_at='2000-01-01T00:00:00.000Z'")
+                with mock.patch.object(notify, "send") as sender:
+                    result = self.command("notify", "flush")
+                sender.assert_not_called()
+                self.assertEqual(result["sends"], [])
+                self.assertEqual(result["blocked"][0]["why"], "route_unproven")
+                self.assertEqual((self.home / "notifier.json").read_bytes(), before)
+        self.spawn.assert_not_called()
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+
+    def test_readding_or_replacing_legacy_route_requires_verification(self):
+        self.legacy_config(http=True)
+        self.assertTrue(notify.load_config(self.home)["routes"]["friday"]["proven"])
+        result = self.add("friday")
+        self.assertFalse(result["created"])
+        self.assertFalse(result["route"]["proven"])
+        self.assertIn("verification", self.raw()["routes"]["friday"])
+        self.assertIsNone(self.raw()["routes"]["friday"]["verification"])
+        self.assertEqual(self.submit(route="friday", expected=6)["error"], "route_unproven")
+        self.assertEqual(self.submit(expected=6)["error"], "route_unproven")
+        self.command("route", "verify", "friday")
+        self.assertTrue(notify.load_config(self.home)["routes"]["friday"]["proven"])
+
+        self.legacy_config(http=True)
+        self.command("route", "remove", "friday")
+        changed = self.command("route", "add", "friday", "--consumer", "friday", "--chat", "new-chat",
+                               "--url-env", "ROUTE_URL", "--token-env", "ROUTE_TOKEN")
+        self.assertFalse(changed["route"]["proven"])
+        self.assertEqual(self.submit(route="friday", expected=6)["error"], "route_unproven")
+        self.no_secret_persisted()
+
+    def test_managing_another_route_preserves_legacy_exemption(self):
+        self.legacy_config(http=True)
+        self.add()
+        self.assertNotIn("verification", self.raw()["routes"]["friday"])
+        self.assertTrue(notify.load_config(self.home)["routes"]["friday"]["proven"])
+        self.assertFalse(notify.load_config(self.home)["routes"]["bot"]["proven"])
+        self.command("route", "verify", "bot")
+        self.command("route", "set-default", "bot")
+        self.command("route", "remove", "bot")
+        self.command("route", "set-default", "friday")
+        self.assertNotIn("verification", self.raw()["routes"]["friday"])
+        sub = self.submit()
+        self.finish(sub)
+        self.assertEqual(len(self.command("notify", "flush")["sends"]), 1)
+        self.assertEqual(self.requests[-1]["cli_relay"]["route"], "friday")
         self.no_secret_persisted()
 
     def test_unproven_default_and_explicit_route_are_rejected_before_task_commit(self):
@@ -340,8 +479,8 @@ class RouteAndOriginTests(unittest.TestCase):
         self.assertNotEqual(first["verification"]["verification_id"], second["verification"]["verification_id"])
         self.assertNotEqual(first["verification"]["ledger_id"], second["verification"]["ledger_id"])
 
-    def test_old_config_is_unproven_and_command_adapter_can_return_a_probe_receipt(self):
-        self.save({"source_id": "mac-test", "routes": {"bot": {"consumer": "bot", "chat": "target-chat",
+    def test_explicitly_unproven_command_adapter_can_return_a_probe_receipt(self):
+        self.save({"source_id": "mac-test", "routes": {"bot": {"consumer": "bot", "chat": "target-chat", "verification": None,
                    "adapter": {"type": "command", "argv": ["/bin/false"]}}}})
         self.assertFalse(self.command("route", "list")["routes"][0]["proven"])
 

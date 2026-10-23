@@ -51,13 +51,13 @@ def _get(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
 
 
 def _view(route: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: route[k] for k in ("name", "consumer", "chat", "proven", "verification")}
+    return {k: route[k] for k in ("name", "consumer", "chat", "proven")} | {"verification": route.get("verification")}
 
 
 def add(home: Path, name: str, *, consumer: str, chat: str, adapter: Dict[str, Any],
         source_id: Optional[str] = None) -> Dict[str, Any]:
     # Validation does not resolve secrets, or read the files they reference.
-    candidate = notify._route(name, {"consumer": consumer, "chat": chat, "adapter": adapter})
+    candidate = notify._route(name, {"consumer": consumer, "chat": chat, "adapter": adapter, "verification": None})
     with _locked(home):
         if notify.configured(home):
             cfg = notify.load_config(home)
@@ -72,6 +72,10 @@ def add(home: Path, name: str, *, consumer: str, chat: str, adapter: Dict[str, A
             fields = ("consumer", "chat", "adapter")
             if any(existing[k] != candidate[k] for k in fields):
                 raise Refused("route_conflict", "route already exists with different configuration; remove it first")
+            if "verification" not in existing:
+                # Explicit re-registration opts this route into the managed verification flow.
+                existing.update(verification=None, proven=False)
+                _save(home, cfg)
             return {"created": False, "route": _view(existing)}
         for key, value in candidate["adapter"].items():
             if key.endswith("_file"):
@@ -138,7 +142,8 @@ def doctor(home: Path, env: Dict[str, str]) -> Dict[str, Any]:
         adapter = route["adapter"]
         resolved = {kind: bool(notify._secret(adapter, kind, env)) for kind in ("url", "token")} \
             if adapter["type"] == "http" else {}
-        rows.append({"name": name, "proven": route["proven"], "secret_resolved": resolved})
+        proof = "legacy_config" if "verification" not in route else "receipt" if route["proven"] else "unproven"
+        rows.append({"name": name, "proven": route["proven"], "proof": proof, "secret_resolved": resolved})
     default = cfg["default_route"]
     default_usable = default is None or cfg["routes"][default]["proven"]
     return {"configured": True, "source_id": cfg["source_id"], "default_route": default,
@@ -149,7 +154,7 @@ def doctor(home: Path, env: Dict[str, str]) -> Dict[str, Any]:
 def _receipt(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, *, sent: bool) -> Dict[str, Any]:
     return {"source_id": cfg["source_id"], "ledger_id": ledger_id, "route": route["name"],
             "consumer": route["consumer"], "chat": route["chat"], "proven": route["proven"],
-            "sent": sent, "verification": route["verification"]}
+            "sent": sent, "verification": route.get("verification")}
 
 
 def verify(home: Path, name: str, *, retry: bool = False,
@@ -169,7 +174,7 @@ def verify(home: Path, name: str, *, retry: bool = False,
         finally:
             ledger.close()
         fingerprint = notify.route_fingerprint(cfg["source_id"], route)
-        state = route["verification"]
+        state = route.get("verification")
         if route["proven"]:
             return _receipt(cfg, route, ledger_id, sent=False)
         if retry and state and state["state"] not in ("failed", "unacknowledged"):

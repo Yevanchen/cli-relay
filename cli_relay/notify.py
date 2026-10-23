@@ -85,11 +85,12 @@ def load_config(home: Path) -> Dict[str, Any]:
     except (OSError, ValueError) as exc:
         raise _bad("unreadable or not JSON", error=type(exc).__name__) from exc
     cfg = validate_config(raw)
-    if any(route["proven"] for route in cfg["routes"].values()):
+    verified_routes = [route for route in cfg["routes"].values() if route["proven"] and route.get("verification")]
+    if verified_routes:
         ledger = Ledger(home)
         try:
-            for route in cfg["routes"].values():
-                route["proven"] = bool(route["proven"] and route["verification"]["ledger_id"] == ledger.ledger_id)
+            for route in verified_routes:
+                route["proven"] = route["verification"]["ledger_id"] == ledger.ledger_id
         finally:
             ledger.close()
     return cfg
@@ -113,9 +114,12 @@ def validate_config(raw: Any) -> Dict[str, Any]:
     if default_route is not None and (not isinstance(default_route, str) or default_route not in clean_routes):
         raise _bad("default_route is not one of the routes")
     for route in clean_routes.values():
-        verification = route["verification"]
-        route["proven"] = bool(verification and verification["state"] == "acked"
-                               and verification["route_sha256"] == route_fingerprint(source_id, route))
+        verification = route.get("verification")
+        # Installer-managed legacy routes have no verification key. Preserve their existing
+        # behavior without migrating the file; an explicit null or pending receipt is not legacy.
+        route["proven"] = "verification" not in route or bool(
+            verification and verification["state"] == "acked"
+            and verification["route_sha256"] == route_fingerprint(source_id, route))
     outcomes = raw.get("notify_outcomes", list(DEFAULT_OUTCOMES))
     if (not isinstance(outcomes, list) or not outcomes
             or any(o not in KNOWN_OUTCOMES for o in outcomes)):
@@ -151,8 +155,10 @@ def _route(name: str, spec: Any) -> Dict[str, Any]:
     chat = spec.get("chat", "")
     if not isinstance(chat, str) or len(chat) > 80 or any(not ch.isprintable() for ch in chat):
         raise _bad(f"route {name}: chat must be a short label")
-    return {"name": name, "consumer": consumer, "chat": chat, "adapter": _adapter(name, spec.get("adapter")),
-            "verification": _verification(spec.get("verification"))}
+    route = {"name": name, "consumer": consumer, "chat": chat, "adapter": _adapter(name, spec.get("adapter"))}
+    if "verification" in spec:
+        route["verification"] = _verification(spec["verification"])
+    return route
 
 
 def route_fingerprint(source_id: str, route: Dict[str, Any]) -> str:

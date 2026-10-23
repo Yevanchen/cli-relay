@@ -391,11 +391,14 @@ The [D16 workflow](decisions.md#d16-issue-4-registered-routes-visible-message-pr
 adds a separate probe receipt in home-local notifier.json. No execution-ledger migration is
 needed. Registration and verification use atomic, mode-0600 config replacement under a local
 lock. Only credential references and non-secret receipt fields are stored. Doctor resolves
-references locally and reports booleans; it sends nothing. Missing proof (including legacy
-configuration without a receipt) prevents new task submissions through that route.
+references locally and reports booleans; it sends nothing. New routes and routes with explicit
+null/pending verification require a receipt before task use. Legacy routes with no `verification`
+key retain existing behavior without rewriting their configuration; doctor reports `proof: legacy_config`.
 
 | Fault | Durable fact and next action | Local mock test |
 |---|---|---|
+| Installer's Friday route has no verification key | explicit/default submissions, delivery and reminders still work; config bytes stay unchanged | `test_installer_template_friday_submits_delivers_and_keeps_config_bytes` |
+| Legacy-shaped route has explicit null/pending verification | no exemption; new submissions refused and pending events not sent | `test_legacy_with_explicit_null_or_pending_verification_is_not_exempt` |
 | Verification returns 2xx without a matching visible-message id | unproven, possible wake consumed; wait for ACK timeout before any retry | `test_2xx_requires_visible_message_id_and_exact_probe_destination` |
 | Verifier dies during a send or before saving its reply | `sending` persisted first; recover as `unconfirmed`, retain id and budget, no immediate resend | `test_crashed_verifier_consumes_one_possible_wake_and_is_not_resent_at_once` |
 | Verification ACK response times out repeatedly | at most 2 possible wakes by default, then `unacknowledged`; receipt retained, explicit `route verify --retry` required | `test_verify_timeout_is_bounded_keeps_receipt_and_requires_explicit_new_budget` |
@@ -414,7 +417,7 @@ fresh budget. `route verify --retry` and `notify retry` are explicit operator ac
 
 Origin is optional canonical payload data, so it participates in conflict detection and survives
 resume and terminal/unknown event creation in the same transaction. It does not change the task's
-stored owner or give the receiver permission to execute text. A copied configuration/receipt is
+stored owner or give the receiver permission to execute text. A copied verification receipt is
 unproven in another ledger; use distinct source ids and verify each receiver.
 A receiver can falsely claim it has displayed a message, and an in-flight notifier may finish
 using its old config snapshot. This protocol checks a matching receipt, not human readership or

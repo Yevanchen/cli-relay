@@ -79,7 +79,7 @@ class LocalWebhook:
         (home / "acceptance-webhook-token").write_text("local-acceptance-token\n")
         (home / "notifier.json").write_text(json.dumps({
             "source_id": "acceptance", "default_route": "local",
-            "routes": {"local": {"consumer": CONSUMER, "chat": "local fake webhook", "adapter": {
+            "routes": {"local": {"consumer": CONSUMER, "chat": "local fake webhook", "verification": None, "adapter": {
                 "type": "http", "url_file": str(home / "acceptance-webhook-url"),
                 "token_file": str(home / "acceptance-webhook-token"), "timeout_s": 5}}},
             "reminder": {"ack_timeout_s": 3600, "max_wakes": 2}}))
