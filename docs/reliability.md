@@ -74,6 +74,17 @@ Three facts are stored separately and never substituted for one another:
   `CLI-RELAY-STATUS: complete` in the CLI's final message, and a run without it is `needs_input`.
   That is still the CLI's self-report, not acceptance ([`decisions.md`](decisions.md) D15).
 
+Git observations are separate attempt evidence, never an outcome gate or request-payload input.
+For a detected work tree, `git` contains `head_before`, `head_after` and the final `dirty` flag;
+unavailable observations are `null`. A dirty tree adds an `uncommitted_changes` warning,
+including when those changes predate the attempt. The keeper persists the initial snapshot
+before spawn and the final snapshot in `exit.json`. Reconciliation reuses the saved final
+snapshot; if the keeper died before saving one, it observes the tree after the processes stop.
+Git commands use argv, a two-second timeout per call, disabled optional index writes and
+disabled fsmonitor hooks. No paths, diffs, Git errors or tool inputs are added to events.
+Codex `workspace-write` leaves `.git` read-only and cannot commit; the caller must handle
+committing outside that sandbox.
+
 ## Persistence boundaries and crash windows
 
 The SQLite commit and the OS `spawn` cannot be atomic. The design makes the window between
@@ -184,8 +195,10 @@ Permission posture does not depend on the CLIs' configuration of the moment:
 - A Claude task adds no tool unless it opts in with `allowed_tools`, a list of exact names from a
   fixed allowlist (`WebSearch`, `WebFetch`). That adds one `--allowedTools` value for the task,
   on every attempt, and changes neither the mode nor any settings layer. Deny and ask rules of
-  every layer, and managed `allowManagedPermissionRulesOnly`, still win; a tool that stays denied
-  ends the task `needs_input`.
+  every layer, and managed `allowManagedPermissionRulesOnly`, still win. Native success plus a
+  known zero exit treats denied tools as `permission_denials` warnings (tool names only), with
+  the completion marker gate still applied. Otherwise denials mean `needs_input`. Cancellation
+  precedence and the allowlist are unchanged; `Monitor` is not allowed by the relay.
 - Argv checks reject `danger-full-access` unless both task options opt in, a workspace network
   setting other than the one built from the task's options, and Claude `--allowedTools` unless it
   carries exactly the task's stored list. Every permission-bypass flag, including

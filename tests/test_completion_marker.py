@@ -84,7 +84,7 @@ class OutcomeGate(unittest.TestCase):
         self.assertEqual(self.decide({"ok": True, "result": DONE}, cancel=True, exit_code=None, exit_known=False)[0],
                          "succeeded")
         self.assertEqual(self.decide(None, cancel=True, exit_code=None, exit_known=False)[0], "cancelled")
-        denied = {"ok": True, "result": DONE, "permission_denials": ["WebSearch"]}
+        denied = {"ok": False, "result": DONE, "permission_denials": ["WebSearch"]}
         self.assertEqual(self.decide(denied, engine="claude"), ("needs_input", {"completion_check": {"marker": "complete"}}))
         blocked = self.decide({"ok": True, "result": DONE}, guard={"reason": "api_key_source_detected"})
         self.assertEqual(blocked, ("blocked", {"billing_guard": {"reason": "api_key_source_detected"}}))

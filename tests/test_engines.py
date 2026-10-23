@@ -130,7 +130,7 @@ class OutputParsing(unittest.TestCase):
         self.assertEqual(parsed["session_id"], "S1")
         self.assertEqual(parsed["native"]["permission_denials"], ["Bash"])
         self.assertEqual(engines.classify(parsed["native"], exit_code=0, exit_signal=None, exit_known=True,
-                                          cancel_requested=False), "needs_input")
+                                          cancel_requested=False), "succeeded")
 
     def test_claude_error_and_missing_result(self) -> None:
         path = self.write([{"type": "result", "subtype": "error_during_execution", "is_error": True,

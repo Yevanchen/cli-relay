@@ -169,6 +169,14 @@ was submitted with `--option require_completion_marker=true`), it also includes
 that the outcome was decided on. A task that required it and did not report `complete` arrives as
 `needs_input`, which is also the `status` of the five fields.
 
+When present in an event, `git` and `warnings` are copied into its notification entry. `git`
+contains `head_before`, `head_after` and `dirty`; unavailable values are `null`. Warnings have
+the form `{"code": "uncommitted_changes"}` or `{"code": "permission_denials", "tools": ["Monitor"]}`.
+The summary also names warning codes and denied tools for the command adapter. A native success
+with exit 0 can carry denial warnings while remaining `succeeded`; a required completion marker
+still gates it. Git observations never change the outcome. Without these observations, the
+notification payload is unchanged; no empty warning list or non-Git placeholder is added.
+
 ### Earlier v0.2 candidate ledgers
 
 Run `migrate` when upgrading an earlier candidate as well as v0.1. The core schema stays 1;

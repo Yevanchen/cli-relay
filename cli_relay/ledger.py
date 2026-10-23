@@ -686,6 +686,15 @@ class Ledger:
             # outcome (but before this commit) is still visible here, and one committed after this
             # commit finds the attempt finished and is refused as not cancellable.
             evidence = dict(evidence or {}, cancel_lost_race=True)
+        observations = json.loads(_merge_json(att["evidence_json"], evidence) or "{}")
+        warnings = []
+        if native and native.get("permission_denials"):
+            warnings.append({"code": "permission_denials", "tools": sorted(set(native["permission_denials"]))})
+        if observations.get("git", {}).get("dirty") is True:
+            warnings.append({"code": "uncommitted_changes"})
+        if warnings:
+            evidence = dict(evidence or {}, warnings=warnings)
+            observations["warnings"] = warnings
         cur = c.execute(
             "UPDATE attempts SET state=?, outcome=?, exit_code=?, exit_signal=?, exit_known=?, "
             "native_result_json=COALESCE(?, native_result_json), evidence_json=?, "
@@ -707,6 +716,7 @@ class Ledger:
         if details["completion_marker_required"]:
             # The marker line sits at the end of the result, often past the excerpt: name it here.
             details["completion_marker"] = engines.completion_marker((native or {}).get("result"))
+        details.update({key: observations[key] for key in ("git", "warnings") if key in observations})
         body = {
             "task_id": att["task_id"],
             "attempt_no": att["attempt_no"],

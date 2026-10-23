@@ -921,12 +921,14 @@ def parse_output(engine: str, stdout_path: Path, last_message_path: Optional[Pat
 def classify(native: Optional[Dict[str, Any]], *, exit_code: Optional[int], exit_signal: Optional[int],
              exit_known: bool, cancel_requested: bool) -> str:
     """CLI exit status and the CLI's own result are recorded separately; this only names the outcome.
-    It never claims business success. A structured permission denial means the run stopped at a
-    permission nobody could grant, so it is ``needs_input`` even if the CLI also reports an error
-    (only Claude reports denials; Codex has no structured denial in its JSON output)."""
+    It never claims business success. A native success with a known zero exit can recover from
+    denied tools; those denials are warnings. Otherwise a structured denial is ``needs_input``,
+    even if the CLI reports an error (only Claude reports structured denials)."""
     if cancel_requested and (exit_signal is not None or (exit_known and exit_code != 0)
                              or native is None or not native.get("ok")):
         return "cancelled"
+    if native is not None and native.get("ok") and exit_known and exit_code == 0 and exit_signal is None:
+        return "succeeded"
     if native is not None and native.get("permission_denials"):
         return "needs_input"
     if native is None or not native.get("ok"):

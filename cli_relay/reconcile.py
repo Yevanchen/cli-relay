@@ -13,7 +13,7 @@ import socket
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from . import engines, procs
+from . import engines, git_state, procs
 from .ledger import Ledger, iso_age_seconds, now_iso
 
 KICK_GRACE_S = 5.0
@@ -126,6 +126,12 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
     if must_stop:
         decided = {**decided, "processes_stopped": True, "cli_alive": cli_alive,
                    "process_group_alive": group_alive}
+
+    if exit_info is not None:
+        decided.update({"git": exit_info["git"]} if "git" in exit_info else {})
+    elif not maybe_running:
+        # No exit snapshot survived: observe only after the attempt's processes have stopped.
+        decided.update(git_state.completion(payload["cwd"], _evidence(att).get("git_before")))
 
     if exit_info is not None:
         # The keeper died after recording the exit status but before committing it.
