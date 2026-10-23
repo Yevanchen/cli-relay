@@ -385,6 +385,45 @@ Two machines are two independent ledgers and notifiers. Every payload names `sou
 `ledger_id`, and `ack --ledger-id` refuses an event of another ledger
 (`test_each_host_names_itself_and_acks_never_cross`).
 
+### Route verification and origin (issue #4)
+
+The [D16 workflow](decisions.md#d16-issue-4-registered-routes-visible-message-proof-and-origin)
+adds a separate probe receipt in home-local notifier.json. No execution-ledger migration is
+needed. Registration and verification use atomic, mode-0600 config replacement under a local
+lock. Only credential references and non-secret receipt fields are stored. Doctor resolves
+references locally and reports booleans; it sends nothing. New routes and routes with explicit
+null/pending verification require a receipt before task use. Legacy routes with no `verification`
+key retain existing behavior without rewriting their configuration; doctor reports `proof: legacy_config`.
+
+| Fault | Durable fact and next action | Local mock test |
+|---|---|---|
+| Installer's Friday route has no verification key | explicit/default submissions, delivery and reminders still work; config bytes stay unchanged | `test_installer_template_friday_submits_delivers_and_keeps_config_bytes` |
+| Legacy-shaped route has explicit null/pending verification | no exemption; new submissions refused and pending events not sent | `test_legacy_with_explicit_null_or_pending_verification_is_not_exempt` |
+| Verification returns 2xx without a matching visible-message id | unproven, possible wake consumed; wait for ACK timeout before any retry | `test_2xx_requires_visible_message_id_and_exact_probe_destination` |
+| Verifier dies during a send or before saving its reply | `sending` persisted first; recover as `unconfirmed`, retain id and budget, no immediate resend | `test_crashed_verifier_consumes_one_possible_wake_and_is_not_resent_at_once` |
+| Verification ACK response times out repeatedly | at most 2 possible wakes by default, then `unacknowledged`; receipt retained, explicit `route verify --retry` required | `test_verify_timeout_is_bounded_keeps_receipt_and_requires_explicit_new_budget` |
+| Connection never succeeds | exponential backoff, at most 6 attempts, then retained `failed` | `test_verify_connect_failures_use_exponential_backoff_and_stop_at_six` |
+| Configuration identity/reference changes after proof | fingerprint no longer matches; route becomes unproven | `test_proof_is_invalidated_by_identity_or_reference_edits` |
+| Task's route loses proof while an event is pending | no adapter call; bounded readiness checks, event kept after exhaustion, no task restart | `test_unproven_events_are_retained_with_bounded_checks_and_no_task_restart` |
+| Task consumer never ACKs | existing bounded reminders, event kept as `unacknowledged`; one fixture side effect and one task attempt | `test_actual_fixture_side_effect_happens_once_during_all_notification_retries` |
+
+Defaults for both probes and notifications: 6 attempts, backoff `min(1800, 30 * 2^(attempt-1))`
+seconds, 2 possible wakes, 1800-second ACK timeout. Their counters are separate. The last failed
+attempt schedules nothing; at the default six-attempt budget the delays are 30/60/120/240/480
+seconds. `Retry-After` can require a longer wait than the cap. Readiness checks spend an attempt
+but no wake. Probes are driven only by explicit `route verify` calls; `notify run` drives task
+notifications. Neither exhausted budgets nor a later successful verification grants an automatic
+fresh budget. `route verify --retry` and `notify retry` are explicit operator actions.
+
+Origin is optional canonical payload data, so it participates in conflict detection and survives
+resume and terminal/unknown event creation in the same transaction. It does not change the task's
+stored owner or give the receiver permission to execute text. A copied verification receipt is
+unproven in another ledger; use distinct source ids and verify each receiver.
+A receiver can falsely claim it has displayed a message, and an in-flight notifier may finish
+using its old config snapshot. This protocol checks a matching receipt, not human readership or
+future delivery. Only local fake/mock evidence was collected for issue #4; real webhook approval,
+live verification and the unfinished 25-hour soak remain outside its scope.
+
 ## Residual risks
 
 - If the CLI moved itself to a new process group *and* the keeper died in the microseconds

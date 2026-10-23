@@ -15,6 +15,7 @@ from unittest.mock import patch
 from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config
 from test_ind_02_codex_permissions import fake_codex as fixed_turn_codex
 
+from notify_helpers import write_config
 from cli_relay import engines, notify
 from cli_relay.errors import UsageError
 from cli_relay.ledger import payload_hash
@@ -325,7 +326,7 @@ class NetworkRoundTrip(RelayTestCase):
         self.assertEqual(call[call.index("--sandbox") + 1], WW)
         self.assertEqual(network_settings(call), [ON])
 
-        (self.home / "notifier.json").write_text(json.dumps(NOTIFIER))
+        write_config(self.home, NOTIFIER)
         with patch("cli_relay.notify.send", return_value={"outcome": "handed_off"}) as send:
             notify.flush(self.home, env=self.env)
         send.assert_called_once()

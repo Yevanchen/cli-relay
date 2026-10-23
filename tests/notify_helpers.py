@@ -6,6 +6,7 @@ import http.server
 import json
 import socket
 import threading
+import copy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -95,4 +96,23 @@ def http_config(tmp: Path, url: str, *, source_id: str = "host-a", max_attempts:
 
 
 def write_config(home: Path, cfg: Dict[str, Any]) -> None:
+    """Transport tests start after synthetic verification; no real chat is certified here."""
+    from cli_relay import notify
+    from cli_relay.errors import UsageError
+    from cli_relay.ledger import now_iso
+
+    cfg = copy.deepcopy(cfg)
+    try:
+        clean = notify.validate_config(cfg)
+    except UsageError:
+        pass  # invalid-config tests need the exact invalid input
+    else:
+        for name, route in clean["routes"].items():
+            cfg["routes"][name]["verification"] = {
+                "verification_id": "v-" + "a" * 32,
+                "route_sha256": notify.route_fingerprint(clean["source_id"], route),
+                "ledger_id": json.loads((Path(home) / "LEDGER.json").read_text())["ledger_id"],
+                "state": "acked", "attempts": 1, "wakes": 1, "next_at": None,
+                "created_at": now_iso(), "message_id": "synthetic-test-message", "acked_at": now_iso(),
+                "last_result": "visible_message_confirmed"}
     (Path(home) / "notifier.json").write_text(json.dumps(cfg))

@@ -30,6 +30,7 @@ Adapters:
 from __future__ import annotations
 
 import http.client
+import hashlib
 import json
 import os
 import re
@@ -56,6 +57,8 @@ DEFAULT_OUTCOMES = ("succeeded", "failed", "blocked", "needs_input", "unknown")
 KNOWN_OUTCOMES = ("succeeded", "failed", "blocked", "needs_input", "unknown", "cancelled")
 _ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 ROUTE_RE = _ID_RE
+ENV_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+MESSAGE_ID_RE = re.compile(r"[A-Za-z0-9._:@/+-]{1,256}")
 _NAME_RE = re.compile(r"^[A-Za-z0-9._:@/+-]{1,64}$")
 # states in which the row waits for something other than its own next send
 WAITING = ("accepted", "handed_off", "unconfirmed")
@@ -81,6 +84,19 @@ def load_config(home: Path) -> Dict[str, Any]:
         raise Refused("notifier_not_configured", "no notifier.json in the ledger home", path=str(path)) from exc
     except (OSError, ValueError) as exc:
         raise _bad("unreadable or not JSON", error=type(exc).__name__) from exc
+    cfg = validate_config(raw)
+    verified_routes = [route for route in cfg["routes"].values() if route["proven"] and route.get("verification")]
+    if verified_routes:
+        ledger = Ledger(home)
+        try:
+            for route in verified_routes:
+                route["proven"] = route["verification"]["ledger_id"] == ledger.ledger_id
+        finally:
+            ledger.close()
+    return cfg
+
+
+def validate_config(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise _bad("top level must be an object")
     allowed = {"source_id", "default_route", "routes", "notify_outcomes", "retry", "reminder"}
@@ -88,15 +104,22 @@ def load_config(home: Path) -> Dict[str, Any]:
     if unknown:
         raise _bad("unknown keys", keys=unknown)
     source_id = raw.get("source_id")
-    if not isinstance(source_id, str) or not _ID_RE.match(source_id):
+    if not isinstance(source_id, str) or not _ID_RE.fullmatch(source_id):
         raise _bad("source_id must be 1-32 chars of [A-Za-z0-9._-]")
     routes = raw.get("routes")
-    if not isinstance(routes, dict) or not routes:
-        raise _bad("routes must be a non-empty object")
+    if not isinstance(routes, dict):
+        raise _bad("routes must be an object")
     clean_routes = {name: _route(name, spec) for name, spec in routes.items()}
     default_route = raw.get("default_route")
-    if default_route is not None and default_route not in clean_routes:
+    if default_route is not None and (not isinstance(default_route, str) or default_route not in clean_routes):
         raise _bad("default_route is not one of the routes")
+    for route in clean_routes.values():
+        verification = route.get("verification")
+        # Installer-managed legacy routes have no verification key. Preserve their existing
+        # behavior without migrating the file; an explicit null or pending receipt is not legacy.
+        route["proven"] = "verification" not in route or bool(
+            verification and verification["state"] == "acked"
+            and verification["route_sha256"] == route_fingerprint(source_id, route))
     outcomes = raw.get("notify_outcomes", list(DEFAULT_OUTCOMES))
     if (not isinstance(outcomes, list) or not outcomes
             or any(o not in KNOWN_OUTCOMES for o in outcomes)):
@@ -122,17 +145,59 @@ def _numbers(spec: Any, fields: Dict[str, Tuple[Any, Any, Any]], where: str) -> 
 
 
 def _route(name: str, spec: Any) -> Dict[str, Any]:
-    if not isinstance(name, str) or not _ID_RE.match(name):
+    if not isinstance(name, str) or not _ID_RE.fullmatch(name):
         raise _bad("route names must be 1-32 chars of [A-Za-z0-9._-]")
-    if not isinstance(spec, dict) or set(spec) - {"consumer", "chat", "adapter"}:
+    if not isinstance(spec, dict) or set(spec) - {"consumer", "chat", "adapter", "verification"}:
         raise _bad(f"route {name} must have consumer, chat and adapter")
     consumer = spec.get("consumer")
-    if not isinstance(consumer, str) or not _NAME_RE.match(consumer):
+    if not isinstance(consumer, str) or not _NAME_RE.fullmatch(consumer):
         raise _bad(f"route {name}: consumer must be a valid consumer name")
     chat = spec.get("chat", "")
-    if not isinstance(chat, str) or len(chat) > 80:
+    if not isinstance(chat, str) or len(chat) > 80 or any(not ch.isprintable() for ch in chat):
         raise _bad(f"route {name}: chat must be a short label")
-    return {"name": name, "consumer": consumer, "chat": chat, "adapter": _adapter(name, spec.get("adapter"))}
+    route = {"name": name, "consumer": consumer, "chat": chat, "adapter": _adapter(name, spec.get("adapter"))}
+    if "verification" in spec:
+        route["verification"] = _verification(spec["verification"])
+    return route
+
+
+def route_fingerprint(source_id: str, route: Dict[str, Any]) -> str:
+    """Bind a proof to non-secret configuration, including credential *references*, not values."""
+    identity = {k: route[k] for k in ("name", "consumer", "chat", "adapter")}
+    return hashlib.sha256(canonical_json({"source_id": source_id, **identity}).encode("utf-8")).hexdigest()
+
+
+def _verification(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    fields = {"verification_id", "route_sha256", "ledger_id", "state", "attempts", "wakes", "next_at", "created_at",
+              "message_id", "acked_at", "last_result"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise _bad("invalid route verification receipt")
+    if (not isinstance(value["verification_id"], str)
+            or not re.fullmatch(r"v-[0-9a-f]{32}", value["verification_id"])
+            or not isinstance(value["route_sha256"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value["route_sha256"])
+            or not isinstance(value["ledger_id"], str)
+            or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", value["ledger_id"])
+            or value["state"] not in ("pending", "sending", "unconfirmed", "failed", "unacknowledged", "acked")):
+        raise _bad("invalid route verification identity or state")
+    for key in ("attempts", "wakes"):
+        if type(value[key]) is not int or not 0 <= value[key] <= 50:
+            raise _bad("invalid route verification budget")
+    for key in ("next_at", "created_at", "acked_at"):
+        if value[key] is not None and (not isinstance(value[key], str)
+                                      or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", value[key])):
+            raise _bad("invalid route verification timestamp")
+    if value["message_id"] is not None and (not isinstance(value["message_id"], str)
+                                            or not MESSAGE_ID_RE.fullmatch(value["message_id"])):
+        raise _bad("invalid route verification message id")
+    if value["state"] == "acked" and (not value["message_id"] or not value["acked_at"] or not value["attempts"]):
+        raise _bad("an ACKed verification needs a message id, timestamp and send")
+    if value["last_result"] is not None and (not isinstance(value["last_result"], str)
+                                            or not re.fullmatch(r"[a-z0-9_]{1,64}", value["last_result"])):
+        raise _bad("invalid route verification result")
+    return dict(value)
 
 
 def _adapter(route: str, spec: Any) -> Dict[str, Any]:
@@ -151,7 +216,7 @@ def _adapter(route: str, spec: Any) -> Dict[str, Any]:
         if exit_status not in ("unverified", "verified"):
             raise _bad(f"route {route}: exit_status must be unverified or verified")
         job = spec.get("job", "CLI_RELAY")
-        if not isinstance(job, str) or not _NAME_RE.match(job):
+        if not isinstance(job, str) or not _NAME_RE.fullmatch(job):
             raise _bad(f"route {route}: job must be a short name")
         return {"type": "command", "argv": list(argv), "job": job, "exit_status": exit_status,
                 "timeout_s": float(timeout)}
@@ -165,8 +230,10 @@ def _adapter(route: str, spec: Any) -> Dict[str, Any]:
         value = spec[sources[0]]
         if not isinstance(value, str) or not value or (sources[0].endswith("_file") and not os.path.isabs(value)):
             raise _bad(f"route {route}: {sources[0]} must be a variable name or an absolute path")
+        if sources[0].endswith("_env") and not ENV_RE.fullmatch(value):
+            raise _bad(f"route {route}: invalid environment variable name")
     job = spec.get("job", "CLI_RELAY")
-    if not isinstance(job, str) or not _NAME_RE.match(job):
+    if not isinstance(job, str) or not _NAME_RE.fullmatch(job):
         raise _bad(f"route {route}: job must be a short name")
     return {"type": "http", **{k: spec[k] for k in spec if k.endswith(("_env", "_file"))}, "job": job,
             "timeout_s": float(timeout)}
@@ -186,7 +253,7 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
     return {"event_id": row["event_id"], "task_id": row["task_id"], "attempt_no": row["attempt_no"],
             "kind": row["kind"], "outcome": body.get("outcome") or row["kind"], "key": row.get("request_key"),
             **{key: body[key] for key in ("sandbox", "full_access", "network_access", "allowed_tools",
-                                          "completion_marker_required", "completion_marker") if key in body},
+                                          "completion_marker_required", "completion_marker", "origin") if key in body},
             "result_excerpt": _clean(body.get("result_excerpt"), EXCERPT_MAX)}
 
 
@@ -236,13 +303,24 @@ def send_command(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str
     argv = adapter["argv"] + [payload["job"], payload["stage"], payload["status"], payload["summary"],
                               payload["artifact"]]
     try:
-        p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           env=env, timeout=adapter["timeout_s"])
+        verifying = payload.get("cli_relay", {}).get("schema") == "cli-relay.route-verify.v1"
+        if verifying:
+            p = subprocess.run(argv, input=canonical_json(payload).encode("utf-8"), stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, env=env, timeout=adapter["timeout_s"])
+        else:
+            p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               env=env, timeout=adapter["timeout_s"])
     except subprocess.TimeoutExpired:
         return {"outcome": "ambiguous", "why": "command_timeout"}  # it may already have posted
     except OSError as exc:
         return {"outcome": "retry", "why": "command_not_runnable", "error": type(exc).__name__}
     if p.returncode == 0:
+        if verifying:
+            # Existing command adapters can implement the same receipt protocol over stdin/stdout.
+            message_id = _proof_message_id(p.stdout[:65536], payload["cli_relay"], ())
+            if message_id is None:
+                return {"outcome": "ambiguous", "why": "verification_receipt_invalid"}
+            return {"outcome": "accepted", "why": "visible_message_confirmed", "message_id": message_id}
         if adapter["exit_status"] == "verified":
             return {"outcome": "accepted", "why": "command_exit_0_verified"}
         return {"outcome": "handed_off", "why": "command_exit_0_unverified"}
@@ -278,13 +356,19 @@ def send_http(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str, s
             resp = conn.getresponse()
             status = resp.status
             retry_after = resp.getheader("Retry-After")
-            resp.read(65536)
+            response_body = resp.read(65536)
         except (OSError, http.client.HTTPException) as exc:
             # The request may have reached the receiver (which may already have started a run).
             return {"outcome": "ambiguous", "why": "response_lost", "error": type(exc).__name__}
     finally:
         conn.close()
     if 200 <= status < 300:
+        if payload.get("cli_relay", {}).get("schema") == "cli-relay.route-verify.v1":
+            message_id = _proof_message_id(response_body, payload["cli_relay"], (url, token))
+            if message_id is None:
+                return {"outcome": "ambiguous", "why": "verification_receipt_invalid", "status": status}
+            return {"outcome": "accepted", "why": "visible_message_confirmed", "status": status,
+                    "message_id": message_id}
         return {"outcome": "accepted", "why": "http_2xx", "status": status}
     if status == 429 or status == 408 or status >= 500:
         out: Dict[str, Any] = {"outcome": "retry", "why": "http_retryable", "status": status,
@@ -294,6 +378,24 @@ def send_http(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str, s
             out["retry_after_s"] = delay
         return out
     return {"outcome": "permanent", "why": "http_rejected", "status": status, "may_have_woken": True}
+
+
+def _proof_message_id(body: bytes, request: Dict[str, Any], secrets: Tuple[str, ...]) -> Optional[str]:
+    """Never persist a receiver's raw body, error text or an echoed credential."""
+    try:
+        receipt = json.loads(body)
+    except (ValueError, UnicodeError):
+        return None
+    if not isinstance(receipt, dict) or receipt.get("visible") is not True:
+        return None
+    for key in ("verification_id", "source_id", "ledger_id", "route", "consumer", "chat"):
+        if receipt.get(key) != request[key]:
+            return None
+    message_id = receipt.get("message_id")
+    if (not isinstance(message_id, str) or not MESSAGE_ID_RE.fullmatch(message_id)
+            or any(secret in message_id for secret in secrets if secret)):
+        return None
+    return message_id
 
 
 def _retry_after(value: Optional[str]) -> Optional[float]:
@@ -467,35 +569,44 @@ def _claim(ledger: Ledger, route: Dict[str, Any], cfg: Dict[str, Any]) -> Tuple[
     return claim_id, [dict(r) for r in rows]
 
 
-def _record(ledger: Ledger, cfg: Dict[str, Any], claim_id: str, result: Dict[str, Any], started: str) -> None:
+def delivery_result(cfg: Dict[str, Any], result: Dict[str, Any], attempts: int, wakes: int) -> Dict[str, Any]:
+    """Shared bounded transition for task notifications and route verification probes."""
+    outcome = result["outcome"]
+    attempts += 1
+    wakes += int(outcome in ("accepted", "handed_off", "ambiguous") or result.get("may_have_woken", False))
+    if outcome in ("accepted", "handed_off", "ambiguous"):
+        state = {"accepted": "accepted", "handed_off": "handed_off", "ambiguous": "unconfirmed"}[outcome]
+        next_at = _later(cfg["reminder"]["ack_timeout_s"])
+    elif (outcome == "retry" and attempts < cfg["retry"]["max_attempts"]
+          and wakes < cfg["reminder"]["max_wakes"]):
+        delay = min(cfg["retry"]["max_delay_s"], cfg["retry"]["base_delay_s"] * 2 ** (attempts - 1))
+        if "retry_after_s" in result:
+            delay = max(delay, float(result["retry_after_s"]))
+        state, next_at = "pending", _later(delay)
+    else:
+        state, next_at = "failed", None
+    return {"state": state, "attempts": attempts, "wakes": wakes, "next_at": next_at}
+
+
+def _record(ledger: Ledger, cfg: Dict[str, Any], claim_id: str, result: Dict[str, Any], started: str,
+            *, sent: bool = True) -> None:
     now = now_iso()
     outcome = result["outcome"]
     with ledger.tx() as c:
         rows = c.execute("SELECT * FROM notifications WHERE claim_id=? AND state='sending'", (claim_id,)).fetchall()
         for r in rows:
-            attempts = r["attempts"] + 1
-            may_have_woken = outcome in ("accepted", "handed_off", "ambiguous") or result.get("may_have_woken", False)
-            wakes = r["wakes"] + int(may_have_woken)
-            if outcome in ("accepted", "handed_off", "ambiguous"):
-                state = {"accepted": "accepted", "handed_off": "handed_off", "ambiguous": "unconfirmed"}[outcome]
-                next_at = _later(cfg["reminder"]["ack_timeout_s"])
-            elif (outcome == "retry" and attempts < cfg["retry"]["max_attempts"]
-                  and wakes < cfg["reminder"]["max_wakes"]):
-                delay = min(cfg["retry"]["max_delay_s"], cfg["retry"]["base_delay_s"] * 2 ** (attempts - 1))
-                if "retry_after_s" in result:
-                    delay = max(delay, float(result["retry_after_s"]))
-                state, next_at = "pending", _later(delay)
-            else:  # permanent rejection, or out of attempts
-                state, next_at = "failed", None
+            transition = delivery_result(cfg, result, r["attempts"], r["wakes"])
             c.execute("UPDATE notifications SET state=?, attempts=?, wakes=?, next_at=?, last_result_json=?, "
-                      "first_sent_at=COALESCE(first_sent_at, ?), last_sent_at=?, accepted_at=CASE WHEN ?='accepted' "
+                      "first_sent_at=COALESCE(first_sent_at, ?), last_sent_at=COALESCE(?, last_sent_at), accepted_at=CASE WHEN ?='accepted' "
                       "THEN COALESCE(accepted_at, ?) ELSE accepted_at END, claimed_by=NULL, claimed_token=NULL, "
                       "claim_id=NULL, reminder=0, updated_at=? WHERE event_id=? AND route=? AND claim_id=?",
-                      (state, attempts, wakes, next_at, canonical_json(result), started, now, outcome, now, now,
+                      (transition["state"], transition["attempts"], transition["wakes"], transition["next_at"],
+                       canonical_json(result), started if sent else None, now if sent else None, outcome, now, now,
                        r["event_id"], r["route"], claim_id))
-            c.execute("INSERT INTO notification_sends (event_id, route, claim_id, started_at, ended_at, outcome, "
-                      "detail_json) VALUES (?,?,?,?,?,?,?)",
-                      (r["event_id"], r["route"], claim_id, started, now, outcome, canonical_json(result)))
+            if sent:
+                c.execute("INSERT INTO notification_sends (event_id, route, claim_id, started_at, ended_at, outcome, "
+                          "detail_json) VALUES (?,?,?,?,?,?,?)",
+                          (r["event_id"], r["route"], claim_id, started, now, outcome, canonical_json(result)))
 
 
 def flush(home: Path, env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -510,7 +621,7 @@ def flush(home: Path, env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         summary.update(recover(ledger, cfg))
         summary["acked"] = sync_acks(ledger, cfg)
         summary.update(remind(ledger, cfg))
-        sends = []
+        sends, blocked = [], []
         for name, route in cfg["routes"].items():
             claim_id, rows = _claim(ledger, route, cfg)
             if not rows:
@@ -524,15 +635,18 @@ def flush(home: Path, env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
                     c.execute("UPDATE notifications SET state='sending', updated_at=? WHERE claim_id=? AND state='claimed'",
                               (started, claim_id))
                 _hook("notify_before_send")
-                result = send(route["adapter"], payload, env)
+                result = (send(route["adapter"], payload, env) if route["proven"] else
+                          {"outcome": "retry", "why": "route_unproven"})
                 _hook("notify_after_send")
-                _record(ledger, cfg, claim_id, result, started)
-                sends.append({"route": name, "events": [r["event_id"] for r in refs], "outcome": result["outcome"],
-                              "why": result.get("why"), "status": result.get("status")})
+                _record(ledger, cfg, claim_id, result, started, sent=route["proven"])
+                (sends if route["proven"] else blocked).append({
+                    "route": name, "events": [r["event_id"] for r in refs], "outcome": result["outcome"],
+                    "why": result.get("why"), "status": result.get("status")})
             finally:
                 with _CLAIMS_LOCK:
                     _ACTIVE_CLAIMS.discard(claim_id)
         summary["sends"] = sends
+        summary["blocked"] = blocked
         return summary
     finally:
         ledger.close()

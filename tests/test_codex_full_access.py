@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config
+from notify_helpers import write_config
 from cli_relay import engines, notify
 from cli_relay.errors import UsageError
 from cli_relay.ledger import payload_hash
@@ -224,9 +225,9 @@ class FullAccessRoundTrip(RelayTestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][calls[0].index("--sandbox") + 1], FULL)
 
-        (self.home / "notifier.json").write_text(json.dumps({"source_id": "test-host", "default_route": "bot",
+        write_config(self.home, {"source_id": "test-host", "default_route": "bot",
             "routes": {"bot": {"consumer": "bot", "chat": "test chat",
-                               "adapter": {"type": "command", "argv": ["/usr/bin/false"]}}}}))
+                               "adapter": {"type": "command", "argv": ["/usr/bin/false"]}}}})
         with patch("cli_relay.notify.send", return_value={"outcome": "handed_off"}) as send:
             notify.flush(self.home, env=self.env)
         send.assert_called_once()
