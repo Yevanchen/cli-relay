@@ -216,7 +216,8 @@ class NetworkToolDefaultsForDoctor(unittest.TestCase):
 
 def recording_claude(tmp: Path) -> Path:
     """No network: record argv. WebSearch is a structured denial unless --allowedTools names it and
-    no deny rule in the user settings does, as dontAsk treats a tool that needs permission."""
+    no deny rule in the user settings does, as dontAsk treats a tool that needs permission.
+    This fixture needs the search to finish, so a denial also reports native failure."""
     script = r'''
 import json, os, sys
 from pathlib import Path
@@ -234,10 +235,12 @@ deny = json.loads(settings.read_text()).get("permissions", {}).get("deny", []) i
 denied = "WebSearch" not in (value("--allowedTools") or "").split(",") or "WebSearch" in deny
 print(json.dumps({"type": "system", "subtype": "init", "session_id": sid, "apiKeySource": "none",
                   "permissionMode": value("--permission-mode"), "model": "fake"}), flush=True)
-print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "session_id": sid, "num_turns": 1,
+print(json.dumps({"type": "result", "subtype": "error_during_execution" if denied else "success",
+                  "is_error": denied, "session_id": sid, "num_turns": 1,
                   "result": "could not search" if denied else "found it",
                   "permission_denials": [{"tool_name": "WebSearch", "tool_use_id": "t-1",
                                           "tool_input": {"query": "q"}}] if denied else []}))
+sys.exit(1 if denied else 0)
 '''
     path = tmp / "claude"
     path.write_text(f"#!{sys.executable}\nMARKER={str(tmp / 'calls.jsonl')!r}\n" + script)

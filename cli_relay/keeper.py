@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import engines, procs
+from . import engines, git_state, procs
 from .errors import RelayError
 from .ledger import Ledger, atomic_write_text, canonical_json, now_iso
 from .spawn import spawn_notifier_pass
@@ -104,6 +104,9 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     log = _Log(run_dir / "keeper.log")
     env = dict(os.environ)
+    git_before = git_state.snapshot(payload["cwd"])
+    if git_before is not None:
+        ledger.add_evidence(attempt_id, {"git_before": git_before})
 
     def notify_pass() -> None:
         # A terminal event was committed: wake the consumer now rather than at the next periodic pass.
@@ -111,7 +114,8 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
             spawn_notifier_pass(home)
 
     def close(outcome: str, evidence: Dict[str, Any]) -> None:
-        ledger.finish(attempt_id, from_states=("claimed",), outcome=outcome, evidence=evidence, source="keeper")
+        ledger.finish(attempt_id, from_states=("claimed",), outcome=outcome,
+                      evidence={**evidence, **git_state.completion(payload["cwd"], git_before)}, source="keeper")
         notify_pass()
 
     try:
@@ -297,10 +301,13 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         lingering = others_in_group()
         if lingering:  # a normal exit leaves them alone, but the record says they exist
             cleanup["remaining_after_normal_exit"] = len(lingering)
+    # Persist the end snapshot with the exit, so reconciliation never substitutes later edits.
+    git_result = git_state.completion(payload["cwd"], git_before)
+    exit_info.update(git_result)
     atomic_write_text(run_dir / "exit.json", canonical_json(exit_info) + "\n")
     _hook("after_exit_before_commit")
 
-    evidence: Dict[str, Any] = {"exit_source": "keeper_waitpid", **decided}
+    evidence: Dict[str, Any] = {"exit_source": "keeper_waitpid", **decided, **git_result}
     if "process_group_cleanup" in exit_info or "remaining_after_normal_exit" in cleanup:
         evidence["process_group_cleanup"] = cleanup
     if "process_group_cleanup" in exit_info:

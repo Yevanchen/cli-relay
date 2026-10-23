@@ -61,6 +61,7 @@ class KeeperStopEvidence(unittest.TestCase):
                 stack.enter_context(patch.object(keeper.os, name, return_value=42001))
             stack.enter_context(patch.object(procs, "start_token", return_value="fixture-token"))
             stack.enter_context(patch.object(procs, "group_members", return_value=members))
+            stack.enter_context(patch.object(keeper.git_state, "snapshot", return_value=None))
             stack.enter_context(patch.object(keeper.subprocess, "Popen", return_value=FakeChild(wait_once)))
             stack.enter_context(patch.object(keeper.os, "killpg"))
             stack.enter_context(patch.object(keeper.os, "kill", side_effect=PermissionError("fixture")))

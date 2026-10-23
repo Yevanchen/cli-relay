@@ -182,7 +182,8 @@ Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--yolo`
   by the existing rules, plus the `allowed_tools` a task opts in to (see below); it is not a
   no-tools mode or a filesystem sandbox.
 - Claude: permission prompts that nobody can answer are denied by the CLI. A result that lists
-  permission denials ends as `needs_input`, even if the CLI also reports an error.
+  permission denials ends as `needs_input` unless native success and a known zero exit show the
+  run recovered; then the denials are warnings and the completion marker gate still applies.
 - Codex: the `codex exec --json` events that cli-relay reads carry no structured permission
   denial. A command refused by the sandbox reaches the model as a failed command, and the
   outcome follows Codex's own result: a run whose commands were refused still ends `succeeded`
@@ -201,6 +202,19 @@ Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--yolo`
   cannot verify that attempt. Before the run, a Codex permission setting, requirements layer, or an unsafe or unreadable selected profile blocks it.
 - These outcomes do not depend on whether the keeper survived: reconciliation applies the same
   checks. See [`docs/reliability.md`](docs/reliability.md) for the exact layers and limits.
+
+Codex **cannot commit under `workspace-write`**: `.git` is read-only by design, so commands
+that need `.git/index.lock` fail even though source files can be edited. Have the caller review
+and commit the changes outside that sandbox. There is no option to make just `.git` writable.
+
+For any engine whose task directory is in a Git work tree, the relay records `git` evidence:
+`head_before`, `head_after`, and `dirty` (the final tree has staged, unstaged or untracked changes).
+It uses read-only argv calls with optional index writes disabled and a two-second timeout per
+call. An unavailable HEAD or dirty check is `null`; an undetected/non-Git work tree adds no
+fields. The observations appear in `status`/`wait` attempt evidence, the terminal event body,
+and notification event entries. A dirty tree also adds `warnings: [{"code": "uncommitted_changes"}]`.
+This reports the whole tree, including pre-existing changes; it does not attribute edits to the
+task or change its outcome. These observations never enter the request payload or its hash.
 
 Codex **full access is off by default**. Requesting `sandbox="danger-full-access"` alone is a
 usage error. To opt in for one task, supply both options:
@@ -266,8 +280,14 @@ cli-relay submit --key tests-1 --engine codex --cwd ~/code/app --prompt "Run the
   ```
 
 Claude **adds no tool by default**. Under `dontAsk`, a tool that needs permission and is not
-already allowed by your settings is denied, so a research task that tries `WebSearch` or
-`WebFetch` ends `needs_input` with that permission denial. To allow them for one task, name them:
+already allowed by your settings is denied. A native failure with a permission denial ends
+`needs_input`. If Claude reports native success and exits 0, denials are warnings and the outcome
+is `succeeded`, subject to the completion marker gate below. Without a confirmed zero exit,
+denials still mean `needs_input`; cancellation keeps its existing precedence. `status`/`wait`
+attempt evidence, terminal events and notification event entries carry, for example,
+`warnings: [{"code": "permission_denials", "tools": ["Monitor"]}]`. Only tool names are included,
+not inputs; `Monitor` is not added to the allowlist. To allow `WebSearch` or `WebFetch` for one
+task, name them:
 
 ```sh
 cli-relay submit --key research-1 --engine claude --cwd ~/code/app --prompt "Compare the current options for X" \
@@ -287,7 +307,7 @@ part of the request.
 - Claude's own rules still decide. It evaluates deny, then ask, then allow rules, so a deny or
   ask rule in any settings layer wins over the option. A managed deny cannot be overridden by
   `--allowedTools`, and managed `allowManagedPermissionRulesOnly` ignores `--allowedTools`
-  altogether. A tool that is still denied ends the task `needs_input`, as before.
+  altogether. A denial that the task does not recover from still ends it `needs_input`.
 - These tools reach the network: fetched pages are untrusted input, and a fetched URL can carry
   data out of the task. Only opt in for tasks that need it.
 - Like every option, `allowed_tools` is part of the payload and `payload_sha256`, so another
@@ -350,7 +370,7 @@ CLI-RELAY-STATUS: incomplete."
   CLI's final message is exactly `CLI-RELAY-STATUS: complete` (surrounding whitespace aside).
   `CLI-RELAY-STATUS: incomplete`, any other last line (backticks, bold or a trailing period included)
   and no final message end it `needs_input`. `failed`, `blocked`, `cancelled` and the `needs_input` of
-  a Claude permission denial are never changed: the marker cannot turn a failure into a success.
+  an unresolved Claude permission denial are never changed: the marker cannot turn a failure into a success.
 - The relay never edits a prompt: ask for the line in the task prompt, and again in resume prompts.
   Each attempt is judged by its own final message, so a `needs_input` task can be continued with
   `resume`.
@@ -359,8 +379,8 @@ CLI-RELAY-STATUS: incomplete."
   notifications carry `completion_marker_required`; when it is `true`, event bodies and notifications
   also carry `completion_marker` (`complete`, `incomplete` or `null`), because the line is usually
   past the result excerpt. The option is part of the payload and its hash.
-- It is the CLI's self-report, not a verification: the relay runs no command of its own and reads no
-  other text of the result, so a CLI can still claim `complete` wrongly. Without the opt-in nothing
+- It is the CLI's self-report, not a verification: the marker check reads no other text of the
+  result and runs no verification command, so a CLI can still claim `complete` wrongly. Without the opt-in nothing
   changes. `doctor` describes the contract in `completion_marker_policy`.
 
 ## How a consumer (e.g. a chat bot calling over SSH) should use it
