@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from . import git_state
 from .errors import UsageError
 
 ENGINES = ("claude", "codex", "fixture")
@@ -104,6 +105,7 @@ class Spec:
     env: Dict[str, str]
     cwd: str
     last_message_path: Optional[str] = None
+    evidence: Dict[str, Any] = field(default_factory=dict)
 
 
 def validate_engine(engine: str) -> str:
@@ -709,6 +711,7 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
     resume = attempt.get("resume_session_id")
     cenv = child_env(env)
     last_message = None
+    evidence: Dict[str, Any] = {}
     if engine == "claude":
         binary = resolve_bin(engine, env)
         argv = [binary, "-p", "--output-format", "stream-json", "--verbose"]
@@ -740,7 +743,15 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
                     *network_args, "--json", "-o", last_message]
         else:
             argv = [binary, "exec", "--json", "-C", cwd, "-o", last_message, "--sandbox", sandbox, *network_args]
-        if opts.get("skip_git_repo_check"):
+        skip_git_repo_check = opts.get("skip_git_repo_check")
+        if skip_git_repo_check is True:
+            decision = "explicit_skip"
+        elif skip_git_repo_check is False or git_state.is_work_tree(cwd):
+            decision = "enforced"
+        else:
+            decision = "auto_skipped"
+        evidence["codex_git_repo_check"] = decision
+        if decision != "enforced":
             argv.append("--skip-git-repo-check")
         if opts.get("model"):
             argv += ["-m", opts["model"]]
@@ -771,10 +782,23 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
     if not argv[0]:
         raise RuntimeError(f"{engine} CLI not found")
     assert_safe(engine, argv, options=opts)
-    return Spec(argv=argv, env=cenv, cwd=cwd, last_message_path=last_message)
+    return Spec(argv=argv, env=cenv, cwd=cwd, last_message_path=last_message, evidence=evidence)
 
 
 # ---------------------------------------------------------------------------- output parsing
+def codex_git_repo_check_warning(stderr_path: Path) -> Optional[Dict[str, str]]:
+    """Export only a fixed hint, never any of the CLI's stderr."""
+    try:
+        with open(stderr_path, "rb") as f:
+            if not any(b"Not inside a trusted directory" in line for line in f):
+                return None
+    except OSError:
+        return None
+    return {"code": "codex_trusted_directory",
+            "hint": "Codex rejected the task directory. Submit a new task with --option "
+                    "skip_git_repo_check=true to pass --skip-git-repo-check."}
+
+
 def iter_json_lines(path: Path, *, offset: int = 0) -> Iterable[Dict[str, Any]]:
     try:
         f = open(path, "rb")

@@ -61,6 +61,10 @@ Routes are configured per machine in `<home>/notifier.json`. Configuration, rout
 
 Model and effort can be set per task with `--option`. Sandbox, network, and tool opt-ins are documented in [`docs/usage.md`](docs/usage.md#engines), and the guards behind them in [`docs/reliability.md`](docs/reliability.md) — not repeated here.
 
+Codex automatically adds `--skip-git-repo-check` when the task directory is outside a Git work
+tree. Use `--option skip_git_repo_check=true` to always skip the check, or `false` to enforce it.
+The decision is recorded in attempt evidence and terminal events; sandbox defaults stay the same.
+
 ## How a consumer should use it
 
 1. Submit with a key derived from the request. If the reply is lost, submit the same key again.
