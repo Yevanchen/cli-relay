@@ -153,6 +153,8 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         close("blocked", {"preflight": {"reason": reason, "error": str(exc) if isinstance(exc, RuntimeError)
                                         else type(exc).__name__}})
         return 0
+    if spec.evidence:
+        ledger.add_evidence(attempt_id, spec.evidence)
     prompt_path = run_dir / "prompt.txt"
     try:
         atomic_write_text(prompt_path, att["prompt"])

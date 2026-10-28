@@ -686,12 +686,19 @@ class Ledger:
             # outcome (but before this commit) is still visible here, and one committed after this
             # commit finds the attempt finished and is refused as not cancellable.
             evidence = dict(evidence or {}, cancel_lost_race=True)
+        task = c.execute("SELECT current_attempt, engine, payload_json FROM tasks WHERE task_id=?",
+                         (att["task_id"],)).fetchone()
         observations = json.loads(_merge_json(att["evidence_json"], evidence) or "{}")
         warnings = []
         if native and native.get("permission_denials"):
             warnings.append({"code": "permission_denials", "tools": sorted(set(native["permission_denials"]))})
         if observations.get("git", {}).get("dirty") is True:
             warnings.append({"code": "uncommitted_changes"})
+        if task["engine"] == "codex" and outcome in ("failed", "blocked"):
+            warning = engines.codex_git_repo_check_warning(
+                self.run_dir(att["task_id"], att["attempt_no"]) / "stderr.log")
+            if warning is not None:
+                warnings.append(warning)
         if warnings:
             evidence = dict(evidence or {}, warnings=warnings)
             observations["warnings"] = warnings
@@ -704,8 +711,6 @@ class Ledger:
              _merge_json(att["evidence_json"], evidence), now, now, att["attempt_id"], att["state"]))
         if cur.rowcount != 1:
             raise LedgerWriteFailed("attempt changed concurrently", attempt_id=att["attempt_id"])
-        task = c.execute("SELECT current_attempt, engine, payload_json FROM tasks WHERE task_id=?",
-                         (att["task_id"],)).fetchone()
         if task["current_attempt"] == att["attempt_no"]:
             c.execute("UPDATE tasks SET state=?, updated_at=? WHERE task_id=?",
                       (task_state_for(new_state, outcome), now, att["task_id"]))
@@ -719,7 +724,8 @@ class Ledger:
         if details["completion_marker_required"]:
             # The marker line sits at the end of the result, often past the excerpt: name it here.
             details["completion_marker"] = engines.completion_marker((native or {}).get("result"))
-        details.update({key: observations[key] for key in ("git", "warnings") if key in observations})
+        details.update({key: observations[key] for key in ("git", "warnings", "codex_git_repo_check")
+                        if key in observations})
         body = {
             "task_id": att["task_id"],
             "attempt_no": att["attempt_no"],

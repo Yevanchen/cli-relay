@@ -22,13 +22,18 @@ def _read(cwd: str, *args: str) -> Optional[bytes]:
     return result.stdout if result.returncode == 0 else None
 
 
+def is_work_tree(cwd: str) -> bool:
+    """A failed probe (including missing Git or a timeout) is not a detected work tree."""
+    return _read(cwd, "rev-parse", "--is-inside-work-tree") == b"true\n"
+
+
 def snapshot(cwd: str) -> Optional[Dict[str, Any]]:
     """None if no work tree is detected; each unavailable observation is also None.
 
     --no-optional-locks prevents status from refreshing/writing the index. No filenames,
     command output or error text leave this helper. Staged, unstaged and untracked files count.
     """
-    if _read(cwd, "rev-parse", "--is-inside-work-tree") != b"true\n":
+    if not is_work_tree(cwd):
         return None
     head = _read(cwd, "rev-parse", "--verify", "HEAD")
     head = head.strip() if head is not None else b""

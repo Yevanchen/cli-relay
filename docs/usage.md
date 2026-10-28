@@ -161,6 +161,32 @@ and notification event entries. A dirty tree also adds `warnings: [{"code": "unc
 This reports the whole tree, including pre-existing changes; it does not attribute edits to the
 task or change its outcome. These observations never enter the request payload or its hash.
 
+Codex **Git repository checks are automatic by default**, including on exact resume:
+
+- Omit `skip_git_repo_check` for **auto**: a read-only argv call to
+  `git -C <cwd> rev-parse --is-inside-work-tree` detects whether the task directory is in a
+  Git work tree, including a subdirectory. Outside a work tree, the adapter adds
+  `--skip-git-repo-check`; inside one, it leaves the Codex argv unchanged. The probe disables
+  optional Git writes and has a two-second timeout. Missing Git, a timeout or any failed probe
+  is treated as no detected work tree, so the flag is added.
+- `--option skip_git_repo_check=true` always passes `--skip-git-repo-check`.
+- `--option skip_git_repo_check=false` never passes it, preserving Codex's strict check even
+  in a plain temporary directory. When set, the option must be a JSON boolean; strings,
+  numbers and `null` are usage errors. Omit the option to select auto.
+
+Each built Codex attempt records `codex_git_repo_check` in `status`/`wait` attempt evidence,
+terminal event bodies and notification event entries: `auto_skipped` for an automatic skip,
+`explicit_skip` for `true`, and `enforced` when no flag is passed. Detection does not add an
+option to the stored request or change its hash. An explicit boolean remains part of the
+payload and its hash, as with other options. Sandbox, network and approval settings are
+unchanged.
+
+If a failed or blocked Codex attempt still writes `Not inside a trusted directory` to stderr,
+its `warnings` include `codex_trusted_directory` with a hint to submit a new task using
+`--option skip_git_repo_check=true`. Notifications include the hint too. This can also happen
+inside a Git work tree whose directory Codex does not trust; the warning does not change the
+attempt's outcome or automatically retry it.
+
 Codex **full access is off by default**. Requesting `sandbox="danger-full-access"` alone is a
 usage error. To opt in for one task, supply both options:
 

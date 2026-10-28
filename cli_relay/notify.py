@@ -253,7 +253,8 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
     return {"event_id": row["event_id"], "task_id": row["task_id"], "attempt_no": row["attempt_no"],
             "kind": row["kind"], "outcome": body.get("outcome") or row["kind"], "key": row.get("request_key"),
             **{key: body[key] for key in ("sandbox", "full_access", "network_access", "allowed_tools",
-                                          "completion_marker_required", "completion_marker", "origin", "git", "warnings")
+                                          "completion_marker_required", "completion_marker", "origin", "git", "warnings",
+                                          "codex_git_repo_check")
                if key in body},
             "result_excerpt": _clean(body.get("result_excerpt"), EXCERPT_MAX)}
 
@@ -280,6 +281,8 @@ def build_payload(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, re
                                for tool in w["tools"]})
         if denied_tools:
             head += " denied_tools=" + ",".join(denied_tools)
+        if any(w["code"] == "codex_trusted_directory" for w in warnings):
+            head += " hint=skip_git_repo_check=true"
     parts = [f"{r['event_id']} {r['task_id']}#{r['attempt_no']} {r['outcome']}" for r in refs[:3]]
     if len(refs) > 3:
         parts.append(f"+{len(refs) - 3} more")
