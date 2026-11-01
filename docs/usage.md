@@ -120,11 +120,11 @@ Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--yolo`
 `--continue`, `--last`, `--bare`.
 - The Codex sandbox is always passed explicitly, so neither the first run nor a resume takes it
   from the configuration of the moment. The same holds for the network access of `workspace-write`.
-- Claude always pins `dontAsk` for the task, including resume. This overrides a user/project
-  bypass default while retaining their settings, permission rules and subscription login.
+- Claude always pins `dontAsk` for the task, including resume. A `bypassPermissions` default
+  in any settings layer is rejected; other settings, permission rules and subscription login remain loaded.
   A conflicting managed mode, a stricter `plan` default, malformed checked settings, and a
   missing/mismatched runtime mode still block the run. `dontAsk` permits tools already allowed
-  by the existing rules, plus the `allowed_tools` a task opts in to (see below); it is not a
+  by the existing rules, plus the web tools, scoped writes and Bash prefixes a task opts in to; it is not a
   no-tools mode or a filesystem sandbox.
 - Claude: permission prompts that nobody can answer are denied by the CLI. A result that lists
   permission denials ends as `needs_input` unless native success and a known zero exit show the
@@ -249,6 +249,10 @@ cli-relay submit --key tests-1 --engine codex --cwd ~/code/app --prompt "Run the
   ```json
   {"config_network_access": true, "set_by_layers": ["user"], "complete": true}
   ```
+
+Scoped Edit/Write and Bash opt-ins are available through `--allow-write-dir` and `--allow-bash`;
+Codex also accepts `--network-access` or the `network_access` JSON alias. See the
+[README permission examples](../README.md#permission-opt-ins) for syntax, validation and limitations.
 
 Claude **adds no tool by default**. Under `dontAsk`, a tool that needs permission and is not
 already allowed by your settings is denied. A native failure with a permission denial ends

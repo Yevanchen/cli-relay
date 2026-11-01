@@ -185,15 +185,18 @@ Permission posture does not depend on the CLIs' configuration of the moment:
   other sandbox and never selects full access. Codex has no loopback-only setting, so the opt-in
   allows all network access from the sandbox; writes stay limited to the workspace.
 - Claude always gets `--permission-mode dontAsk --permission-prompts none`, including resume.
-  Preflight only accepts a user/project bypass default because that fixed CLI override replaces
-  it. A conflicting managed mode, a stricter `plan` default, and malformed checked settings
+  Preflight rejects `bypassPermissions` defaults in every settings layer.
+  A conflicting managed mode, a stricter `plan` default, and malformed checked settings
   still block. User/project settings
   and their allow/ask/deny rules remain loaded; the relay does not isolate HOME, copy credentials,
   skip setting sources, or bypass approvals. Existing allowed tools can still run.
   Every Claude run must report `permissionMode: dontAsk` in its init event; a mismatch or missing
   init blocks, including when reconciliation closes the attempt after a keeper crash.
 - A Claude task adds no tool unless it opts in with `allowed_tools`, a list of exact names from a
-  fixed allowlist (`WebSearch`, `WebFetch`). That adds one `--allowedTools` value for the task,
+  fixed allowlist (`WebSearch`, `WebFetch`), `allowed_write_dirs` (cwd subdirectories for Edit/Write),
+  or `allowed_bash_commands` (literal command prefixes). Directory grants reject traversal and
+  symlink escapes and are rechecked before launch. These are CLI rules, not a filesystem sandbox;
+  permitted Bash programs can write elsewhere. That adds one `--allowedTools` value for the task,
   on every attempt, and changes neither the mode nor any settings layer. Deny and ask rules of
   every layer, and managed `allowManagedPermissionRulesOnly`, still win. Native success plus a
   known zero exit treats denied tools as `permission_denials` warnings (tool names only), with
@@ -201,7 +204,7 @@ Permission posture does not depend on the CLIs' configuration of the moment:
   precedence and the allowlist are unchanged; `Monitor` is not allowed by the relay.
 - Argv checks reject `danger-full-access` unless both task options opt in, a workspace network
   setting other than the one built from the task's options, and Claude `--allowedTools` unless it
-  carries exactly the task's stored list. Every permission-bypass flag, including
+  carries exactly the rules generated from the task's validated lists. Every permission-bypass flag, including
   `--dangerously-bypass-approvals-and-sandbox`, `--yolo` and `--full-auto`, stays forbidden.
 - `--sandbox` is not the only thing that decides a Codex run's permissions: named permission
   profiles and requirements can take precedence. Codex runs, including opted-in full-access runs,

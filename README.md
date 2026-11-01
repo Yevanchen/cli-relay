@@ -59,7 +59,72 @@ Routes are configured per machine in `<home>/notifier.json`. Configuration, rout
 | `codex` | Codex (`read-only` by default; `workspace-write` / full access only with explicit options) |
 | `fixture` | Local stand-in for tests |
 
-Model and effort can be set per task with `--option`. Sandbox, network, and tool opt-ins are documented in [`docs/usage.md`](docs/usage.md#engines), and the guards behind them in [`docs/reliability.md`](docs/reliability.md) — not repeated here.
+Model and effort can be set per task with `--option`. More engine options are documented in
+[`docs/usage.md`](docs/usage.md#engines), and their guards in [`docs/reliability.md`](docs/reliability.md).
+
+### Permission opt-ins
+
+Defaults stay minimal: Claude pins `dontAsk` and adds no allow rules; its existing
+`allowed_tools` option accepts only `WebFetch` and `WebSearch`. Existing Claude settings and
+deny rules remain active. `bypassPermissions` is rejected in task options, argv and every
+settings layer, including user/project defaults. Codex defaults to `read-only`.
+
+Claude can opt into Edit and Write within specific task subdirectories and Bash command prefixes:
+
+```sh
+cli-relay submit --key reports --engine claude --cwd ~/code/app \
+  --prompt "Generate reports in out and run the Python checker." \
+  --allow-write-dir './out/**' --allow-write-dir './reports' \
+  --allow-bash python3 --allow-bash 'pip install --user'
+```
+
+Both flags are repeatable. Directories are relative to the task `--cwd`, with an optional
+trailing `/**`; absolute paths inside that cwd are also accepted. They become rules such as
+`Edit(./out/**)` and `Write(./out/**)`. The whole cwd, `..` components, paths outside cwd,
+symlink escapes and other glob/rule syntax are rejected. Paths are checked again before each
+launch, including resume. Command prefixes become `Bash(python3:*)` and
+`Bash(pip install --user:*)`. Use literal words separated by single spaces; shell operators,
+quotes within the value, substitutions and wildcard/rule syntax are rejected. Shell quoting
+around the CLI argument, as above, is fine.
+
+These are Claude permission rules, not an OS sandbox. A permitted interpreter or installer
+can write outside the Edit/Write directories; choose command prefixes accordingly. Existing
+Claude allow rules can also grant additional permissions, and filesystem checks cannot prevent
+symlinks changing after launch.
+
+Codex network access requires an explicit `workspace-write` sandbox:
+
+```sh
+cli-relay submit --key network-tests --engine codex --cwd ~/code/app \
+  --prompt "Run tests that bind localhost." \
+  --option sandbox=workspace-write --network-access
+```
+
+This pins `sandbox_workspace_write.network_access=true` on first runs and resumes. Without
+the opt-in, workspace network access remains pinned false. Network opt-ins are rejected with
+`read-only`, the default sandbox, and `danger-full-access`. The existing full-access gate is
+unchanged: it still requires both `--option sandbox=danger-full-access` and
+`--option allow_full_access=true`.
+
+The equivalent JSON task `options` fields (also accepted through `--option`) are:
+
+```sh
+# Claude
+--option 'allowed_write_dirs=["./out/**","./reports"]' \
+--option 'allowed_bash_commands=["python3","pip install --user"]'
+
+# Codex
+--option sandbox=workspace-write --option network_access=true
+```
+
+`network_access` is a typed boolean alias for the existing `allow_network`; both normalize to
+`allow_network` in stored options. Conflicting aliases or flag/JSON values are rejected.
+Claude lists are normalized and retained for exact resume and fresh reruns. Submit JSON,
+status and terminal events include `permissions`, containing the exact requested sandbox,
+network and tool opt-ins, or `"default minimal"`. Notification messages report the same
+permissions separately for every attempt, without truncating permission lists. These fields
+describe task opt-ins, not proof that a permission was used or a replacement for inherited
+Claude settings.
 
 Codex automatically adds `--skip-git-repo-check` when the task directory is outside a Git work
 tree. Use `--option skip_git_repo_check=true` to always skip the check, or `false` to enforce it.

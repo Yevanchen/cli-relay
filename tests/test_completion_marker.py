@@ -108,9 +108,9 @@ class OutcomeGate(unittest.TestCase):
                                   False)
         self.assertEqual(engines.request_details("codex", {"options": {}}),
                          {"sandbox": "read-only", "full_access": False, "network_access": False,
-                          "completion_marker_required": False})
+                          "completion_marker_required": False, "permissions": "default minimal"})
         self.assertEqual(engines.request_details("claude", {"options": {}}),
-                         {"allowed_tools": [], "completion_marker_required": False})
+                         {"allowed_tools": [], "completion_marker_required": False, "permissions": "default minimal"})
 
 
 class MarkerRoundTrip(RelayTestCase):

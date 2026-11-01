@@ -12,6 +12,7 @@ import fnmatch
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -48,9 +49,11 @@ _FORBIDDEN = {
 }
 
 _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
-    "claude": {"model": (str,), "effort": (str,), "allowed_tools": (list,), "require_completion_marker": (bool,)},
+    "claude": {"model": (str,), "effort": (str,), "allowed_tools": (list,),
+               "allowed_write_dirs": (list,), "allowed_bash_commands": (list,), "require_completion_marker": (bool,)},
     "codex": {"model": (str,), "effort": (str,), "sandbox": (str,), "allow_full_access": (bool,),
-              "allow_network": (bool,), "skip_git_repo_check": (bool,), "require_completion_marker": (bool,)},
+              "allow_network": (bool,), "network_access": (bool,),
+              "skip_git_repo_check": (bool,), "require_completion_marker": (bool,)},
     "fixture": {"duration_s": (int, float), "exit_code": (int,), "result": (str,), "side_effect_file": (str,),
                 "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,),
                 "descendant_s": (int, float), "descendant_pid_file": (str,), "require_completion_marker": (bool,)},
@@ -114,7 +117,66 @@ def validate_engine(engine: str) -> str:
     return engine
 
 
-def validate_options(engine: str, options: Dict[str, Any]) -> Dict[str, Any]:
+def _write_dirs(values: list, cwd: Optional[str]) -> List[str]:
+    """Accept literal directory names, optionally ending in /**; never caller-supplied globs."""
+    if values and cwd is None:
+        raise UsageError("allowed_write_dirs requires the task cwd")
+    root = Path(cwd).resolve() if cwd is not None else None
+    result = []
+    for value in values:
+        if not isinstance(value, str):
+            raise UsageError("allowed_write_dirs must contain directory strings")
+        directory = value[:-3] if value.endswith("/**") else value
+        if (not directory or not re.fullmatch(r"[A-Za-z0-9_./ -]+", directory)
+                or ".." in directory.split("/") or directory != directory.strip()):
+            raise UsageError("allowed_write_dirs requires literal directories without .. or rule syntax")
+        path = Path(directory)
+        if not path.is_absolute():
+            path = root / path
+        try:
+            resolved = path.resolve()
+            resolved_relative = resolved.relative_to(root)
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                # The absolute spelling may use an OS alias such as /var -> /private/var.
+                # Store a cwd-relative rule, never that outside lexical spelling.
+                relative = resolved_relative
+            if relative == Path(".") or resolved == root:
+                raise ValueError("the whole cwd is not a subdirectory")
+            if path.exists() and not path.is_dir():
+                raise ValueError("not a directory")
+            # A recursive grant must not hide an existing symlink escape beneath it.
+            def unreadable(exc):
+                raise exc
+
+            children = os.walk(path, followlinks=False, onerror=unreadable) if path.exists() else ()
+            for parent, dirs, files in children:
+                for name in dirs + files:
+                    child = Path(parent) / name
+                    if child.is_symlink():
+                        child.resolve().relative_to(resolved)
+        except (ValueError, OSError, RuntimeError) as exc:
+            raise UsageError("allowed_write_dirs must stay inside a task cwd subdirectory, including symlinks") from exc
+        result.append("./" + relative.as_posix() + "/**")
+    return sorted(set(result))
+
+
+def _bash_commands(values: list) -> List[str]:
+    result = []
+    for value in values:
+        # Prefix rules, not shell programs or raw Claude permission expressions. In particular
+        # commas, parentheses, wildcards, quoting, substitutions and separators are forbidden.
+        if (not isinstance(value, str) or not re.fullmatch(
+                r"[A-Za-z0-9_./+-]+(?: [A-Za-z0-9_./+=-]+)*", value)
+                or value.startswith("-") or "bypasspermissions" in value.lower()
+                or "dangerously-skip-permissions" in value.lower()):
+            raise UsageError("allowed_bash_commands requires literal command prefixes without shell or rule syntax")
+        result.append(value)
+    return sorted(set(result))
+
+
+def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str] = None) -> Dict[str, Any]:
     spec = _OPTION_TYPES[engine]
     clean: Dict[str, Any] = {}
     for key, value in sorted(options.items()):
@@ -126,6 +188,10 @@ def validate_options(engine: str, options: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(value, types):
             raise UsageError(f"option {key!r} has the wrong type")
         clean[key] = value
+    if engine == "codex" and "network_access" in clean:
+        if "allow_network" in clean and clean["allow_network"] != clean["network_access"]:
+            raise UsageError("network_access and allow_network must agree")
+        clean["allow_network"] = clean.pop("network_access")
     if engine == "codex":
         sandboxes = (*CODEX_SANDBOXES, CODEX_FULL_ACCESS)
         if "sandbox" in clean and clean["sandbox"] not in sandboxes:
@@ -152,6 +218,13 @@ def validate_options(engine: str, options: Dict[str, Any]) -> Dict[str, Any]:
         if len(set(tools)) != len(tools):
             raise UsageError("allowed_tools names a tool more than once")
         clean["allowed_tools"] = sorted(tools)  # a set of tools: the order is not part of the request
+    if engine == "claude":
+        if "bypasspermissions" in json.dumps(clean).lower():
+            raise UsageError("bypassPermissions is forbidden")
+        if "allowed_write_dirs" in clean:
+            clean["allowed_write_dirs"] = _write_dirs(clean["allowed_write_dirs"], cwd)
+        if "allowed_bash_commands" in clean:
+            clean["allowed_bash_commands"] = _bash_commands(clean["allowed_bash_commands"])
     if "effort" in clean and clean["effort"] not in EFFORT_LEVELS:
         raise UsageError("effort must be low, medium, high, xhigh or max", allowed=list(EFFORT_LEVELS))
     for key in ("side_effect_file", "descendant_pid_file"):
@@ -376,10 +449,9 @@ def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None, *,
             problems.append(f"{layer}:permissions")
             permissions = {}
         mode = permissions.get("defaultMode")
-        # The adapter pins dontAsk on every first/resumed run. Only that known CLI override
-        # permits a non-managed bypass default; malformed or managed policy still blocks.
+        # Bypass defaults are rejected in every layer, even though argv pins dontAsk.
         if ((mode is not None and mode not in CLAUDE_PERMISSION_MODES) or
-                (mode == "bypassPermissions" and permission_mode != CLAUDE_PERMISSION_MODE) or
+                mode == "bypassPermissions" or
                 (permission_mode == CLAUDE_PERMISSION_MODE and
                  (mode == "plan" or (layer == "managed" and mode not in (None, CLAUDE_PERMISSION_MODE))))):
             problems.append(f"{layer}:permissions.defaultMode")
@@ -446,7 +518,7 @@ def preflight(engine: str, env: Dict[str, str], cwd: Optional[str] = None, *,
         return Preflight(False, "billing_env_present", {"names": present})
     if engine == "fixture":
         return Preflight(True)
-    opts = validate_options(engine, options or {})
+    opts = validate_options(engine, options or {}, cwd=cwd)
     if engine == "codex":
         problems, layers = codex_config_problems(env, cwd)
     else:
@@ -529,8 +601,10 @@ def full_access_enabled(engine: str, payload: Dict[str, Any]) -> bool:
 
 def network_enabled(engine: str, payload: Dict[str, Any]) -> bool:
     """Network in the workspace-write sandbox needs both options, as full access does."""
+    options = payload.get("options") or {}
+    network = options.get("allow_network", options.get("network_access"))
     return (engine == "codex" and requested_sandbox(engine, payload) == CODEX_WORKSPACE_WRITE
-            and (payload.get("options") or {}).get("allow_network") is True)
+            and network is True and options.get("network_access", network) is network)
 
 
 def codex_network_override(engine: str, payload: Dict[str, Any]) -> Optional[str]:
@@ -555,11 +629,33 @@ def completion_marker(result: Any) -> Optional[str]:
 
 
 def requested_tools(engine: str, payload: Dict[str, Any]) -> List[str]:
-    """The extra Claude tools of a task; only allowable names in a list count, never a string."""
-    tools = (payload.get("options") or {}).get("allowed_tools") if engine == "claude" else None
+    """Expand a validated task's web tools, directory grants and command prefixes into rules."""
+    if engine != "claude":
+        return []
+    options = payload.get("options") or {}
+    tools = options.get("allowed_tools", [])
     if not isinstance(tools, list):
         return []
-    return sorted({tool for tool in tools if isinstance(tool, str) and tool in CLAUDE_ALLOWABLE_TOOLS})
+    rules = {tool for tool in tools if isinstance(tool, str) and tool in CLAUDE_ALLOWABLE_TOOLS}
+    for directory in options.get("allowed_write_dirs", []):
+        rules.update((f"Edit({directory})", f"Write({directory})"))
+    for command in options.get("allowed_bash_commands", []):
+        rules.add(f"Bash({command}:*)")
+    return sorted(rules)
+
+
+def permission_summary(details: Dict[str, Any]) -> str:
+    """Exact task opt-ins, shared by submit receipts and notification messages."""
+    opened = []
+    if details.get("sandbox") not in (None, "read-only"):
+        opened.append("sandbox=" + details["sandbox"])
+    if details.get("full_access") is True:
+        opened.append("full_access=true")
+    if details.get("network_access") is True:
+        opened.append("network_access=true")
+    if details.get("allowed_tools"):
+        opened.append("allowed_tools=" + ",".join(details["allowed_tools"]))
+    return "; ".join(opened) or "default minimal"
 
 
 def permission_details(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -576,7 +672,9 @@ def permission_details(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 def request_details(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """What a task asked for, for receipts, status and events: its permissions and whether success
     needs the completion marker."""
-    return {**permission_details(engine, payload), "completion_marker_required": completion_marker_required(payload)}
+    details = permission_details(engine, payload)
+    return {**details, "permissions": permission_summary(details),
+            "completion_marker_required": completion_marker_required(payload)}
 
 
 def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[str],
@@ -643,23 +741,32 @@ def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[
     return None
 
 
-def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str, Any]] = None) -> None:
+def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str, Any]] = None,
+                cwd: Optional[str] = None) -> None:
     args = list(argv)
     bad = sorted(set(args) & _FORBIDDEN[engine])
-    if engine == "codex":
+    if engine in ("codex", "claude"):
         bad = sorted({arg for arg in args if arg.partition("=")[0] in _FORBIDDEN[engine]})
+    if engine == "claude" and any("bypasspermissions" in arg.lower() for arg in args):
+        bad.append("bypassPermissions")
     if bad:
         raise RuntimeError(f"refusing to run {engine} with forbidden flags {bad}")
     sandboxes = set(CODEX_SANDBOXES)
     if full_access_enabled(engine, {"options": options}):
         sandboxes.add(CODEX_FULL_ACCESS)
     network = codex_network_override(engine, {"options": options})
-    tools = ",".join(requested_tools(engine, {"options": options}))
     if engine == "claude":
+        if options and ("allowed_write_dirs" in options or "allowed_bash_commands" in options):
+            try:
+                validated = validate_options(engine, options, cwd=cwd)
+            except UsageError as exc:
+                raise RuntimeError("refusing unvalidated claude allowed tools") from exc
+            options = validated
         modes = [args[i + 1] if i + 1 < len(args) else None for i, arg in enumerate(args)
                  if arg == "--permission-mode"]
         if modes != [CLAUDE_PERMISSION_MODE] or any(arg.startswith("--permission-mode=") for arg in args):
             raise RuntimeError("refusing to run claude without the explicit dontAsk permission mode")
+    tools = ",".join(requested_tools(engine, {"options": options}))
     for i, arg in enumerate(args):
         sandbox = override = None
         if arg in ("--sandbox", "-s") and (i + 1 < len(args) or engine == "codex"):
@@ -686,6 +793,8 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
             if override.replace(" ", "") not in allowed:
                 raise RuntimeError("refusing a codex config override other than an approved sandbox, a validated "
                                    "effort or the task's own workspace network setting")
+        if engine == "claude" and arg.startswith("--settings="):
+            raise RuntimeError("refusing unvalidated claude settings")
         if engine == "claude" and arg == "--settings":
             try:
                 setting = json.loads(args[i + 1])
@@ -706,8 +815,8 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
 
 def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_dir: Path,
           fixture_state_dir: str, env: Dict[str, str]) -> Spec:
-    opts = validate_options(engine, payload.get("options", {}))
     cwd = payload["cwd"]
+    opts = validate_options(engine, payload.get("options", {}), cwd=cwd)
     resume = attempt.get("resume_session_id")
     cenv = child_env(env)
     last_message = None
@@ -717,10 +826,11 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
         argv = [binary, "-p", "--output-format", "stream-json", "--verbose"]
         argv += ["--resume", resume] if resume else ["--session-id", attempt["native_session_id"]]
         argv += ["--permission-mode", CLAUDE_PERMISSION_MODE, "--permission-prompts", "none"]
-        if opts.get("allowed_tools"):
+        tools = requested_tools(engine, {"options": opts})
+        if tools:
             # Allow rules for this session only: deny and ask rules of every settings layer, managed
             # included, still win; the mode, the settings files and their sources stay as they are.
-            argv += ["--allowedTools", ",".join(opts["allowed_tools"])]
+            argv += ["--allowedTools", ",".join(tools)]
         if opts.get("model"):
             argv += ["--model", opts["model"]]
         if opts.get("effort"):
@@ -781,7 +891,7 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
         cenv["CLI_RELAY_ATTEMPT_ID"] = attempt["attempt_id"]
     if not argv[0]:
         raise RuntimeError(f"{engine} CLI not found")
-    assert_safe(engine, argv, options=opts)
+    assert_safe(engine, argv, options=opts, cwd=cwd)
     return Spec(argv=argv, env=cenv, cwd=cwd, last_message_path=last_message, evidence=evidence)
 
 

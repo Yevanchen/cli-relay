@@ -95,13 +95,13 @@ class TaskLocalOptions(unittest.TestCase):
             with self.subTest(config=config), self.assertRaises(RuntimeError):
                 engines.assert_safe("codex", ["codex", "exec", "-c", config])
 
-    def test_only_known_overridden_mode_is_tolerated_and_rules_are_not_removed(self) -> None:
+    def test_bypass_is_rejected_and_rules_are_not_removed(self) -> None:
         settings = Path(self.env["CLAUDE_CONFIG_DIR"]) / "settings.json"
         data = {"permissions": {"defaultMode": "bypassPermissions", "deny": ["Bash(rm *)"],
                                  "ask": ["Edit"], "allow": ["Read"]}}
         saved = json.dumps(data)
         settings.write_text(saved)
-        self.assertTrue(engines.preflight("claude", self.env, options={"effort": "max"}).ok)
+        self.assertFalse(engines.preflight("claude", self.env, options={"effort": "max"}).ok)
         self.assertEqual(settings.read_text(), saved)
         self.assertIn("user:permissions.defaultMode", engines.claude_settings_problems(self.env)[0])
         data["permissions"]["defaultMode"] = "plan"
@@ -243,7 +243,7 @@ class TaskLocalConfigClosedLoop(RelayTestCase):
     def test_claude_new_and_exact_resume_preserve_global_settings(self) -> None:
         env = self.fake_env("claude")
         settings = Path(env["CLAUDE_CONFIG_DIR"]) / "settings.json"
-        saved = json.dumps({"permissions": {"defaultMode": "bypassPermissions", "deny": ["Edit"]},
+        saved = json.dumps({"permissions": {"defaultMode": "default", "deny": ["Edit"]},
                             "env": {engines.CLAUDE_EFFORT_ENV: "low"}})
         settings.write_text(saved)
         sub = self.submit_model("claude", env)
