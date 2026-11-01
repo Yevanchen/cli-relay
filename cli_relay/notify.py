@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from . import procs
+from . import engines, procs
 from .errors import Refused, UsageError
 from .keeper import _hook
 from .ledger import Ledger, canonical_json, now_iso
@@ -252,7 +252,7 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
     body = json.loads(row["body_json"])
     return {"event_id": row["event_id"], "task_id": row["task_id"], "attempt_no": row["attempt_no"],
             "kind": row["kind"], "outcome": body.get("outcome") or row["kind"], "key": row.get("request_key"),
-            **{key: body[key] for key in ("sandbox", "full_access", "network_access", "allowed_tools",
+            **{key: body[key] for key in ("sandbox", "full_access", "network_access", "allowed_tools", "permissions",
                                           "completion_marker_required", "completion_marker", "origin", "git", "warnings",
                                           "codex_git_repo_check")
                if key in body},
@@ -267,13 +267,6 @@ def build_payload(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, re
     status = single["outcome"] if single else "multiple"
     head = (f"cli-relay {'reminder ' if reminder else ''}source={cfg['source_id']} ledger={ledger_id} "
             f"route={route['name']} events={len(refs)}")
-    if any(r.get("full_access") is True for r in refs):
-        head += " full_access=true"  # also visible through the five-field command adapter
-    if any(r.get("network_access") is True for r in refs):
-        head += " network_access=true"
-    tools = sorted({tool for r in refs for tool in r.get("allowed_tools") or []})
-    if tools:
-        head += " allowed_tools=" + ",".join(tools)
     warnings = [warning for r in refs for warning in r.get("warnings", [])]
     if warnings:
         head += " warnings=" + ",".join(sorted({w["code"] for w in warnings}))
@@ -289,11 +282,16 @@ def build_payload(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, re
     summary = head + " | " + " ; ".join(parts)
     if single and single["result_excerpt"]:
         summary += " | " + single["result_excerpt"]
+    # Excerpts/identifiers remain bounded, but permissions must never be truncated or merged
+    # across runs: even a batched notification says exactly what each attempt requested.
+    permissions = " | ".join(f"{r['task_id']}#{r['attempt_no']} permissions: {engines.permission_summary(r)}"
+                             for r in refs)
     record = {"schema": PAYLOAD_SCHEMA, "source_id": cfg["source_id"], "ledger_id": ledger_id,
               "route": route["name"], "chat": route["chat"], "consumer": route["consumer"],
               "reminder": reminder, "count": len(refs), "events": refs}
     return {"job": route["adapter"]["job"], "stage": f"{cfg['source_id']}/{route['name']}", "status": status,
-            "summary": _clean(summary, SUMMARY_MAX), "artifact": f"cli-relay:{cfg['source_id']}:{ledger_id}",
+            "summary": _clean(summary, SUMMARY_MAX) + " | " + permissions,
+            "artifact": f"cli-relay:{cfg['source_id']}:{ledger_id}",
             "cli_relay": record}
 
 

@@ -55,15 +55,15 @@ class ClaudeDefaultModeIsTightened(unittest.TestCase):
     def test_user_settings(self) -> None:
         (self.tmp / "claude-config" / "settings.json").write_text(
             json.dumps({"permissions": {"defaultMode": "bypassPermissions"}}))
-        self.assertTrue(engines.preflight("claude", self.env).ok)
+        self.assertFalse(engines.preflight("claude", self.env).ok)
         self.assertIn("user:permissions.defaultMode", engines.claude_settings_problems(self.env)[0],
-                      "a raw settings check must still reject bypass without a known CLI override")
+                      "every settings layer must reject bypass, even with the CLI override")
 
     def test_project_settings_of_the_task_directory(self) -> None:
         (self.tmp / "work" / ".claude" / "settings.local.json").write_text(
             json.dumps({"permissions": {"defaultMode": "bypassPermissions"}}))
         self.assertTrue(engines.preflight("claude", self.env).ok, "not visible without the task directory")
-        self.assertTrue(engines.preflight("claude", self.env, cwd=str(self.tmp / "work")).ok)
+        self.assertFalse(engines.preflight("claude", self.env, cwd=str(self.tmp / "work")).ok)
         self.assertIn("project:permissions.defaultMode",
                       engines.claude_settings_problems(self.env, str(self.tmp / "work"))[0])
 

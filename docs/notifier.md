@@ -227,7 +227,7 @@ The five `notify.sh` fields, so an existing routine keeps working:
 | `job` | the adapter's `job` (default `CLI_RELAY`) |
 | `stage` | `<source_id>/<route>` |
 | `status` | the outcome (`succeeded`, `failed`, `blocked`, `needs_input`, `unknown`), or `multiple` for a batch |
-| `summary` | one line, at most 400 characters: `cli-relay [reminder] source=… ledger=… route=… events=N \| <event_id> <task_id>#<attempt> <outcome> ; …`, plus a short result excerpt for a single event. Control characters, `"` and `\` are replaced |
+| `summary` | one line: a header and result excerpt bounded to 400 characters, followed by the complete permission opt-ins (or `default minimal`) for every task attempt. Permission lists are never truncated. Control characters, `"` and `\` in the excerpt are replaced |
 | `artifact` | `cli-relay:<source_id>:<ledger_id>` |
 
 The HTTP adapter also sends `cli_relay`, a structured copy:

@@ -184,7 +184,15 @@ def cmd_submit(args: argparse.Namespace) -> int:
     key = _check_key(args.key)
     prompt = _read_prompt(args)
     cwd = os.path.realpath(args.cwd)
-    options = engines.validate_options(engine, _parse_options(args.option))
+    raw_options = _parse_options(args.option)
+    for flag, field in (("allow_write_dir", "allowed_write_dirs"),
+                        ("allow_bash", "allowed_bash_commands"), ("network_access", "network_access")):
+        value = getattr(args, flag, None)
+        if value is not None:
+            if field in raw_options and raw_options[field] != value:
+                raise UsageError(f"--{flag.replace('_', '-')} conflicts with --option {field}")
+            raw_options[field] = value
+    options = engines.validate_options(engine, raw_options, cwd=cwd)
     payload = {"engine": engine, "cwd": cwd, "prompt": prompt, "options": options, **_parse_origin(args.origin)}
     ledger = Ledger(args.home, integrity=True)
     existing = None
@@ -508,6 +516,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     out["claude_tool_policy"] = {
         "default_allowed_tools": [], "allowable_tools": list(engines.CLAUDE_ALLOWABLE_TOOLS),
         "opt_in": "--option 'allowed_tools=[\"WebSearch\",\"WebFetch\"]'",
+        "write_opt_in": "--allow-write-dir './out/**' (repeatable; allowed_write_dirs JSON list)",
+        "bash_opt_in": "--allow-bash python3 (repeatable; allowed_bash_commands JSON list)",
         "effect": "adds --allowedTools for that task only; the permission mode stays dontAsk and no "
                   "--settings layer or settings file is changed",
         "precedence": "deny and ask rules of every settings layer, managed included, still win, and managed "
@@ -644,6 +654,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--prompt")
     s.add_argument("--prompt-file")
     s.add_argument("--option", action="append", default=[], metavar="KEY=VALUE")
+    s.add_argument("--allow-write-dir", action="append", metavar="DIR",
+                   help="Claude: allow Edit/Write recursively in a task cwd subdirectory (repeatable)")
+    s.add_argument("--allow-bash", action="append", metavar="COMMAND",
+                   help="Claude: allow a literal Bash command prefix (repeatable)")
+    s.add_argument("--network-access", action="store_true", default=None,
+                   help="Codex: enable network access; requires --option sandbox=workspace-write")
     s.add_argument("--notify-route", help="route in notifier.json that is woken when the task ends")
     s.add_argument("--origin", metavar='JSON', help='optional origin metadata: {"bot":"NAME","chat":"ID"}')
     s.set_defaults(func=cmd_submit)
