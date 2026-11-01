@@ -449,9 +449,11 @@ def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None, *,
             problems.append(f"{layer}:permissions")
             permissions = {}
         mode = permissions.get("defaultMode")
-        # Bypass defaults are rejected in every layer, even though argv pins dontAsk.
+        # The adapter pins dontAsk on every first/resumed run. Only that known CLI override
+        # permits a non-managed bypass default; malformed or managed policy still blocks.
+        # Task options can never request bypass (validate_options/assert_safe reject it).
         if ((mode is not None and mode not in CLAUDE_PERMISSION_MODES) or
-                mode == "bypassPermissions" or
+                (mode == "bypassPermissions" and permission_mode != CLAUDE_PERMISSION_MODE) or
                 (permission_mode == CLAUDE_PERMISSION_MODE and
                  (mode == "plan" or (layer == "managed" and mode not in (None, CLAUDE_PERMISSION_MODE))))):
             problems.append(f"{layer}:permissions.defaultMode")

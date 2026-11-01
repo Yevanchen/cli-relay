@@ -55,15 +55,24 @@ class ClaudeDefaultModeIsTightened(unittest.TestCase):
     def test_user_settings(self) -> None:
         (self.tmp / "claude-config" / "settings.json").write_text(
             json.dumps({"permissions": {"defaultMode": "bypassPermissions"}}))
-        self.assertFalse(engines.preflight("claude", self.env).ok)
+        self.assertTrue(engines.preflight("claude", self.env).ok)
         self.assertIn("user:permissions.defaultMode", engines.claude_settings_problems(self.env)[0],
-                      "every settings layer must reject bypass, even with the CLI override")
+                      "a raw settings check must still reject bypass without a known CLI override")
+
+    def test_user_bypass_default_with_scoped_opt_ins(self) -> None:
+        # Regression (#19 deploy): opt-in write dirs / Bash allowlist must still run when the
+        # machine's user settings default to bypassPermissions; argv pins dontAsk regardless.
+        (self.tmp / "claude-config" / "settings.json").write_text(
+            json.dumps({"permissions": {"defaultMode": "bypassPermissions"}}))
+        (self.tmp / "work" / "out").mkdir()
+        opts = {"allowed_write_dirs": ["out"], "allowed_bash_commands": ["python3"]}
+        self.assertTrue(engines.preflight("claude", self.env, cwd=str(self.tmp / "work"), options=opts).ok)
 
     def test_project_settings_of_the_task_directory(self) -> None:
         (self.tmp / "work" / ".claude" / "settings.local.json").write_text(
             json.dumps({"permissions": {"defaultMode": "bypassPermissions"}}))
         self.assertTrue(engines.preflight("claude", self.env).ok, "not visible without the task directory")
-        self.assertFalse(engines.preflight("claude", self.env, cwd=str(self.tmp / "work")).ok)
+        self.assertTrue(engines.preflight("claude", self.env, cwd=str(self.tmp / "work")).ok)
         self.assertIn("project:permissions.defaultMode",
                       engines.claude_settings_problems(self.env, str(self.tmp / "work"))[0])
 
