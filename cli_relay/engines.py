@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from . import git_state
+from . import business_status, git_state
 from .errors import UsageError
 
 ENGINES = ("claude", "codex", "fixture")
@@ -58,6 +58,8 @@ _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
                 "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,),
                 "descendant_s": (int, float), "descendant_pid_file": (str,), "require_completion_marker": (bool,)},
 }
+for _spec in _OPTION_TYPES.values():
+    _spec.update({"result_file": (str,), "require_business_status": (bool,)})
 
 CODEX_SANDBOXES = ("read-only", "workspace-write")
 CODEX_FULL_ACCESS = "danger-full-access"
@@ -230,6 +232,8 @@ def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str]
     for key in ("side_effect_file", "descendant_pid_file"):
         if engine == "fixture" and key in clean and not os.path.isabs(clean[key]):
             raise UsageError(f"{key} must be an absolute path")
+    if "result_file" in clean:
+        clean["result_file"] = business_status.validate_result_file(clean["result_file"], cwd)
     return clean
 
 
