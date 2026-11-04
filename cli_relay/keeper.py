@@ -108,6 +108,10 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     log = _Log(run_dir / "keeper.log")
     env = dict(os.environ)
+    if "unset_env" in payload.get("options", {}):
+        names = payload["options"]["unset_env"]
+        ledger.add_evidence(attempt_id, {"unset_env": names,
+                                         "unset_env_present": [name for name in names if name in env]})
     git_before = None
 
     def notify_pass() -> None:
@@ -157,6 +161,8 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         return 0
     if not pf.ok:
         log(f"preflight blocked: {pf.reason}")
+        if pf.detail.get("message"):
+            log(pf.detail["message"])
         close("blocked", {"preflight": {"reason": pf.reason, **pf.detail}})
         return 0
     permission_checkpoint = None
@@ -306,7 +312,8 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     if violation is not None:
         exit_info["billing_guard"] = violation  # survives a keeper that dies before the commit below
     last_message = Path(spec.last_message_path) if spec.last_message_path else None
-    parsed = engines.parse_output(engine, stdout_path, last_message)
+    parsed = engines.parse_output(engine, stdout_path, last_message,
+                                 allowed_bash_commands=(payload.get("options") or {}).get("allowed_bash_commands", []))
     if parsed["session_id"] and parsed["session_id"] != recorded_sid:
         ledger.set_native_session(attempt_id, parsed["session_id"])
     cancel_requested = cancel["set"] or ledger.cancel_requested(attempt_id)
@@ -334,6 +341,8 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     _hook("after_exit_before_commit")
 
     evidence: Dict[str, Any] = {"exit_source": "keeper_waitpid", **decided, **git_result}
+    if parsed.get("warnings"):
+        evidence["warnings"] = parsed["warnings"]
     if "process_group_cleanup" in exit_info or "remaining_after_normal_exit" in cleanup:
         evidence["process_group_cleanup"] = cleanup
     if "process_group_cleanup" in exit_info:

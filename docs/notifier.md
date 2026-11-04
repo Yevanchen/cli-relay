@@ -316,8 +316,21 @@ contains `head_before`, `head_after` and `dirty`; unavailable values are `null`.
 the form `{"code": "uncommitted_changes"}` or `{"code": "permission_denials", "tools": ["Monitor"]}`.
 The summary also names warning codes and denied tools for the command adapter. A native success
 with exit 0 can carry denial warnings while remaining `succeeded`; a required completion marker
-still gates it. Git observations never change the outcome. Without these observations, no empty
-warning list or non-Git placeholder is added.
+still gates it. A structured Bash denial matching a task's requested command prefix also adds
+`{"code": "allowed_rule_denied", "commands": ["cp -n a b"]}`. Only matching prefixes requested
+by the user are copied, without runtime arguments. The list is unique and sorted, with each
+prefix truncated to 200 characters; the summary reports the prefix count and first prefix
+(up to 80 characters). No tool-input fields are copied into the diagnostic. See the
+[Claude prefix-rule limitation and submit warning](usage.md#allowed_bash_commands).
+Git observations and these diagnostics never change the outcome. Without these observations, no
+empty warning list or non-Git placeholder is added.
+
+Tasks submitted with `--unset-env NAME` carry `unset_env` in event bodies and structured
+notification event entries. `unset_env_present` lists the requested names observed before
+cleanup for that attempt, including empty values; it is omitted if the keeper never took a
+snapshot. Only names are recorded. Billing-blocked events also carry `preflight` with the
+unchanged reason/names and copyable `--unset-env` / `env -u` fixes. These fields are absent
+from historical events and do not change routing or delivery.
 
 ### Earlier v0.2 candidate ledgers
 

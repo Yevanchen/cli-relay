@@ -84,7 +84,11 @@ class ArgvSafety(unittest.TestCase):
         pf = engines.preflight("claude", env)
         self.assertFalse(pf.ok)
         self.assertEqual(pf.reason, "billing_env_present")
-        self.assertEqual(pf.detail, {"names": ["ANTHROPIC_API_KEY"]})
+        self.assertEqual(pf.detail["names"], ["ANTHROPIC_API_KEY"])
+        self.assertEqual(pf.detail["fix"], {"submit_flags": "--unset-env ANTHROPIC_API_KEY",
+                                           "env_prefix": "env -u ANTHROPIC_API_KEY"})
+        self.assertIn("--unset-env ANTHROPIC_API_KEY", pf.detail["message"])
+        self.assertIn("env -u ANTHROPIC_API_KEY", pf.detail["message"])
         self.assertNotIn("sk-secret", json.dumps(pf.detail))
         pf = engines.preflight("codex", dict(self.env, OPENAI_API_KEY="sk-other"))
         self.assertEqual((pf.ok, pf.reason), (False, "billing_env_present"))

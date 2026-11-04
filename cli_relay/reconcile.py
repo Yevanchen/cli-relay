@@ -81,7 +81,8 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
     payload = json.loads(task["payload_json"])
     run_dir = ledger.run_dir(att["task_id"], att["attempt_no"])
     exit_info = _read_exit(run_dir)
-    parsed = engines.parse_output(engine, run_dir / "stdout.jsonl", run_dir / "last_message.txt")
+    parsed = engines.parse_output(engine, run_dir / "stdout.jsonl", run_dir / "last_message.txt",
+                                 allowed_bash_commands=(payload.get("options") or {}).get("allowed_bash_commands", []))
     if parsed["session_id"] and parsed["session_id"] != att["native_session_id"]:
         ledger.set_native_session(att["attempt_id"], parsed["session_id"])
     native = parsed["native"]
@@ -115,6 +116,8 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
 
     outcome, decided = decide((exit_info or {}).get("exit_code"), (exit_info or {}).get("signal"),
                               exit_info is not None)
+    if parsed.get("warnings"):
+        decided["warnings"] = parsed["warnings"]
     cli_alive = procs.same_process_alive(att["cli_pid"], att["cli_token"]) if att["cli_pid"] else None
     group_alive = procs.group_alive(att["keeper_pgid"])
     action.update(cli_alive=cli_alive, group_alive=group_alive)

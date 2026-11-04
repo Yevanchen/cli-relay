@@ -191,6 +191,57 @@ and [D16](decisions.md#d16-issue-4-registered-routes-visible-message-proof-and-o
 This change has only local fake/mock test evidence. No new live webhook route was approved or
 verified, and it makes no new 25-hour reliability claim.
 
+## Per-task environment cleanup
+
+`submit --unset-env NAME` removes an inherited billing environment variable for that task only.
+Repeat the flag for more names:
+
+```sh
+cli-relay submit --key clean-env-1 --engine codex --cwd ~/code/app --prompt "Run the tests." \
+  --unset-env OPENAI_BASE_URL --unset-env OPENAI_API_KEY
+```
+
+Like `--network-access`, this is a CLI flag mapped to a persisted task option, rather than an
+argv option passed to the engine. The equivalent is
+`--option 'unset_env=["OPENAI_BASE_URL","OPENAI_API_KEY"]'`. Both forms store a sorted, unique
+`options.unset_env` list; duplicate names are harmless. If both forms are supplied, their
+normalized lists must agree. Omitting both adds no field and preserves existing payload hashes.
+An explicit JSON `[]` is stored as an empty list. Changing the list under an existing scope/key
+is a payload conflict, so use a new key when adding it to an already-created task.
+
+Names must match `[A-Za-z_][A-Za-z0-9_]*`; assignments such as `NAME=value` are rejected without
+echoing their values. Cleanup is restricted to the union of the engines' billing variables:
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`,
+`CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `ANTHROPIC_BEDROCK_BASE_URL`,
+`ANTHROPIC_VERTEX_BASE_URL`, `ANTHROPIC_VERTEX_PROJECT_ID`, `OPENAI_API_KEY`, `CODEX_API_KEY`,
+`OPENAI_BASE_URL`, and `AZURE_OPENAI_API_KEY`. Any of these names is accepted for either engine
+and the fixture. Other names, including HOME, configuration directories and relay controls,
+are refused. The option only removes variables; it cannot set values or alter configuration files.
+
+### Preflight
+
+Cleanup happens before the billing/configuration/login checks and in the CLI child environment
+on first runs, exact resumes and explicit fresh reruns. The stored list is reused; resume cannot
+change it. The relay's own environment, launchd, shell profiles and unrelated tasks are unchanged.
+Existing session-marker and test-variable scrubbing still applies. Variables not named in the
+list retain the existing behavior, and subscription/configuration guards still apply.
+
+Without cleanup, `billing_env_present` keeps its reason code and `names` list. Its preflight
+details now also contain `fix.submit_flags` (for example `--unset-env OPENAI_BASE_URL`),
+`fix.env_prefix` (`env -u OPENAI_BASE_URL`) and a `message` containing both fixes. The prefix goes
+before `cli-relay`; flags go on `submit`. The `env -u` prefix applies only to that invocation;
+use `--unset-env` to retain cleanup for future resumes. `doctor --engine codex` /
+`--engine claude` shows the same hint when billing variables block it. Blocked terminal events
+include these billing preflight details too.
+
+Submit/resume receipts, task records and terminal events include `unset_env` only when requested.
+Once the keeper observes the attempt's environment, attempt evidence and terminal events also
+include `unset_env_present`: the requested names that existed before cleanup, even if their
+values were empty. An absent requested name is harmless. Values are never recorded by cleanup.
+The snapshot is taken again for each attempt and survives reconciliation; if the keeper never
+observed the environment, `unset_env_present` is omitted rather than guessed. Structured
+notification event entries carry the same fields. No ledger migration is needed.
+
 ## Engines
 
 | Engine | Runs | Resume |
@@ -338,15 +389,57 @@ Scoped Edit/Write and Bash opt-ins are available through `--allow-write-dir` and
 Codex also accepts `--network-access` or the `network_access` JSON alias. See the
 [README permission examples](../README.md#permission-opt-ins) for syntax, validation and limitations.
 
+### allowed_bash_commands
+
+`--allow-bash 'cp -n a b'` and `--option 'allowed_bash_commands=["cp -n a b"]'` request the same
+`Bash(cp -n a b:*)` prefix rule. Claude Code itself decides whether a command matches. In the
+2026-11-04 reproduction with Claude Code 2.1.312, `dontAsk` and a clean non-Git cwd, these
+commands were each listed in the same `--allowedTools` argument:
+
+| Observed result | Commands |
+|---|---|
+| Denied | `cp -n a.example a.txt`, `cp -p a.example f.txt`, `cp -n a.example g.txt` |
+| Denied for dotfiles and scoped output too | `cp -n .env.example .env`, `cp -n .env.example env.txt`, `cp -n x.example .env2`, `cp -n a.example out/c.txt` (with `allowed_write_dirs=["out"]`) |
+| Allowed | `cp a.example b.txt`, `cp a.example out/m.txt` |
+| Allowed, including other commands with flags | `cat a.example`, `touch d.txt`, `mkdir e`, `ls -la a.example`, `mkdir -p k/l` |
+
+This is an observed Claude matching limitation for `cp` with flags, including `-n` and `-p`.
+The relay keeps the rule construction, settings and permission mode unchanged. Use
+`cp <src> <dst>` without flags (remove `-n` only when overwriting the destination is acceptable),
+or check existence with `test -e` first (request a prefix for that check too). An existence
+check followed by a copy is not atomic.
+
+- Submit receipts include one `{"code": "bash_rule_not_honoured", "command": "cp -n a b", "hint": "…"}`
+  per affected entry: its first word is `cp` and a later token starts with `-`. Only `cp` is on
+  the observed command list; this does not predict a problem with `mv`, `rm` or other commands.
+  The hint names the observed Claude version and workarounds. Submission still succeeds;
+  the warning is receipt metadata and does not change the stored payload or its hash.
+- After a Claude run, structured Bash denials whose stripped `tool_input.command` equals a
+  requested prefix or starts with that prefix plus a space add one
+  `{"code": "allowed_rule_denied", "commands": ["cp -n a b"]}` warning. This applies to any
+  requested Bash prefix. The diagnostic copies only matching requested prefixes, never runtime
+  arguments added to them. Prefixes are matched before truncation, then each is limited to 200
+  characters; the displayed list is unique and sorted. No tool-input fields are copied into
+  the diagnostic or native summary. Missing command details and older name-only denials add
+  no diagnostic.
+
+`allowed_rule_denied` follows the existing warnings path through `status`/`wait` attempt
+evidence, terminal events and notification entries. The notifier summary includes the command
+prefix count and first prefix. These diagnostics do not change the outcome, grant permissions or
+retry a task. An inherited deny or ask rule can also explain a matching denial.
+
+### Claude web tools
+
 Claude **adds no tool by default**. Under `dontAsk`, a tool that needs permission and is not
 already allowed by your settings is denied. A native failure with a permission denial ends
 `needs_input`. If Claude reports native success and exits 0, denials are warnings and the outcome
 is `succeeded`, subject to the completion marker gate below. Without a confirmed zero exit,
 denials still mean `needs_input`; cancellation keeps its existing precedence. `status`/`wait`
 attempt evidence, terminal events and notification event entries carry, for example,
-`warnings: [{"code": "permission_denials", "tools": ["Monitor"]}]`. Only tool names are included,
-not inputs; `Monitor` is not added to the allowlist. To allow `WebSearch` or `WebFetch` for one
-task, name them:
+`warnings: [{"code": "permission_denials", "tools": ["Monitor"]}]`. This warning includes only
+tool names; the separate `allowed_rule_denied` diagnostic can include matching Bash prefixes
+requested by the user as described above. `Monitor` is not added to the allowlist. To allow
+`WebSearch` or `WebFetch` for one task, name them:
 
 ```sh
 cli-relay submit --key research-1 --engine claude --cwd ~/code/app --prompt "Compare the current options for X" \

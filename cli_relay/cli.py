@@ -194,6 +194,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
     prompt = _read_prompt(args)
     cwd = os.path.realpath(args.cwd)
     raw_options = _parse_options(args.option)
+    if args.unset_env is not None:
+        names = engines.validate_unset_env(args.unset_env)
+        if "unset_env" in raw_options and engines.validate_unset_env(raw_options["unset_env"]) != names:
+            raise UsageError("--unset-env conflicts with --option unset_env")
+        raw_options["unset_env"] = names
     for flag, field in (("allow_write_dir", "allowed_write_dirs"),
                         ("allow_bash", "allowed_bash_commands"), ("network_access", "network_access")):
         value = getattr(args, flag, None)
@@ -262,11 +267,13 @@ def cmd_submit(args: argparse.Namespace) -> int:
             keeper = "kicked"
         task = ledger.get_task(task["task_id"])
         att = ledger.current_attempt(task["task_id"])
+    warnings = engines.bash_rule_warnings(engine, payload)
     emit({"ok": True, "accepted": True, "status": status, "task_id": task["task_id"], "state": task["state"],
           "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
           "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper,
           **({"origin": payload["origin"]} if "origin" in payload else {}),
           **{key: payload[key] for key in SCHEDULING_FIELDS if key in payload},
+          **({"warnings": warnings} if warnings else {}),
           **engines.request_details(task["engine"], json.loads(task["payload_json"])),
           "notify_route": task.get("notify_route"), "notify_consumer": task.get("notify_consumer"),
           "notify_chat": task.get("notify_chat"), "notify_bound": task.get("notify_bound") == 1,
@@ -683,6 +690,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Claude: allow a literal Bash command prefix (repeatable)")
     s.add_argument("--network-access", action="store_true", default=None,
                    help="Codex: enable network access; requires --option sandbox=workspace-write")
+    s.add_argument("--unset-env", action="append", metavar="NAME",
+                   help="remove a billing environment variable for this task, including resume (repeatable)")
     s.add_argument("--notify-route", help="route in notifier.json that is woken when the task ends")
     s.add_argument("--origin", metavar='JSON', help='optional origin metadata: {"bot":"NAME","chat":"ID"}')
     s.add_argument("--after", action="append", metavar="REF", help="wait for one existing task id or key in this scope")

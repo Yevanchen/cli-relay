@@ -63,6 +63,11 @@ Routes are configured per machine in `<home>/notifier.json`. Configuration, rout
 Model and effort can be set per task with `--option`. More engine options are documented in
 [`docs/usage.md`](docs/usage.md#engines), and their guards in [`docs/reliability.md`](docs/reliability.md).
 
+If preflight reports `billing_env_present`, add `--unset-env OPENAI_BASE_URL` (repeatable,
+using the names in the error) to `submit` with a new key. It removes only those billing
+variables for that task's preflight and CLI, including resume, and leaves the relay and
+machine environment unchanged. See [environment cleanup](docs/usage.md#per-task-environment-cleanup).
+
 ### Permission opt-ins
 
 Defaults stay minimal: Claude pins `dontAsk` and adds no allow rules; its existing
@@ -87,6 +92,11 @@ launch, including resume. Command prefixes become `Bash(python3:*)` and
 `Bash(pip install --user:*)`. Use literal words separated by single spaces; shell operators,
 quotes within the value, substitutions and wildcard/rule syntax are rejected. Shell quoting
 around the CLI argument, as above, is fine.
+
+Claude Code (observed 2.1.312) denies `cp` with flags even when its Bash prefix rule is listed.
+Submit receipts warn with `bash_rule_not_honoured`; a matching structured Bash denial adds
+`allowed_rule_denied` to status, terminal events and notifications. See the
+[observed commands and workarounds](docs/usage.md#allowed_bash_commands).
 
 These are Claude permission rules, not an OS sandbox. A permitted interpreter or installer
 can write outside the Edit/Write directories; choose command prefixes accordingly. Existing

@@ -815,6 +815,9 @@ class Ledger:
                 self.run_dir(att["task_id"], att["attempt_no"]) / "stderr.log")
             if warning is not None:
                 warnings.append(warning)
+        for warning in observations.get("warnings", []):
+            if warning not in warnings:
+                warnings.append(warning)
         if warnings:
             observations["warnings"] = []
             for warning in warnings:
@@ -844,8 +847,10 @@ class Ledger:
             details["completion_marker"] = engines.completion_marker((native or {}).get("result"))
         details.update({key: observations[key] for key in ("git", "warnings", "codex_git_repo_check",
                                                           "reason_code", "details", "summary",
-                                                          *business_status.FIELDS)
+                                                          "unset_env_present", *business_status.FIELDS)
                         if key in observations})
+        if observations.get("preflight", {}).get("reason") == "billing_env_present":
+            details["preflight"] = observations["preflight"]
         body = {
             "task_id": att["task_id"],
             "attempt_no": att["attempt_no"],
