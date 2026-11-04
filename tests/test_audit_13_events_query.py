@@ -54,7 +54,8 @@ class EventsQueryCost(unittest.TestCase):
                      "VALUES ('t-1','default','k','h','{}','fixture','/','succeeded',1,1,?,?)", (now, now))
         rows = [(f"e-{i:05d}", "t-1", i + 1, "terminal", "{}", now) for i in range(3000)]
         conn.executemany("INSERT INTO events VALUES (?,?,?,?,?,?)", rows)
-        conn.executemany("INSERT INTO acks VALUES (?,?,?,?,?)", [(r[0], "grok", "t-1", r[2], now) for r in rows])
+        conn.executemany("INSERT INTO acks (event_id, consumer, task_id, attempt_no, acked_at) VALUES (?,?,?,?,?)",
+                         [(r[0], "grok", "t-1", r[2], now) for r in rows])
         conn.commit()
         conn.close()
 

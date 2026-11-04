@@ -18,6 +18,7 @@ It is not a model proxy, an agent framework, a networked relay, an orchestrator,
 | **Honest status after a break** | Attempts record host, process identity, native session id, and exit evidence. What cannot be proven is `unknown`, never guessed. |
 | **Hold until ACK** | Terminal events keep a stable id and are re-delivered until a named consumer ACKs them. |
 | **Wake on finish** | Optional notifier (script or webhook) can wake a consumer such as a Grok Bot routine when a task ends. A wake is not an ACK. |
+| **Results to the submitting bot** | A verified per-bot route wakes that bot directly. `brief` prints complete identities, Chinese message lines and one batch ACK command; `acks.message_id` records the visible delivery. |
 | **Dependencies and queues** | `submit --after <task id or key>` requires business `ok` by default; `--queue NAME` runs tasks one at a time in FIFO order within a home and scope. [Waiting, cancellation and release rules](docs/usage.md#dependencies-and-queues). |
 
 ## Quick start
@@ -35,17 +36,23 @@ cli-relay events --consumer grok    # waiting/result events this consumer has no
 cli-relay ack --consumer grok --task t-… --attempt 1 --event e-…
 ```
 
-Every command prints one JSON object on stdout (except `--help` / `--version`). Exit codes, `status`, `resume`, `cancel` and more: [`docs/usage.md`](docs/usage.md#commands).
+Every command prints one JSON object on stdout (except `brief --text`, `--help` / `--version`). Exit codes, `status`, `resume`, `cancel` and more: [`docs/usage.md`](docs/usage.md#commands).
 
 With the notifier (v0.2):
 
 ```sh
-cli-relay migrate                   # only for a ledger made by an older version; takes a backup first
+cli-relay migrate                   # upgrade an existing ledger; consistent backup first
 cli-relay submit --key k --engine claude --cwd ~/code/app --prompt "…" --notify-route bot
 cli-relay notify run --interval 60  # periodic pass: retries, reminders, catch-up after a restart
 ```
 
 Routes are configured per machine in `<home>/notifier.json`. Configuration, route registration and verification: [`docs/notifier.md`](docs/notifier.md).
+For an asynchronous webhook, `route verify NAME` prints an awaiting-confirmation verification id
+(exit 6, still unproven). After the bot posts `cli-relay 接通测试，无需处理`, run
+`route confirm NAME --verification-id V --message-id M` on the same Mac. A synchronous visible-message
+receipt still verifies in one step. New managed routes cannot gain proof by editing the configuration.
+`route set-fallback NAME friday` optionally sends one reminder after the original consumer misses
+the 30-minute ACK timeout, or its notification fails; it keeps the task's original owner.
 
 ## Requirements
 
@@ -147,6 +154,18 @@ The decision is recorded in attempt evidence and terminal events; sandbox defaul
 2. Wait or poll `status`. A wait timeout is not a task failure.
 3. Read `events --consumer <you>`, deliver the result, then `ack`. `succeeded` means the CLI finished without an error. Check the separate [business status](docs/usage.md#business-status) (`ok`, `partial`, `stopped_for_approval`, `failed`, `unreported`) and denial count in status/events and notification summaries. Tasks can report a final `status=...` line or opt into `result_file=out/result.json`; `require_business_status=true` warns when no status is reported. The existing [completion marker](docs/usage.md#when-the-cli-finished-is-not-the-task-is-done-the-completion-marker) can still gate the process outcome.
 4. If the state is `unknown`, a human chooses `resume` or an explicit fresh re-run.
+
+A bot woken by its own route uses these four steps on the named Mac:
+
+1. Run `cli-relay --home /path/to/ledger brief --consumer <you> --route <your-route> --text`.
+2. Send the printed Chinese lines together as one visible message in the route's chat. Each line
+   contains the tool-computed task/event suffixes, conclusion and absolute result path (or `无结果文件`).
+3. Obtain that message's platform message id.
+4. Run the printed batch `ack` command, replacing `<MESSAGE_ID>` with that id; `--chat` can record
+   the delivery chat. The ledger's `acks.message_id` and `acks.chat` are the delivery record.
+
+`brief` does not send, ACK, reconcile or increment `delivery_count`. An empty brief needs no message.
+Submit with `--notify-route <your-route>` so the result reaches the submitting bot directly.
 
 ## Documentation
 
