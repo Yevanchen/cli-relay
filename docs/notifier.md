@@ -227,7 +227,7 @@ The five `notify.sh` fields, so an existing routine keeps working:
 | `job` | the adapter's `job` (default `CLI_RELAY`) |
 | `stage` | `<source_id>/<route>` |
 | `status` | the outcome (`succeeded`, `failed`, `blocked`, `needs_input`, `unknown`), or `multiple` for a batch |
-| `summary` | one line: a header and result excerpt bounded to 400 characters, followed by the complete permission opt-ins (or `default minimal`) for every task attempt. Permission lists are never truncated. Control characters, `"` and `\` in the excerpt are replaced |
+| `summary` | one line: a header and result excerpt bounded to 400 characters, followed by business status and denial count when available, then complete permission opt-ins (or `default minimal`) for every task attempt. Business fields and permission lists are never truncated. Control characters, `"` and `\` in the excerpt are replaced |
 | `artifact` | `cli-relay:<source_id>:<ledger_id>` |
 
 The HTTP adapter also sends `cli_relay`, a structured copy:
@@ -237,9 +237,30 @@ The HTTP adapter also sends `cli_relay`, a structured copy:
  "chat": "Bot chat", "consumer": "bot", "reminder": false, "count": 1,
  "events": [{"event_id": "e-…", "task_id": "t-…", "attempt_no": 1, "kind": "terminal",
              "outcome": "succeeded", "key": "…", "result_excerpt": "…",
+             "business_status": "partial", "business_status_source": "status_line",
+             "business_status_counts": {"ok": 9, "fail": 4, "skip": 4},
+             "denials": {"count": null, "tools": [], "available": false},
              "sandbox": "danger-full-access", "full_access": true, "network_access": true,
              "completion_marker_required": false}]}
 ```
+
+Every new terminal/unknown event entry includes `business_status`, `business_status_source` and
+`denials`, copied from the event without changing `outcome` or the five-field `status`. Optional
+`business_status_counts` contains integer counters from the final status line. Values and
+precedence follow the [business-status rules](usage.md#business-status): reports can be `ok`,
+`partial`, `stopped_for_approval`, `failed`, or `unreported`. Sources are `status_line`,
+`result_file`, `outcome`, `denials`, or `none`. A succeeded Claude run with structured permission
+denials becomes business `partial` when its report is `ok` or absent; its process outcome remains
+`succeeded`. Denial counts count entries, including repeated tool names, with a unique tool list.
+Codex has `available: false` and count `null`; Claude also has no denial data without a final result.
+
+The summary appends `<task_id>#<attempt_no> business_status=partial denials=2` for each new event,
+including every event in a batch. An unavailable denial count is rendered as `denials=null`.
+These fields survive header/excerpt truncation, so a command-adapter consumer need not inspect
+`result_excerpt` to discover a partial result. Historical events can omit the new fields and
+remain deliverable; no past event is reinterpreted or backfilled. Warnings such as
+`business_status_unknown`, `business_status_conflict`, `business_status_result_file_invalid` and
+`business_status_missing` follow the existing structured-warning and summary-code convention.
 
 New Codex event bodies and each corresponding `cli_relay.events` entry include `sandbox` and
 `full_access`. Full access is **off by default** and requires both
@@ -289,8 +310,8 @@ contains `head_before`, `head_after` and `dirty`; unavailable values are `null`.
 the form `{"code": "uncommitted_changes"}` or `{"code": "permission_denials", "tools": ["Monitor"]}`.
 The summary also names warning codes and denied tools for the command adapter. A native success
 with exit 0 can carry denial warnings while remaining `succeeded`; a required completion marker
-still gates it. Git observations never change the outcome. Without these observations, the
-notification payload is unchanged; no empty warning list or non-Git placeholder is added.
+still gates it. Git observations never change the outcome. Without these observations, no empty
+warning list or non-Git placeholder is added.
 
 Tasks submitted with `--unset-env NAME` carry `unset_env` in event bodies and structured
 notification event entries. `unset_env_present` lists the requested names observed before
@@ -327,7 +348,8 @@ A webhook routine receives the payload and its instructions. A minimal instructi
      `ledger_id`, `route` and the result excerpt;
    - `cli-relay status <task_id>`: the full record (state, exit status, the CLI's own result,
      evidence) when the excerpt is not enough.
-3. Report the result in the route's chat: outcome, a short summary and where the artifacts are.
+3. Report the result in the route's chat: outcome, business status, denial count, a short summary
+   and where the artifacts are. A `succeeded` outcome alone does not establish business completion.
    For `blocked`, `needs_input` or `unknown`, say what decision is needed. Never re-run a task on
    your own: a re-run is `resume` and needs a human decision.
 4. Then acknowledge each event you reported, on the same machine:

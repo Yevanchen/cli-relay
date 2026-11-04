@@ -140,8 +140,10 @@ class GitObservations(RelayTestCase):
 
 @needs_clean_cli_config
 class DenialObservations(RelayTestCase):
-    def run_claude(self, *, ok=True, marker=None, crash=False):
+    def run_claude(self, *, ok=True, marker=None, crash=False, status=None):
         result = "done" if marker is None else "done\nCLI-RELAY-STATUS: " + marker
+        if status is not None:
+            result += "\nTASK_DONE status=" + status
         output = {"type": "result", "subtype": "success" if ok else "error_during_execution",
                   "is_error": not ok, "result": result,
                   "permission_denials": [{"tool_name": "Monitor", "tool_input": {"detail": "not exported"}},
@@ -175,11 +177,20 @@ class DenialObservations(RelayTestCase):
         self.assertEqual(payload["cli_relay"]["events"][0]["warnings"], expected)
         self.assertIn("warnings=permission_denials", payload["summary"])
         self.assertIn("denied_tools=Monitor", payload["summary"])
+        for record in (done["task"], done["attempts"][0], done["attempts"][0]["evidence"],
+                       done["events"][0]["body"], payload["cli_relay"]["events"][0]):
+            self.assertEqual(record["denials"], {"count": 2, "tools": ["Monitor"], "available": True})
+            self.assertEqual(record["business_status"], "partial" if outcome == "succeeded" else "failed")
+            self.assertEqual(record["business_status_source"], "denials" if outcome == "succeeded" else "outcome")
+        self.assertIn("denials=2", payload["summary"])
         self.assertNotIn("not exported", json.dumps(done))
         self.assertEqual(done["task"]["allowed_tools"], [])
 
     def test_native_success_with_denial_is_success_with_warning(self):
         self.assert_warning(self.run_claude(), "succeeded")
+
+    def test_native_success_with_ok_status_and_denials_is_business_partial(self):
+        self.assert_warning(self.run_claude(status="ok"), "succeeded")
 
     def test_native_failure_with_denial_still_needs_input(self):
         self.assert_warning(self.run_claude(ok=False), "needs_input")
