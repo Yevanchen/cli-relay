@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 from . import __version__, business_status, engines, notify, procs, routes
 from .errors import NotFound, Refused, RelayError, UsageError
 from .keeper import _hook
-from .ledger import Ledger, init_ledger
+from .ledger import ACTIVE_STATES, AFTER_REQUIRE, SCHEDULING_FIELDS, Ledger, init_ledger
 from .reconcile import old_run_stopped, reconcile_all, reconcile_task
 from .spawn import SpawnFailed, spawn_keeper, spawn_notifier_pass
 
@@ -125,7 +125,7 @@ def _parse_origin(raw: Optional[str]) -> Dict[str, Any]:
 
 
 def attempt_view(a: Dict[str, Any], probe: bool = True) -> Dict[str, Any]:
-    active = a["state"] in ("claimed", "running")
+    active = a["state"] in ("waiting", "claimed", "running")
     keeper_alive = procs.same_process_alive(a["keeper_pid"], a["keeper_token"]) if probe and active else None
     cli_alive = procs.same_process_alive(a["cli_pid"], a["cli_token"]) if probe and active and a["cli_pid"] else None
     evidence = _loads(a["evidence_json"])
@@ -149,11 +149,15 @@ def task_view(ledger: Ledger, task_id: str, probe: bool = True) -> Dict[str, Any
     payload = json.loads(t["payload_json"])
     attempts = [attempt_view(a, probe) for a in ledger.attempts(task_id)]
     current = next((a for a in attempts if a["attempt_no"] == t["current_attempt"]), {})
+    if current.get("state") == "waiting":
+        current["waiting_on"] = ledger.waiting_on(task_id)
     return {
         "task": {k: t[k] for k in ("task_id", "scope", "engine", "cwd", "state", "current_attempt", "submit_count",
                                    "payload_sha256", "created_at", "updated_at")} | {
                                        "key": t["request_key"], "options": payload.get("options", {}),
                                        **{key: current[key] for key in business_status.FIELDS if key in current},
+                                       **({"waiting_on": current["waiting_on"]} if "waiting_on" in current else {}),
+                                       **{key: payload[key] for key in SCHEDULING_FIELDS if key in payload},
                                        **({"origin": payload["origin"]} if "origin" in payload else {}),
                                        **engines.request_details(t["engine"], payload)},
         "attempts": attempts,
@@ -204,7 +208,19 @@ def cmd_submit(args: argparse.Namespace) -> int:
             raw_options[field] = value
     options = engines.validate_options(engine, raw_options, cwd=cwd)
     payload = {"engine": engine, "cwd": cwd, "prompt": prompt, "options": options, **_parse_origin(args.origin)}
+    if args.after_require is not None and not args.after:
+        raise UsageError("--after-require requires --after")
+    if args.after and len(args.after) != 1:
+        raise UsageError("--after accepts one dependency")
+    if args.queue is not None:
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", args.queue):
+            raise UsageError("invalid --queue: use 1-64 chars of [A-Za-z0-9._-]")
+        payload["queue"] = args.queue
     ledger = Ledger(args.home, integrity=True)
+    if args.after:
+        payload["after"] = ledger.resolve_dependency(scope, args.after[0])
+    if args.after_require is not None:
+        payload["after_require"] = args.after_require
     existing = None
     try:
         existing = ledger.find_task(scope, key)
@@ -256,6 +272,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
           "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
           "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper,
           **({"origin": payload["origin"]} if "origin" in payload else {}),
+          **{key: payload[key] for key in SCHEDULING_FIELDS if key in payload},
           **({"warnings": warnings} if warnings else {}),
           **engines.request_details(task["engine"], json.loads(task["payload_json"])),
           "notify_route": task.get("notify_route"), "notify_consumer": task.get("notify_consumer"),
@@ -308,7 +325,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
     while True:
         _after_reconcile(args.home, reconcile_task(ledger, task_id, kick=True, spawn=_spawner(args.home)))
         state = ledger.get_task(task_id)["state"]
-        if state not in ("accepted", "running"):
+        if state not in ("accepted", "waiting", "running"):
             emit({"ok": True, "timed_out": False, **task_view(ledger, task_id)})
             return 0
         if time.monotonic() >= deadline:
@@ -431,7 +448,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     task_id = _resolve_task(ledger, args)
     task = ledger.get_task(task_id)
     att = ledger.current_attempt(task_id)
-    if att["state"] in ("pending", "claimed", "running"):
+    if att["state"] in ACTIVE_STATES:
         raise Refused("attempt_active", "the current attempt is still active; wait or cancel first",
                       state=att["state"])
     proof = old_run_stopped(att)
@@ -470,6 +487,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     emit({"ok": True, "task_id": task_id, "attempt_no": new["attempt_no"], "attempt_id": new["attempt_id"],
           "reason": reason, "resume_session_id": resume_sid, "previous_attempt_stopped": proof, "keeper": keeper,
           **({"origin": payload["origin"]} if "origin" in payload else {}),
+          **{key: payload[key] for key in SCHEDULING_FIELDS if key in payload},
           **engines.request_details(task["engine"], payload)})
     return 0
 
@@ -676,6 +694,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="remove a billing environment variable for this task, including resume (repeatable)")
     s.add_argument("--notify-route", help="route in notifier.json that is woken when the task ends")
     s.add_argument("--origin", metavar='JSON', help='optional origin metadata: {"bot":"NAME","chat":"ID"}')
+    s.add_argument("--after", action="append", metavar="REF", help="wait for one existing task id or key in this scope")
+    s.add_argument("--after-require", choices=AFTER_REQUIRE,
+                   help="dependency release condition (default: ok; requires --after)")
+    s.add_argument("--queue", metavar="NAME", help="FIFO queue in this home and scope; one running task at a time")
     s.set_defaults(func=cmd_submit)
 
     for name, func, helptext in (("status", cmd_status, "show a task (reconciles first)"),

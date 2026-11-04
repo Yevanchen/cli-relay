@@ -67,6 +67,15 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
     if keeper_alive is not False:
         return action  # the keeper owns the attempt (or we cannot prove it is gone)
 
+    if state == "waiting":
+        # No engine can start before admission; never respawn or run it from reconciliation.
+        eid = ledger.finish(att["attempt_id"], from_states=("waiting",), outcome="blocked",
+                            evidence={"reason_code": "keeper_lost_while_waiting",
+                                      "summary": "keeper lost while waiting; engine never started",
+                                      "reconciled_at": now_iso()}, source="reconcile")
+        action.update(action="blocked_waiting_keeper_lost" if eid else "none", event_id=eid)
+        return action
+
     task = ledger.get_task(att["task_id"])
     engine = task["engine"]
     payload = json.loads(task["payload_json"])

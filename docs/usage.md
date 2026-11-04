@@ -20,7 +20,7 @@ cli-relay submit --key fix-tests-42 --engine claude --cwd ~/code/app \
 # {"status": "duplicate", "task_id": "t-…", "submit_count": 2, …}
 
 cli-relay wait t-… --timeout 600   # a timeout only stops waiting; the task keeps running
-cli-relay events --consumer grok   # terminal events not yet ACKed by this consumer
+cli-relay events --consumer grok   # waiting/result events not yet ACKed by this consumer
 cli-relay ack --consumer grok --task t-… --attempt 1 --event e-…
 cli-relay status t-…               # full record: attempts, identities, exit status, native result
 cli-relay resume t-… --prompt "Continue with the next failing test."   # exact native session
@@ -44,6 +44,89 @@ plain text. Exit codes:
 - `5` ledger or storage error
 - `6` refused (a precondition does not hold)
 - `130` interrupted
+
+## Dependencies and queues
+
+`submit` accepts one `--after REF`, where REF is an existing task id (`t-…`) or request key
+in the same `--scope` and relay `--home`. An exact task id takes precedence over a matching key.
+The stored `after` is the resolved task id, so submitting by key or by id gives the same payload.
+An unknown or out-of-scope REF is rejected with exit 6 / `dependency_not_found`, before any task
+or submission is created. Forward references and self references cannot create tasks; changing
+an existing key's payload is still a conflict, so cycles cannot be introduced.
+
+`--after-require` needs `--after` and accepts:
+
+| Value | Release condition once the dependency is terminal |
+|---|---|
+| `ok` (default) | outcome `succeeded` **and** business status `ok` |
+| `ok_or_partial` | outcome `succeeded` **and** business status `ok` or `partial` |
+| `any_terminal` | any terminal outcome, including `failed`, `cancelled`, `blocked`, `needs_input` and `unknown` |
+
+The check uses the dependency's current attempt at admission, and reads the business-status
+observation already committed by the [business-status rules](#business-status). It does not
+interpret prose or reread the dependency's result file. Historical attempts without that
+observation count as `unreported`; they do not satisfy either success requirement. An `unknown`
+outcome means execution is uncertain, even though `any_terminal` permits it.
+
+An unsatisfied terminal dependency ends the dependent as `blocked` without starting its engine.
+Attempt evidence, the terminal event and the notification carry
+`reason_code: "dependency_not_satisfied"`, a one-line `summary` naming the dependency id and
+its business status, and `details`:
+
+```json
+{"dependency_task_id":"t-…","dependency_outcome":"succeeded",
+ "dependency_business_status":"partial","require":"ok"}
+```
+
+For example, submit the English task immediately after the Chinese task, without a dispatcher
+poller. The Chinese task must explicitly report business completion:
+
+```sh
+cli-relay submit --scope friday --key what-is-dify-zh-10 --engine claude --cwd ~/code/dify \
+  --prompt 'Write the Chinese article. End with status=ok only if fully complete; otherwise report status=partial or status=stopped_for_approval.'
+cli-relay submit --scope friday --key what-is-dify-en-04 --engine claude --cwd ~/code/dify \
+  --after what-is-dify-zh-10 --queue articles \
+  --prompt 'Write the English article from the completed Chinese article.'
+# A succeeded Chinese run reporting status=partial blocks the English task by default.
+# Use --after-require ok_or_partial only when a partial result is acceptable.
+```
+
+`--queue NAME` accepts 1–64 characters from `[A-Za-z0-9._-]`. Queues are isolated by relay home
+and scope. At most one task in a queue is admitted to preflight/execution at a time. Other
+tasks wait FIFO by their original submission time; ties use ledger insertion order. Pending
+keepers also hold their place. A queue head waiting for a dependency holds up later tasks.
+Different queues/scopes can run concurrently; tasks without `--queue` are unrestricted.
+Combine `--after` and `--queue` to require both gates. Failed/blocked/cancelled queue tasks
+release their place; an `unknown` holder retains it because its engine may still be alive and
+needs the existing explicit recovery decision. Resume/fresh reruns retain both gates and the
+task's original queue order, and cannot preempt an already admitted task.
+
+| Task state | Meaning |
+|---|---|
+| `accepted` | committed; keeper has not claimed it yet |
+| `waiting` | keeper owns the attempt; a dependency and/or earlier queue task prevents execution |
+| `running` | admitted to preflight or engine execution |
+| `succeeded`, `failed`, `blocked`, `needs_input`, `cancelled`, `unknown` | existing outcomes; `unknown` still requires a human recovery decision |
+
+`status` and `wait` include current `task.waiting_on` and current-attempt `waiting_on`, with
+`dependency` (the four fields above) and/or `queue` (`name`, one-based `position`,
+`ahead_task_ids`). A single `kind: "waiting"` event per waiting attempt records its initial
+waiting details; it remains an immutable snapshot and can be ACKed independently of the later
+terminal event. Waiting events do not wake the notifier. Position changes appear in status,
+not as repeated events. Waiting is non-terminal: `wait --timeout` can time out while it continues,
+and `cancel` ends it as `cancelled` without starting the engine. Waiting attempts cannot be resumed.
+
+Each waiting keeper polls the ledger after 2, 4, 8, then at most 10 seconds between checks;
+dependency notifications are not needed for release. No scheduler daemon is added. If a waiting
+keeper is provably dead, `reconcile` (also invoked by normal status/wait/events reads) closes
+the task as `blocked` with `reason_code: "keeper_lost_while_waiting"`. It never launches that
+engine or replaces that waiting keeper. A keeper that never claimed a pending attempt still
+uses the existing safe recovery path.
+
+The optional top-level payload fields are `after` (resolved id), `after_require` (only when
+explicitly supplied) and `queue`. Supplied fields participate in idempotency: changing them
+under the same key conflicts. Omitting all three preserves the previous payload and hash.
+No ledger schema change or migration is required; existing databases and events remain readable.
 
 ## Per-task routes and origin (issue #4)
 
