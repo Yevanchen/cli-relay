@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from . import engines
+from . import business_status, engines
 from .errors import (
     AckMismatch,
     Conflict,
@@ -688,8 +688,17 @@ class Ledger:
             evidence = dict(evidence or {}, cancel_lost_race=True)
         task = c.execute("SELECT current_attempt, engine, payload_json FROM tasks WHERE task_id=?",
                          (att["task_id"],)).fetchone()
+        payload = json.loads(task["payload_json"])
         observations = json.loads(_merge_json(att["evidence_json"], evidence) or "{}")
-        warnings = []
+        # Unknown attempts may close again with late evidence. Recompute business observations
+        # while retaining unrelated warnings supplied by the keeper or earlier evidence.
+        for key in business_status.FIELDS:
+            observations.pop(key, None)
+        warnings = [w for w in observations.pop("warnings", [])
+                    if not w["code"].startswith("business_status_")]
+        business = business_status.evaluate(task["engine"], payload, outcome or "unknown", native)
+        warnings.extend(business.pop("warnings", []))
+        observations.update(business)
         if native and native.get("permission_denials"):
             warnings.append({"code": "permission_denials", "tools": sorted(set(native["permission_denials"]))})
         if observations.get("git", {}).get("dirty") is True:
@@ -700,15 +709,17 @@ class Ledger:
             if warning is not None:
                 warnings.append(warning)
         if warnings:
-            evidence = dict(evidence or {}, warnings=warnings)
-            observations["warnings"] = warnings
+            observations["warnings"] = []
+            for warning in warnings:
+                if warning not in observations["warnings"]:
+                    observations["warnings"].append(warning)
         cur = c.execute(
             "UPDATE attempts SET state=?, outcome=?, exit_code=?, exit_signal=?, exit_known=?, "
             "native_result_json=COALESCE(?, native_result_json), evidence_json=?, "
             "ended_at=COALESCE(ended_at, ?), updated_at=? WHERE attempt_id=? AND state=?",
             (new_state, outcome, exit_code, exit_signal, 1 if exit_known else 0,
              canonical_json(native) if native is not None else None,
-             _merge_json(att["evidence_json"], evidence), now, now, att["attempt_id"], att["state"]))
+             canonical_json(observations), now, now, att["attempt_id"], att["state"]))
         if cur.rowcount != 1:
             raise LedgerWriteFailed("attempt changed concurrently", attempt_id=att["attempt_id"])
         if task["current_attempt"] == att["attempt_no"]:
@@ -717,14 +728,14 @@ class Ledger:
         excerpt = None
         if native and isinstance(native.get("result"), str):
             excerpt = native["result"][:RESULT_EXCERPT_CHARS]
-        payload = json.loads(task["payload_json"])
         details = engines.request_details(task["engine"], payload)
         if "origin" in payload:
             details["origin"] = payload["origin"]
         if details["completion_marker_required"]:
             # The marker line sits at the end of the result, often past the excerpt: name it here.
             details["completion_marker"] = engines.completion_marker((native or {}).get("result"))
-        details.update({key: observations[key] for key in ("git", "warnings", "codex_git_repo_check")
+        details.update({key: observations[key] for key in ("git", "warnings", "codex_git_repo_check",
+                                                          *business_status.FIELDS)
                         if key in observations})
         body = {
             "task_id": att["task_id"],
