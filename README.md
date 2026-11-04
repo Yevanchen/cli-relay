@@ -62,6 +62,11 @@ Routes are configured per machine in `<home>/notifier.json`. Configuration, rout
 Model and effort can be set per task with `--option`. More engine options are documented in
 [`docs/usage.md`](docs/usage.md#engines), and their guards in [`docs/reliability.md`](docs/reliability.md).
 
+If preflight reports `billing_env_present`, add `--unset-env OPENAI_BASE_URL` (repeatable,
+using the names in the error) to `submit` with a new key. It removes only those billing
+variables for that task's preflight and CLI, including resume, and leaves the relay and
+machine environment unchanged. See [environment cleanup](docs/usage.md#per-task-environment-cleanup).
+
 ### Permission opt-ins
 
 Defaults stay minimal: Claude pins `dontAsk` and adds no allow rules; its existing

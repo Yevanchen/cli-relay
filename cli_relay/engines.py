@@ -35,6 +35,7 @@ BILLING_ENV: Dict[str, tuple] = {
     "codex": ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "AZURE_OPENAI_API_KEY"),
     "fixture": (),
 }
+UNSETTABLE_ENV = tuple(sorted({name for names in BILLING_ENV.values() for name in names}))
 
 # Markers of a calling Claude Code session; they must not leak into a child CLI.
 SCRUB_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET",
@@ -178,8 +179,18 @@ def _bash_commands(values: list) -> List[str]:
     return sorted(set(result))
 
 
+def validate_unset_env(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        raise UsageError("unset_env must be a JSON list of environment variable names")
+    if not all(isinstance(name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) for name in values):
+        raise UsageError("unset_env names must match [A-Za-z_][A-Za-z0-9_]*; values are not accepted")
+    if not set(values).issubset(UNSETTABLE_ENV):
+        raise UsageError("unset_env accepts only billing environment variable names", allowed=list(UNSETTABLE_ENV))
+    return sorted(set(values))
+
+
 def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str] = None) -> Dict[str, Any]:
-    spec = _OPTION_TYPES[engine]
+    spec = {**_OPTION_TYPES[engine], "unset_env": (list,)}
     clean: Dict[str, Any] = {}
     for key, value in sorted(options.items()):
         if key not in spec:
@@ -190,6 +201,8 @@ def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str]
         if not isinstance(value, types):
             raise UsageError(f"option {key!r} has the wrong type")
         clean[key] = value
+    if "unset_env" in clean:
+        clean["unset_env"] = validate_unset_env(clean["unset_env"])
     if engine == "codex" and "network_access" in clean:
         if "allow_network" in clean and clean["allow_network"] != clean["network_access"]:
             raise UsageError("network_access and allow_network must agree")
@@ -244,8 +257,9 @@ def resolve_bin(engine: str, env: Dict[str, str]) -> Optional[str]:
     return shutil.which(engine, path=env.get("PATH"))
 
 
-def child_env(env: Dict[str, str]) -> Dict[str, str]:
-    return {k: v for k, v in env.items() if k not in SCRUB_ENV and not k.startswith("CLI_RELAY_TEST_")}
+def child_env(env: Dict[str, str], *, unset_env: Iterable[str] = ()) -> Dict[str, str]:
+    return {k: v for k, v in env.items()
+            if k not in unset_env and k not in SCRUB_ENV and not k.startswith("CLI_RELAY_TEST_")}
 
 
 def _first_json_object(text: str) -> Optional[Dict[str, Any]]:
@@ -519,9 +533,17 @@ def preflight(engine: str, env: Dict[str, str], cwd: Optional[str] = None, *,
               options: Optional[Dict[str, Any]] = None) -> Preflight:
     """Everything that decides which account serves the run is checked before the CLI starts:
     billing variables, the CLI's configuration layers that apply to ``cwd``, and the login."""
+    if options is not None and "unset_env" in options:
+        env = child_env(env, unset_env=validate_unset_env(options["unset_env"]))
     present = [name for name in BILLING_ENV[engine] if env.get(name)]
     if present:
-        return Preflight(False, "billing_env_present", {"names": present})
+        flags = " ".join(f"--unset-env {name}" for name in present)
+        prefix = "env " + " ".join(f"-u {name}" for name in present)
+        return Preflight(False, "billing_env_present", {
+            "names": present, "fix": {"submit_flags": flags, "env_prefix": prefix},
+            "message": f"Billing environment variables block subscription login. Submit with a new key and "
+                       f"{flags}, or prefix the cli-relay command with {prefix}.",
+        })
     if engine == "fixture":
         return Preflight(True)
     opts = validate_options(engine, options or {}, cwd=cwd)
@@ -679,8 +701,10 @@ def request_details(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """What a task asked for, for receipts, status and events: its permissions and whether success
     needs the completion marker."""
     details = permission_details(engine, payload)
+    options = payload.get("options") or {}
     return {**details, "permissions": permission_summary(details),
-            "completion_marker_required": completion_marker_required(payload)}
+            "completion_marker_required": completion_marker_required(payload),
+            **({"unset_env": options["unset_env"]} if "unset_env" in options else {})}
 
 
 def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[str],
@@ -824,7 +848,7 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
     cwd = payload["cwd"]
     opts = validate_options(engine, payload.get("options", {}), cwd=cwd)
     resume = attempt.get("resume_session_id")
-    cenv = child_env(env)
+    cenv = child_env(env, unset_env=opts.get("unset_env", ()))
     last_message = None
     evidence: Dict[str, Any] = {}
     if engine == "claude":
