@@ -81,6 +81,8 @@ CLAUDE_EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
 # wildcard or another tool. Both need permission, so dontAsk denies them unless a rule allows them.
 CLAUDE_ALLOWABLE_TOOLS = ("WebFetch", "WebSearch")
 CLAUDE_ALLOWED_TOOLS_FLAGS = ("--allowedTools", "--allowed-tools")
+# Observed with Claude Code 2.1.312: prefix rules for these commands with flags are denied.
+CLAUDE_BASH_FLAG_RULE_COMMANDS = {"cp"}
 
 # Configuration layers outside the user's own files that the CLIs also read.
 CODEX_SYSTEM_CONFIG = (Path("/etc/codex/config.toml"),)
@@ -646,6 +648,20 @@ def requested_tools(engine: str, payload: Dict[str, Any]) -> List[str]:
     return sorted(rules)
 
 
+def bash_rule_warnings(engine: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Submit diagnostics only; never alter a request or its permission rules."""
+    warnings = []
+    if engine == "claude":
+        for command in (payload.get("options") or {}).get("allowed_bash_commands", []):
+            words = command.split()
+            if words[0] in CLAUDE_BASH_FLAG_RULE_COMMANDS and any(word.startswith("-") for word in words[1:]):
+                warnings.append({"code": "bash_rule_not_honoured", "command": command,
+                                 "hint": "Claude Code (observed 2.1.312) denies cp with flags even when its prefix "
+                                         "rule is listed; use cp <src> <dst> without flags, or check existence "
+                                         "with test -e first."})
+    return warnings
+
+
 def permission_summary(details: Dict[str, Any]) -> str:
     """Exact task opt-ins, shared by submit receipts and notification messages."""
     opened = []
@@ -993,7 +1009,8 @@ def billing_violation(engine: str, ev: Dict[str, Any]) -> Optional[Dict[str, Any
     return None
 
 
-def parse_output(engine: str, stdout_path: Path, last_message_path: Optional[Path] = None) -> Dict[str, Any]:
+def parse_output(engine: str, stdout_path: Path, last_message_path: Optional[Path] = None, *,
+                 allowed_bash_commands: Iterable[str] = ()) -> Dict[str, Any]:
     """Summarise the CLI's own output. ``native`` is None when no final result was emitted."""
     init: Optional[Dict[str, Any]] = None
     session_id: Optional[str] = None
@@ -1026,6 +1043,7 @@ def parse_output(engine: str, stdout_path: Path, last_message_path: Optional[Pat
             elif ev.get("type") == "result":
                 result = ev
     native: Optional[Dict[str, Any]] = None
+    denied_allowed_commands = set()
     if engine == "codex":
         if last_message_path is not None and last_message is None:
             try:
@@ -1038,10 +1056,18 @@ def parse_output(engine: str, stdout_path: Path, last_message_path: Optional[Pat
                       "thread_id": session_id, "result": last_message, "error": error}
     elif result is not None:
         denials = result.get("permission_denials") or []
+        if not isinstance(denials, list):
+            denials = []
         names = []
         for d in denials:
             if isinstance(d, dict):
                 names.append(str(d.get("tool_name") or d.get("tool") or "unknown"))
+                tool_input = d.get("tool_input")
+                command = tool_input.get("command") if isinstance(tool_input, dict) else None
+                if engine == "claude" and d.get("tool_name") == "Bash" and isinstance(command, str):
+                    command = command.strip()
+                    if any(command == entry or command.startswith(entry + " ") for entry in allowed_bash_commands):
+                        denied_allowed_commands.add(command[:200])
         native = {
             "ok": bool(result.get("subtype") == "success" and not result.get("is_error")),
             "subtype": result.get("subtype"),
@@ -1051,7 +1077,9 @@ def parse_output(engine: str, stdout_path: Path, last_message_path: Optional[Pat
             "num_turns": result.get("num_turns"),
             "permission_denials": names,
         }
-    return {"native": native, "session_id": session_id, "init": init}
+    diagnostics = {"warnings": [{"code": "allowed_rule_denied", "commands": sorted(denied_allowed_commands)}]} \
+        if denied_allowed_commands else {}
+    return {"native": native, "session_id": session_id, "init": init, **diagnostics}
 
 
 def classify(native: Optional[Dict[str, Any]], *, exit_code: Optional[int], exit_signal: Optional[int],

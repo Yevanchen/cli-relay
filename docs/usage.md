@@ -254,14 +254,54 @@ Scoped Edit/Write and Bash opt-ins are available through `--allow-write-dir` and
 Codex also accepts `--network-access` or the `network_access` JSON alias. See the
 [README permission examples](../README.md#permission-opt-ins) for syntax, validation and limitations.
 
+### allowed_bash_commands
+
+`--allow-bash 'cp -n a b'` and `--option 'allowed_bash_commands=["cp -n a b"]'` request the same
+`Bash(cp -n a b:*)` prefix rule. Claude Code itself decides whether a command matches. In the
+2026-11-04 reproduction with Claude Code 2.1.312, `dontAsk` and a clean non-Git cwd, these
+commands were each listed in the same `--allowedTools` argument:
+
+| Observed result | Commands |
+|---|---|
+| Denied | `cp -n a.example a.txt`, `cp -p a.example f.txt`, `cp -n a.example g.txt` |
+| Denied for dotfiles and scoped output too | `cp -n .env.example .env`, `cp -n .env.example env.txt`, `cp -n x.example .env2`, `cp -n a.example out/c.txt` (with `allowed_write_dirs=["out"]`) |
+| Allowed | `cp a.example b.txt`, `cp a.example out/m.txt` |
+| Allowed, including other commands with flags | `cat a.example`, `touch d.txt`, `mkdir e`, `ls -la a.example`, `mkdir -p k/l` |
+
+This is an observed Claude matching limitation for `cp` with flags, including `-n` and `-p`.
+The relay keeps the rule construction, settings and permission mode unchanged. Use
+`cp <src> <dst>` without flags, or check existence with `test -e` first (request a prefix for
+that check too). An existence check followed by a copy is not atomic.
+
+- Submit receipts include one `{"code": "bash_rule_not_honoured", "command": "cp -n a b", "hint": "…"}`
+  per affected entry: its first word is `cp` and a later token starts with `-`. Only `cp` is on
+  the observed command list; this does not predict a problem with `mv`, `rm` or other commands.
+  The hint names the observed Claude version and workarounds. Submission still succeeds;
+  the warning is receipt metadata and does not change the stored payload or its hash.
+- After a Claude run, structured Bash denials whose stripped `tool_input.command` equals a
+  requested prefix or starts with that prefix plus a space add one
+  `{"code": "allowed_rule_denied", "commands": ["cp -n a b"]}` warning. This applies to any
+  requested Bash prefix. Commands are matched before truncation, then each is limited to 200
+  characters; the displayed list is unique and sorted. No other tool-input fields are copied
+  into the diagnostic or native summary. Missing command details and older name-only denials
+  add no diagnostic.
+
+`allowed_rule_denied` follows the existing warnings path through `status`/`wait` attempt
+evidence, terminal events and notification entries. The notifier summary includes the command
+count and first command. These diagnostics do not change the outcome, grant permissions or
+retry a task. An inherited deny or ask rule can also explain a matching denial.
+
+### Claude web tools
+
 Claude **adds no tool by default**. Under `dontAsk`, a tool that needs permission and is not
 already allowed by your settings is denied. A native failure with a permission denial ends
 `needs_input`. If Claude reports native success and exits 0, denials are warnings and the outcome
 is `succeeded`, subject to the completion marker gate below. Without a confirmed zero exit,
 denials still mean `needs_input`; cancellation keeps its existing precedence. `status`/`wait`
 attempt evidence, terminal events and notification event entries carry, for example,
-`warnings: [{"code": "permission_denials", "tools": ["Monitor"]}]`. Only tool names are included,
-not inputs; `Monitor` is not added to the allowlist. To allow `WebSearch` or `WebFetch` for one
+`warnings: [{"code": "permission_denials", "tools": ["Monitor"]}]`. This warning includes only
+tool names; the separate `allowed_rule_denied` diagnostic can include matching Bash commands
+as described above. `Monitor` is not added to the allowlist. To allow `WebSearch` or `WebFetch` for one
 task, name them:
 
 ```sh

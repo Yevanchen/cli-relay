@@ -274,6 +274,10 @@ def build_payload(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, re
                                for tool in w["tools"]})
         if denied_tools:
             head += " denied_tools=" + ",".join(denied_tools)
+        denied_commands = sorted({command for w in warnings if w["code"] == "allowed_rule_denied"
+                                  for command in w["commands"]})
+        if denied_commands:
+            head += f" allowed_rule_denied={len(denied_commands)} first_command=" + _clean(denied_commands[0], 80)
         if any(w["code"] == "codex_trusted_directory" for w in warnings):
             head += " hint=skip_git_repo_check=true"
     parts = [f"{r['event_id']} {r['task_id']}#{r['attempt_no']} {r['outcome']}" for r in refs[:3]]

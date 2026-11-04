@@ -241,10 +241,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
             keeper = "kicked"
         task = ledger.get_task(task["task_id"])
         att = ledger.current_attempt(task["task_id"])
+    warnings = engines.bash_rule_warnings(engine, payload)
     emit({"ok": True, "accepted": True, "status": status, "task_id": task["task_id"], "state": task["state"],
           "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
           "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper,
           **({"origin": payload["origin"]} if "origin" in payload else {}),
+          **({"warnings": warnings} if warnings else {}),
           **engines.request_details(task["engine"], json.loads(task["payload_json"])),
           "notify_route": task.get("notify_route"), "notify_consumer": task.get("notify_consumer"),
           "notify_chat": task.get("notify_chat"), "notify_bound": task.get("notify_bound") == 1,
