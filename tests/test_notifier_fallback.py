@@ -156,6 +156,38 @@ class FallbackReminders(DirectRouteCase):
         self.assertEqual(len(receiver.requests), 2)
         self.assertEqual(receiver.requests[-1]["status"], "fallback_reminder")
 
+    def test_target_reregistered_during_original_send_waits_for_new_proof(self):
+        # Start with a proven legacy target so registration can revoke its proof through
+        # the same management operation an operator uses during a running notifier pass.
+        routes._save(self.home, notify.validate_config({"source_id": "test-mac", "routes": {
+            "friday": {"consumer": "friday", "chat": "friday-chat", "adapter": {
+                "type": "http", "url_env": "ROUTE_URL", "token_env": "ROUTE_TOKEN"}}}}))
+        self.add(fallback="friday")
+        self.prove()
+        _, event = self.finish(route="bot")
+
+        def revoke_proof(request):
+            self.assertEqual(request["route"], "bot")
+            self.add("friday")
+            self.assertFalse(notify.load_config(self.home)["routes"]["friday"]["proven"])
+            return 401
+
+        with FakeHTTPReceiver([revoke_proof]) as receiver:
+            result = self.command("notify", "flush")
+            self.assertEqual(result["fallback_sends"], [])
+            self.assertEqual(self.command("notify", "flush")["fallback_sends"], [])
+            self.assertEqual(len(receiver.requests), 1)
+            self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM notification_fallbacks").fetchone()[0], 0)
+            self.prove("friday")
+            recovered = self.command("notify", "flush")
+            self.assertEqual(recovered["fallback_sends"][0]["events"], [event])
+            self.assertEqual(self.command("notify", "flush")["fallback_sends"], [])
+        self.assertEqual(len(receiver.requests), 2)
+        self.assertEqual(receiver.requests[-1]["status"], "fallback_reminder")
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM notification_fallbacks").fetchone()[0], 1)
+        self.assertEqual(self.command("notify", "status")["notifications"][0]["fallback"]["state"], "accepted")
+        self.assert_no_secret()
+
     def test_initial_timeout_is_not_postponed_by_an_original_route_reminder(self):
         self.configure(max_wakes=2)
         self.finish(route="bot")

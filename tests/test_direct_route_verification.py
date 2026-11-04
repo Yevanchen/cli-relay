@@ -44,6 +44,44 @@ class AsyncRouteVerification(DirectRouteCase):
         self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM acks").fetchone()[0], 0)
         self.assert_no_secret()
 
+    def test_confirm_recovers_committed_receipt_after_config_rename_failure(self):
+        for failure in (SystemExit(91), OSError("synthetic rename failure")):
+            with self.subTest(failure=type(failure).__name__):
+                self.command("route", "remove", "bot")
+                pending = self.pending()
+                path = self.home / notify.CONFIG_NAME
+                before = path.read_bytes()
+
+                def fail_rename(src, dst):
+                    self.assertEqual(str(path), dst)
+                    stored = routes._stored_verification(self.home, {"name": "bot"})
+                    self.assertEqual(stored["state"], "acked")
+                    self.assertEqual(stored["message_id"], "visible-123")
+                    raise failure
+
+                with mock.patch("cli_relay.ledger.os.replace", side_effect=fail_rename), \
+                        self.assertRaises(type(failure)):
+                    routes.confirm(self.home, "bot", verification_id=pending["verification_id"],
+                                   message_id="visible-123")
+                self.assertEqual(path.read_bytes(), before)
+                self.assertFalse(notify.load_config(self.home)["routes"]["bot"]["proven"])
+                committed = routes._stored_verification(self.home, {"name": "bot"})
+                conflict = self.command("route", "confirm", "bot", "--verification-id", pending["verification_id"],
+                                        "--message-id", "different-message", expected=6)
+                self.assertEqual(conflict["error"], "verification_mismatch")
+                with mock.patch.object(notify, "send") as send:
+                    confirmed = self.confirm(pending)
+                    self.assertEqual(self.confirm(pending), confirmed)
+                send.assert_not_called()
+                self.assertTrue(confirmed["proven"])
+                self.assertFalse(confirmed["sent"])
+                self.assertEqual(confirmed["verification"], committed)
+                recovered = notify.load_config(self.home)["routes"]["bot"]
+                self.assertTrue(recovered["proven"])
+                self.assertEqual(recovered["verification"], committed)
+                self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM acks").fetchone()[0], 0)
+                self.assert_no_secret()
+
     def test_async_acceptance_survives_failed_reminder_and_delayed_confirmation(self):
         pending = self.pending()
         with mock.patch.object(routes, "now_iso", return_value=pending["verification"]["next_at"]), \

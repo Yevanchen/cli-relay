@@ -247,7 +247,7 @@ def confirm(home: Path, name: str, *, verification_id: str, message_id: str,
         if not state or state["verification_id"] != verification_id:
             raise Refused("verification_mismatch", "verification id is not the current probe for this route")
         if (state["route_sha256"] != notify.route_fingerprint(cfg["source_id"], route)
-                or state != route.get("verification")):
+                or (state != route.get("verification") and state["state"] != "acked")):
             raise Refused("verification_mismatch", "verification destination or receipt has changed")
         for supplied, expected in ((source_id, cfg["source_id"]), (ledger_id, state["ledger_id"]),
                                    (consumer, route["consumer"]), (chat, route["chat"])):
@@ -262,6 +262,10 @@ def confirm(home: Path, name: str, *, verification_id: str, message_id: str,
         if state["state"] == "acked":
             if state["message_id"] != message_id:
                 raise Refused("verification_mismatch", "this verification already has a different message id")
+            if state != route.get("verification"):
+                # The ledger commit may have survived a crash before the config rename.
+                route.update(verification=state, proven=True)
+                _save(home, cfg)
             return _receipt(cfg, route, state["ledger_id"], sent=False)
         if not state.get("expires_at") or state["expires_at"] <= now_iso():
             raise Refused("verification_expired", "probe has expired; run route verify --retry for a new id")

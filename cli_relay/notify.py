@@ -751,30 +751,40 @@ def _claim_fallbacks(ledger: Ledger, cfg: Dict[str, Any], original: str,
 
 
 def _send_fallbacks(ledger: Ledger, cfg: Dict[str, Any], env: Dict[str, str]) -> List[Dict[str, Any]]:
+    from .routes import _locked
+
     _recover_fallbacks(ledger)
     sends = []
     for original, route in cfg["routes"].items():
-        target = cfg["routes"].get(route.get("fallback_route"))
-        if target is None or target["name"] == original or not target["proven"]:
+        if not route.get("fallback_route"):
             continue
-        claim_id, rows = _claim_fallbacks(ledger, cfg, original, target)
-        if not rows:
-            continue
+        claim_id = None
         try:
-            _hook("fallback_after_claim")
-            started = now_iso()
-            with ledger.tx() as c:
-                # Recheck the original owner's ACK immediately before committing the send.
-                c.execute("UPDATE notification_fallbacks SET state='skipped', ended_at=?, last_result_json=?, "
-                          "claim_id=NULL, claimed_by=NULL, claimed_token=NULL WHERE claim_id=? "
-                          "AND EXISTS (SELECT 1 FROM acks a JOIN events e ON e.event_id=a.event_id "
-                          "JOIN tasks t ON t.task_id=e.task_id WHERE a.event_id=notification_fallbacks.event_id "
-                          "AND a.consumer=t.notify_consumer)",
-                          (started, canonical_json({"why": "original_consumer_acked"}), claim_id))
-                c.execute("UPDATE notification_fallbacks SET state='sending', started_at=? "
-                          "WHERE claim_id=? AND state='claimed'", (started, claim_id))
-                ids = {row[0] for row in c.execute("SELECT event_id FROM notification_fallbacks "
-                                                 "WHERE claim_id=? AND state='sending'", (claim_id,))}
+            # Normal sends may have outlived a route edit. Recheck proof and the target
+            # under the management lock, holding it until the send is committed.
+            with _locked(ledger.home):
+                current_cfg = load_config(ledger.home)
+                route = current_cfg["routes"].get(original, {})
+                target = current_cfg["routes"].get(route.get("fallback_route"))
+                if target is None or target["name"] == original or not target["proven"]:
+                    continue
+                claim_id, rows = _claim_fallbacks(ledger, current_cfg, original, target)
+                if not rows:
+                    continue
+                _hook("fallback_after_claim")
+                started = now_iso()
+                with ledger.tx() as c:
+                    # Recheck the original owner's ACK immediately before committing the send.
+                    c.execute("UPDATE notification_fallbacks SET state='skipped', ended_at=?, last_result_json=?, "
+                              "claim_id=NULL, claimed_by=NULL, claimed_token=NULL WHERE claim_id=? "
+                              "AND EXISTS (SELECT 1 FROM acks a JOIN events e ON e.event_id=a.event_id "
+                              "JOIN tasks t ON t.task_id=e.task_id WHERE a.event_id=notification_fallbacks.event_id "
+                              "AND a.consumer=t.notify_consumer)",
+                              (started, canonical_json({"why": "original_consumer_acked"}), claim_id))
+                    c.execute("UPDATE notification_fallbacks SET state='sending', started_at=? "
+                              "WHERE claim_id=? AND state='claimed'", (started, claim_id))
+                    ids = {row[0] for row in c.execute("SELECT event_id FROM notification_fallbacks "
+                                                     "WHERE claim_id=? AND state='sending'", (claim_id,))}
             rows = [row for row in rows if row["event_id"] in ids]
             if not rows:
                 continue
@@ -784,7 +794,7 @@ def _send_fallbacks(ledger: Ledger, cfg: Dict[str, Any], env: Dict[str, str]) ->
                              "original_consumer": row["original_consumer"], "original_chat": row["original_chat"],
                              "notification_age_s": round(max(0, iso_age_seconds(row["first_sent_at"] or row["created_at"]) or 0)),
                              "fallback_reason": "send_failed" if row["state"] == "failed" else "ack_timeout"})
-            payload = build_payload(cfg, target, ledger.ledger_id, refs, reminder=True)
+            payload = build_payload(current_cfg, target, ledger.ledger_id, refs, reminder=True)
             payload["status"] = "fallback_reminder"
             payload["cli_relay"].update(fallback=True, original_route=original)
             origins = " ; ".join(
@@ -805,8 +815,9 @@ def _send_fallbacks(ledger: Ledger, cfg: Dict[str, Any], env: Dict[str, str]) ->
             sends.append({"original_route": original, "route": target["name"], "events": [r["event_id"] for r in refs],
                           "outcome": result["outcome"], "why": result.get("why"), "status": result.get("status")})
         finally:
-            with _CLAIMS_LOCK:
-                _ACTIVE_CLAIMS.discard(claim_id)
+            if claim_id is not None:
+                with _CLAIMS_LOCK:
+                    _ACTIVE_CLAIMS.discard(claim_id)
     return sends
 
 
