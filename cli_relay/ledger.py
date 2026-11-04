@@ -708,6 +708,9 @@ class Ledger:
                 self.run_dir(att["task_id"], att["attempt_no"]) / "stderr.log")
             if warning is not None:
                 warnings.append(warning)
+        for warning in observations.get("warnings", []):
+            if warning not in warnings:
+                warnings.append(warning)
         if warnings:
             observations["warnings"] = []
             for warning in warnings:

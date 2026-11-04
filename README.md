@@ -92,6 +92,11 @@ launch, including resume. Command prefixes become `Bash(python3:*)` and
 quotes within the value, substitutions and wildcard/rule syntax are rejected. Shell quoting
 around the CLI argument, as above, is fine.
 
+Claude Code (observed 2.1.312) denies `cp` with flags even when its Bash prefix rule is listed.
+Submit receipts warn with `bash_rule_not_honoured`; a matching structured Bash denial adds
+`allowed_rule_denied` to status, terminal events and notifications. See the
+[observed commands and workarounds](docs/usage.md#allowed_bash_commands).
+
 These are Claude permission rules, not an OS sandbox. A permitted interpreter or installer
 can write outside the Edit/Write directories; choose command prefixes accordingly. Existing
 Claude allow rules can also grant additional permissions, and filesystem checks cannot prevent
