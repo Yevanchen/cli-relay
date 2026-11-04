@@ -292,6 +292,13 @@ with exit 0 can carry denial warnings while remaining `succeeded`; a required co
 still gates it. Git observations never change the outcome. Without these observations, the
 notification payload is unchanged; no empty warning list or non-Git placeholder is added.
 
+Tasks submitted with `--unset-env NAME` carry `unset_env` in event bodies and structured
+notification event entries. `unset_env_present` lists the requested names observed before
+cleanup for that attempt, including empty values; it is omitted if the keeper never took a
+snapshot. Only names are recorded. Billing-blocked events also carry `preflight` with the
+unchanged reason/names and copyable `--unset-env` / `env -u` fixes. These fields are absent
+from historical events and do not change routing or delivery.
+
 ### Earlier v0.2 candidate ledgers
 
 Run `migrate` when upgrading an earlier candidate as well as v0.1. The core schema stays 1;

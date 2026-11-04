@@ -104,6 +104,10 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     log = _Log(run_dir / "keeper.log")
     env = dict(os.environ)
+    if "unset_env" in payload.get("options", {}):
+        names = payload["options"]["unset_env"]
+        ledger.add_evidence(attempt_id, {"unset_env": names,
+                                         "unset_env_present": [name for name in names if name in env]})
     git_before = git_state.snapshot(payload["cwd"])
     if git_before is not None:
         ledger.add_evidence(attempt_id, {"git_before": git_before})
@@ -133,6 +137,8 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         return 0
     if not pf.ok:
         log(f"preflight blocked: {pf.reason}")
+        if pf.detail.get("message"):
+            log(pf.detail["message"])
         close("blocked", {"preflight": {"reason": pf.reason, **pf.detail}})
         return 0
     permission_checkpoint = None

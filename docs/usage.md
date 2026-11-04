@@ -108,6 +108,57 @@ and [D16](decisions.md#d16-issue-4-registered-routes-visible-message-proof-and-o
 This change has only local fake/mock test evidence. No new live webhook route was approved or
 verified, and it makes no new 25-hour reliability claim.
 
+## Per-task environment cleanup
+
+`submit --unset-env NAME` removes an inherited billing environment variable for that task only.
+Repeat the flag for more names:
+
+```sh
+cli-relay submit --key clean-env-1 --engine codex --cwd ~/code/app --prompt "Run the tests." \
+  --unset-env OPENAI_BASE_URL --unset-env OPENAI_API_KEY
+```
+
+Like `--network-access`, this is a CLI flag mapped to a persisted task option, rather than an
+argv option passed to the engine. The equivalent is
+`--option 'unset_env=["OPENAI_BASE_URL","OPENAI_API_KEY"]'`. Both forms store a sorted, unique
+`options.unset_env` list; duplicate names are harmless. If both forms are supplied, their
+normalized lists must agree. Omitting both adds no field and preserves existing payload hashes.
+An explicit JSON `[]` is stored as an empty list. Changing the list under an existing scope/key
+is a payload conflict, so use a new key when adding it to an already-created task.
+
+Names must match `[A-Za-z_][A-Za-z0-9_]*`; assignments such as `NAME=value` are rejected without
+echoing their values. Cleanup is restricted to the union of the engines' billing variables:
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`,
+`CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `ANTHROPIC_BEDROCK_BASE_URL`,
+`ANTHROPIC_VERTEX_BASE_URL`, `ANTHROPIC_VERTEX_PROJECT_ID`, `OPENAI_API_KEY`, `CODEX_API_KEY`,
+`OPENAI_BASE_URL`, and `AZURE_OPENAI_API_KEY`. Any of these names is accepted for either engine
+and the fixture. Other names, including HOME, configuration directories and relay controls,
+are refused. The option only removes variables; it cannot set values or alter configuration files.
+
+### Preflight
+
+Cleanup happens before the billing/configuration/login checks and in the CLI child environment
+on first runs, exact resumes and explicit fresh reruns. The stored list is reused; resume cannot
+change it. The relay's own environment, launchd, shell profiles and unrelated tasks are unchanged.
+Existing session-marker and test-variable scrubbing still applies. Variables not named in the
+list retain the existing behavior, and subscription/configuration guards still apply.
+
+Without cleanup, `billing_env_present` keeps its reason code and `names` list. Its preflight
+details now also contain `fix.submit_flags` (for example `--unset-env OPENAI_BASE_URL`),
+`fix.env_prefix` (`env -u OPENAI_BASE_URL`) and a `message` containing both fixes. The prefix goes
+before `cli-relay`; flags go on `submit`. The `env -u` prefix applies only to that invocation;
+use `--unset-env` to retain cleanup for future resumes. `doctor --engine codex` /
+`--engine claude` shows the same hint when billing variables block it. Blocked terminal events
+include these billing preflight details too.
+
+Submit/resume receipts, task records and terminal events include `unset_env` only when requested.
+Once the keeper observes the attempt's environment, attempt evidence and terminal events also
+include `unset_env_present`: the requested names that existed before cleanup, even if their
+values were empty. An absent requested name is harmless. Values are never recorded by cleanup.
+The snapshot is taken again for each attempt and survives reconciliation; if the keeper never
+observed the environment, `unset_env_present` is omitted rather than guessed. Structured
+notification event entries carry the same fields. No ledger migration is needed.
+
 ## Engines
 
 | Engine | Runs | Resume |

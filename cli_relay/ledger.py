@@ -724,8 +724,11 @@ class Ledger:
         if details["completion_marker_required"]:
             # The marker line sits at the end of the result, often past the excerpt: name it here.
             details["completion_marker"] = engines.completion_marker((native or {}).get("result"))
-        details.update({key: observations[key] for key in ("git", "warnings", "codex_git_repo_check")
+        details.update({key: observations[key] for key in ("git", "warnings", "codex_git_repo_check",
+                                                          "unset_env_present")
                         if key in observations})
+        if observations.get("preflight", {}).get("reason") == "billing_env_present":
+            details["preflight"] = observations["preflight"]
         body = {
             "task_id": att["task_id"],
             "attempt_no": att["attempt_no"],

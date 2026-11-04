@@ -254,7 +254,7 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
             "kind": row["kind"], "outcome": body.get("outcome") or row["kind"], "key": row.get("request_key"),
             **{key: body[key] for key in ("sandbox", "full_access", "network_access", "allowed_tools", "permissions",
                                           "completion_marker_required", "completion_marker", "origin", "git", "warnings",
-                                          "codex_git_repo_check")
+                                          "codex_git_repo_check", "unset_env", "unset_env_present", "preflight")
                if key in body},
             "result_excerpt": _clean(body.get("result_excerpt"), EXCERPT_MAX)}
 
