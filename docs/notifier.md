@@ -67,6 +67,7 @@ consumer (Bot) reads the task by id, reports in its chat, then `cli-relay ack` â
 - **Batching.** Due notifications of one route go out together as one wake-up.
 - **Default wake-ups.** `succeeded`, `failed`, `blocked`, `needs_input`, `unknown`. Logs, tokens
   and heartbeats never produce events, so they never wake anyone; `cancelled` is opt-in.
+  The informational `waiting` event is available through `events` and never causes a wake-up.
 
 ## Configuration: `<ledger home>/notifier.json`
 
@@ -261,6 +262,11 @@ These fields survive header/excerpt truncation, so a command-adapter consumer ne
 remain deliverable; no past event is reinterpreted or backfilled. Warnings such as
 `business_status_unknown`, `business_status_conflict`, `business_status_result_file_invalid` and
 `business_status_missing` follow the existing structured-warning and summary-code convention.
+
+Dependency-blocked terminal events and HTTP event entries also carry `reason_code`, `details`
+and a one-line `summary`, for example `dependency t-â€¦ business_status=partial outcome=succeeded
+does not satisfy require=ok`. This explanation is appended for every blocked task in a batch,
+outside header/excerpt truncation. See [dependency and queue rules](usage.md#dependencies-and-queues).
 
 New Codex event bodies and each corresponding `cli_relay.events` entry include `sandbox` and
 `full_access`. Full access is **off by default** and requires both

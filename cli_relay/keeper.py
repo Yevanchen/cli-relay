@@ -2,8 +2,8 @@
 write exit.json -> commit terminal state + event (one transaction).
 
 The keeper is the only process that ever starts the CLI for an attempt, and only after it won
-the pending->claimed compare-and-set and durably recorded 'spawning'. The CLI writes its
-stdout/stderr to files (not pipes), so it keeps running if the keeper dies; the CLI stays in
+the pending->claimed (or pending->waiting->claimed) compare-and-set and recorded 'spawning'.
+The CLI writes stdout/stderr to files (not pipes), so it keeps running if the keeper dies; it stays in
 the keeper's process group so an orphaned CLI is still detectable.
 
 SIGTERM or SIGUSR1 sent to the keeper means "cancel": it stops the CLI and records the outcome.
@@ -32,6 +32,8 @@ from .spawn import spawn_notifier_pass
 CANCEL_GRACE_S = 10.0
 POLL_S = 0.2
 CANCEL_DB_POLL_S = 2.0
+WAIT_POLL_MIN_S = 2.0
+WAIT_POLL_MAX_S = 10.0
 LOG_CAP_BYTES = 1 << 20
 
 
@@ -98,15 +100,15 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     _hook("after_claim")
     task = ledger.get_task(task_id)
     att = ledger.get_attempt(attempt_id)
+    if att["state"] not in ("waiting", "claimed"):
+        return 0  # a waiting attempt may have been cancelled just after the claim
     payload = json.loads(task["payload_json"])
     engine = task["engine"]
     run_dir = ledger.run_dir(task_id, att["attempt_no"])
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     log = _Log(run_dir / "keeper.log")
     env = dict(os.environ)
-    git_before = git_state.snapshot(payload["cwd"])
-    if git_before is not None:
-        ledger.add_evidence(attempt_id, {"git_before": git_before})
+    git_before = None
 
     def notify_pass() -> None:
         # A terminal event was committed: wake the consumer now rather than at the next periodic pass.
@@ -114,9 +116,31 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
             spawn_notifier_pass(home)
 
     def close(outcome: str, evidence: Dict[str, Any]) -> None:
-        ledger.finish(attempt_id, from_states=("claimed",), outcome=outcome,
+        ledger.finish(attempt_id, from_states=("waiting", "claimed"), outcome=outcome,
                       evidence={**evidence, **git_state.completion(payload["cwd"], git_before)}, source="keeper")
         notify_pass()
+
+    if att["state"] == "waiting":
+        delay = WAIT_POLL_MIN_S
+        while True:
+            if cancel["set"]:
+                close("cancelled", {"cancelled_before_start": True})
+                return 0
+            admission = ledger.admit_waiting(attempt_id, keeper_pid=me)
+            if admission == "ready":
+                att = ledger.get_attempt(attempt_id)
+                break
+            if admission != "waiting":
+                if admission == "blocked":
+                    notify_pass()
+                return 0
+            _hook("while_waiting")
+            time.sleep(delay)
+            delay = min(WAIT_POLL_MAX_S, delay * 2)
+
+    git_before = git_state.snapshot(payload["cwd"])
+    if git_before is not None:
+        ledger.add_evidence(attempt_id, {"git_before": git_before})
 
     try:
         ledger.check_integrity()

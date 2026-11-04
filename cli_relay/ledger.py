@@ -103,8 +103,11 @@ def _apply_notifier_extension(c: sqlite3.Connection, cutoff: str, *, historical:
     c.execute("INSERT OR IGNORE INTO meta (k, v) VALUES ('notifier_migrated_at', ?)", (now_iso(),))
 
 
-ACTIVE_STATES = ("pending", "claimed", "running")
-_TASK_STATE = {"pending": "accepted", "claimed": "running", "running": "running", "unknown": "unknown"}
+ACTIVE_STATES = ("pending", "waiting", "claimed", "running")
+_TASK_STATE = {"pending": "accepted", "waiting": "waiting", "claimed": "running", "running": "running",
+               "unknown": "unknown"}
+SCHEDULING_FIELDS = ("after", "after_require", "queue")
+AFTER_REQUIRE = ("ok", "ok_or_partial", "any_terminal")
 
 SCHEMA = """
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
@@ -527,6 +530,15 @@ class Ledger:
             raise NotFound("no task for this key", scope=scope, key=key)
         return row
 
+    def resolve_dependency(self, scope: str, ref: str) -> str:
+        row = self.conn.execute(
+            "SELECT task_id FROM tasks WHERE scope=? AND (task_id=? OR request_key=?) "
+            "ORDER BY (task_id=?) DESC LIMIT 1", (scope, ref, ref, ref)).fetchone()
+        if row is None:
+            raise Refused("dependency_not_found", "--after must name an existing task id or key in the same scope",
+                          scope=scope, ref=ref)
+        return row["task_id"]
+
     def attempts(self, task_id: str) -> List[Dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM attempts WHERE task_id=? ORDER BY attempt_no", (task_id,))
         return [dict(r) for r in rows.fetchall()]
@@ -546,7 +558,7 @@ class Ledger:
 
     def open_attempts(self) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
-            "SELECT * FROM attempts WHERE state IN ('pending','claimed','running','unknown') "
+            "SELECT * FROM attempts WHERE state IN ('pending','waiting','claimed','running','unknown') "
             "ORDER BY created_at")
         return [dict(r) for r in rows.fetchall()]
 
@@ -569,8 +581,8 @@ class Ledger:
         The caller may only report "accepted" after this returns (i.e. after COMMIT).
         Notification ownership is metadata, not payload: a duplicate keeps the first binding."""
         sha = payload_hash(payload)
-        now = now_iso()
         with self.tx() as c:
+            now = now_iso()  # submission order follows the serialized ledger transaction
             existing = c.execute("SELECT * FROM tasks WHERE scope=? AND request_key=?", (scope, key)).fetchone()
             if existing is not None:
                 status = "duplicate" if existing["payload_sha256"] == sha else "conflict"
@@ -581,6 +593,13 @@ class Ledger:
                               (now, existing["task_id"]))
                 task_id = existing["task_id"]
             else:
+                if "after" in payload:
+                    # Dependencies must predate this transaction: no forward/self edges or cycles.
+                    dependency = c.execute("SELECT task_id FROM tasks WHERE scope=? AND task_id=?",
+                                           (scope, payload["after"])).fetchone()
+                    if dependency is None:
+                        raise Refused("dependency_not_found", "dependency task must already exist in the same scope",
+                                      scope=scope, ref=payload["after"])
                 if notify_route is not None or notify_bound:
                     self.require_notifier()
                 status = "created"
@@ -611,16 +630,104 @@ class Ledger:
               host: str) -> bool:
         now = now_iso()
         with self.tx() as c:
+            task = c.execute("SELECT t.* FROM tasks t JOIN attempts a ON a.task_id=t.task_id "
+                             "WHERE a.attempt_id=?", (attempt_id,)).fetchone()
+            if task is None:
+                return False
+            payload = json.loads(task["payload_json"])
+            state = "waiting" if "after" in payload or "queue" in payload else "claimed"
             cur = c.execute(
-                "UPDATE attempts SET state='claimed', keeper_pid=?, keeper_token=?, keeper_pgid=?, host=?, "
+                "UPDATE attempts SET state=?, keeper_pid=?, keeper_token=?, keeper_pgid=?, host=?, "
                 "claimed_at=?, updated_at=? WHERE attempt_id=? AND state='pending'",
-                (keeper_pid, keeper_token, keeper_pgid, host, now, now, attempt_id))
+                (state, keeper_pid, keeper_token, keeper_pgid, host, now, now, attempt_id))
             if cur.rowcount != 1:
                 return False
             att = c.execute("SELECT task_id, attempt_no FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+            c.execute("UPDATE tasks SET state=?, updated_at=? WHERE task_id=? AND current_attempt=?",
+                      (task_state_for(state, None), now, att["task_id"], att["attempt_no"]))
+        return True
+
+    # ------------------------------------------------------------------ dependency / queue admission
+    def _waiting_on(self, c: sqlite3.Connection, task: sqlite3.Row) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        payload = json.loads(task["payload_json"])
+        waiting: Dict[str, Any] = {}
+        rejected = None
+        if "after" in payload:
+            dependency = c.execute(
+                "SELECT a.state, a.outcome, a.evidence_json FROM tasks t JOIN attempts a "
+                "ON a.task_id=t.task_id AND a.attempt_no=t.current_attempt WHERE t.task_id=?",
+                (payload["after"],)).fetchone()
+            require = payload.get("after_require", "ok")
+            status = json.loads(dependency["evidence_json"] or "{}").get("business_status", "unreported")
+            outcome = dependency["outcome"] or ("unknown" if dependency["state"] == "unknown" else None)
+            details = {"dependency_task_id": payload["after"], "dependency_outcome": outcome,
+                       "dependency_business_status": status, "require": require}
+            terminal = dependency["state"] in ("finished", "unknown")
+            satisfied = require == "any_terminal" or (
+                outcome == "succeeded" and (status == "ok" or (require == "ok_or_partial" and status == "partial")))
+            if terminal and not satisfied:
+                rejected = details
+            if not terminal or not satisfied:
+                waiting["dependency"] = details
+        if "queue" in payload:
+            # Include pending keepers for FIFO, and unknown holders because their engine may still run.
+            # shortcut: scan active tasks in the scope; add an indexed queue field for high-volume queues.
+            rows = c.execute(
+                "SELECT t.task_id, t.payload_json, a.state FROM tasks t JOIN attempts a "
+                "ON a.task_id=t.task_id AND a.attempt_no=t.current_attempt WHERE t.scope=? "
+                "AND a.state IN ('pending','waiting','claimed','running','unknown') "
+                "ORDER BY t.created_at, t.rowid", (task["scope"],)).fetchall()
+            ahead = []
+            before = True
+            for row in rows:
+                if row["task_id"] == task["task_id"]:
+                    before = False
+                elif json.loads(row["payload_json"]).get("queue") == payload["queue"]:
+                    if before or row["state"] in ("claimed", "running", "unknown"):
+                        ahead.append(row["task_id"])
+            if ahead:
+                waiting["queue"] = {"name": payload["queue"], "position": len(ahead) + 1, "ahead_task_ids": ahead}
+        return waiting, rejected
+
+    def waiting_on(self, task_id: str) -> Dict[str, Any]:
+        return self._waiting_on(self.conn, self.get_task(task_id))[0]
+
+    def admit_waiting(self, attempt_id: str, *, keeper_pid: int) -> str:
+        """Atomically check both gates and reserve the queue via waiting -> claimed. Only a keeper calls this."""
+        with self.tx() as c:
+            att = c.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+            if att is None or att["state"] != "waiting" or att["keeper_pid"] != keeper_pid:
+                return "closed"
+            task = c.execute("SELECT * FROM tasks WHERE task_id=?", (att["task_id"],)).fetchone()
+            waiting, rejected = self._waiting_on(c, task)
+            if rejected is not None:
+                summary = (f"dependency {rejected['dependency_task_id']} "
+                           f"business_status={rejected['dependency_business_status']} "
+                           f"outcome={rejected['dependency_outcome']} does not satisfy require={rejected['require']}")
+                self._close_in_tx(c, att, new_state="finished", kind="terminal", outcome="blocked",
+                                  exit_code=None, exit_signal=None, exit_known=False, native=None,
+                                  evidence={"reason_code": "dependency_not_satisfied", "details": rejected,
+                                            "summary": summary}, source="keeper")
+                return "blocked"
+            if waiting:
+                evidence = json.loads(att["evidence_json"] or "{}")
+                if evidence.get("waiting_on") != waiting:
+                    evidence["waiting_on"] = waiting
+                    c.execute("UPDATE attempts SET evidence_json=?, updated_at=? WHERE attempt_id=?",
+                              (canonical_json(evidence), now_iso(), attempt_id))
+                # One durable snapshot, not an event/notification on every poll or position change.
+                body = {"task_id": att["task_id"], "attempt_no": att["attempt_no"], "attempt_id": attempt_id,
+                        "kind": "waiting", "state": "waiting", "outcome": None, "waiting_on": waiting}
+                c.execute("INSERT OR IGNORE INTO events (event_id, task_id, attempt_no, kind, body_json, created_at) "
+                          "VALUES (?,?,?,'waiting',?,?)",
+                          (new_id("e"), att["task_id"], att["attempt_no"], canonical_json(body), now_iso()))
+                return "waiting"
+            now = now_iso()
+            c.execute("UPDATE attempts SET state='claimed', updated_at=? WHERE attempt_id=? AND state='waiting'",
+                      (now, attempt_id))
             c.execute("UPDATE tasks SET state='running', updated_at=? WHERE task_id=? AND current_attempt=?",
                       (now, att["task_id"], att["attempt_no"]))
-        return True
+            return "ready"
 
     def release_claim(self, attempt_id: str, *, keeper_pid: int, evidence: Dict[str, Any]) -> bool:
         """Undo a claim whose keeper died before it recorded 'spawning' (so no CLI was started)."""
@@ -729,12 +836,14 @@ class Ledger:
         if native and isinstance(native.get("result"), str):
             excerpt = native["result"][:RESULT_EXCERPT_CHARS]
         details = engines.request_details(task["engine"], payload)
+        details.update({key: payload[key] for key in SCHEDULING_FIELDS if key in payload})
         if "origin" in payload:
             details["origin"] = payload["origin"]
         if details["completion_marker_required"]:
             # The marker line sits at the end of the result, often past the excerpt: name it here.
             details["completion_marker"] = engines.completion_marker((native or {}).get("result"))
         details.update({key: observations[key] for key in ("git", "warnings", "codex_git_repo_check",
+                                                          "reason_code", "details", "summary",
                                                           *business_status.FIELDS)
                         if key in observations})
         body = {
@@ -788,7 +897,7 @@ class Ledger:
 
     # ------------------------------------------------------------------ cancel / resume
     def request_cancel(self, task_id: str) -> Tuple[str, Dict[str, Any], Optional[str]]:
-        """Returns (result, attempt, event_id). A pending attempt is closed directly (nothing ran)."""
+        """Returns (result, attempt, event_id). Pending/waiting attempts close directly (nothing ran)."""
         now = now_iso()
         with self.tx() as c:
             task = c.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
@@ -796,7 +905,7 @@ class Ledger:
                 raise NotFound("no such task", task_id=task_id)
             att = c.execute("SELECT * FROM attempts WHERE task_id=? AND attempt_no=?",
                             (task_id, task["current_attempt"])).fetchone()
-            if att["state"] == "pending":
+            if att["state"] in ("pending", "waiting"):
                 event_id = self._close_in_tx(c, att, new_state="finished", kind="terminal", outcome="cancelled",
                                              exit_code=None, exit_signal=None, exit_known=False, native=None,
                                              evidence={"cancelled_before_start": True}, source="cancel")

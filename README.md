@@ -18,6 +18,7 @@ It is not a model proxy, an agent framework, a networked relay, an orchestrator,
 | **Honest status after a break** | Attempts record host, process identity, native session id, and exit evidence. What cannot be proven is `unknown`, never guessed. |
 | **Hold until ACK** | Terminal events keep a stable id and are re-delivered until a named consumer ACKs them. |
 | **Wake on finish** | Optional notifier (script or webhook) can wake a consumer such as a Grok Bot routine when a task ends. A wake is not an ACK. |
+| **Dependencies and queues** | `submit --after <task id or key>` requires business `ok` by default; `--queue NAME` runs tasks one at a time in FIFO order within a home and scope. [Waiting, cancellation and release rules](docs/usage.md#dependencies-and-queues). |
 
 ## Quick start
 
@@ -30,7 +31,7 @@ cli-relay submit --key fix-tests-42 --engine claude --cwd ~/code/app \
   --prompt "Run the unit tests and summarise failures."
 
 cli-relay wait t-… --timeout 600    # a timeout only stops waiting; the task keeps running
-cli-relay events --consumer grok    # terminal events this consumer has not ACKed yet
+cli-relay events --consumer grok    # waiting/result events this consumer has not ACKed yet
 cli-relay ack --consumer grok --task t-… --attempt 1 --event e-…
 ```
 
