@@ -144,14 +144,17 @@ Private to each machine. Never commit it. Keep it readable only by its owner (`c
   (absolute paths). They are read at send time and never printed or logged.
 - An invalid file is refused as a whole (exit 2, key names only) and nothing is sent.
 
-The example above shows the legacy layout: a route with **no `verification` key** remains usable
+The example above shows the legacy layout: `migrate` records existing routes with **no
+`verification` key** and no managed-route record in the ledger's `legacy_routes` table. Only those
+names with matching source, consumer, chat and adapter fingerprints remain usable without a receipt
 for explicit/default submissions, task delivery and bounded reminders. This preserves the deployed
 installer's `friday` route without changing notifier.json's format, its file bytes or the installer
 template. Loading, listing and diagnosing the configuration do not rewrite it. Leave the live
 route configuration unchanged on upgrade; do not add a receipt or re-register it as an upgrade step.
 `doctor` reports `proven: true, proof: legacy_config`, which denotes compatibility rather than a
 new visible-message receipt. An explicit `verification: null` or any unfinished verification is
-**not** legacy and cannot bypass proof requirements.
+**not** legacy and cannot bypass proof requirements. Adding a new name, renaming a route, or changing
+its recorded identity requires verification; removing `verification` cannot grant an exemption.
 
 Use `route add` for new routes. It writes `verification: null`, so they remain **unproven** until
 `route verify` (plus `route confirm` for an async receiver) succeeds. New routes need Evan's approval and a separate acceptance step before
@@ -399,10 +402,11 @@ from historical events and do not change routing or delivery.
 ### Earlier v0.2 candidate ledgers
 
 Run `migrate` when upgrading an earlier candidate as well as v0.1. The core schema stays 1;
-the additive notifier extension is now 3. A consistent backup is taken before adding any missing
+the additive notifier extension is now 4. A consistent backup is taken before adding any missing
 owner fields, nullable `acks.message_id` / `acks.chat`, `managed_routes`, `route_verifications`
-and `notification_fallbacks`; the original notification cutoff is preserved. Existing ACKs keep
-their time and have null message/chat. Old ledgers open for results and original single-event
+and `notification_fallbacks`, and recording legacy route identities in `legacy_routes`; the original
+notification cutoff is preserved. Existing ACKs keep their time and have null message/chat.
+Old ledgers open for results and original single-event
 ACKs before migration; the new receipt and notifier operations require `migrate`.
 `brief` also requires migration so its printed receipt command can execute. Historical
 managed proofs stored only in notifier.json must run `verify` again (plus async `confirm`);

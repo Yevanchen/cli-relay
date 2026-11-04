@@ -90,17 +90,19 @@ def load_config(home: Path) -> Dict[str, Any]:
         try:
             managed = dict(ledger.conn.execute("SELECT route, verification_id FROM managed_routes").fetchall()) \
                 if ledger.has_notifier() else {}
+            legacy = dict(ledger.conn.execute("SELECT route, route_sha256 FROM legacy_routes").fetchall()) \
+                if ledger.has_notifier() else {}
             for route in cfg["routes"].values():
                 if not route.get("verification"):
-                    if route["name"] in managed:
-                        route["proven"] = False
+                    route["proven"] = bool("verification" not in route and route["name"] not in managed
+                                           and legacy.get(route["name"]) == route_fingerprint(cfg["source_id"], route))
                     continue
                 proof = route["verification"]
                 stored = ledger.conn.execute(
                     "SELECT receipt_json FROM route_verifications WHERE verification_id=? AND route=?",
                     (proof["verification_id"], route["name"])).fetchone() if ledger.has_notifier() else None
                 # Configuration alone cannot grant a managed route proof. Only verify/confirm
-                # write this ledger record. Legacy routes keep the existing compatibility rule.
+                # write this ledger record. Legacy exemptions also require a stored identity.
                 route["proven"] = bool(managed.get(route["name"]) == proof["verification_id"]
                                        and stored and stored[0] == canonical_json(proof)
                                        and proof["state"] == "acked" and proof["ledger_id"] == ledger.ledger_id
@@ -128,9 +130,8 @@ def validate_config(raw: Any) -> Dict[str, Any]:
     if default_route is not None and (not isinstance(default_route, str) or default_route not in clean_routes):
         raise _bad("default_route is not one of the routes")
     for route in clean_routes.values():
-        # Installer-managed legacy routes have no verification key. Preserve their existing
-        # behavior without migrating the file; an explicit null or pending receipt is not legacy.
-        route["proven"] = "verification" not in route
+        # Validation alone cannot grant proof or a legacy exemption; load_config checks the ledger.
+        route["proven"] = False
         fallback = route.get("fallback_route")
         if fallback is not None and (fallback == route["name"] or fallback not in clean_routes):
             raise _bad("fallback_route must be another existing route")

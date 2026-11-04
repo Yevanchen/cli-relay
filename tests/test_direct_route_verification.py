@@ -228,6 +228,44 @@ class AsyncRouteVerification(DirectRouteCase):
             pending = self.command("route", "verify", "bot", expected=6)
         self.confirm(pending)
 
+    def assert_unproven_without_probe(self, name):
+        with mock.patch.object(notify, "send") as send:
+            listed = {route["name"]: route for route in self.command("route", "list")["routes"]}
+            self.assertFalse(listed[name]["proven"])
+            self.assertEqual(self.command("route", "set-default", name, expected=6)["error"], "route_unproven")
+            result = self.command("submit", "--key", "unproven", "--engine", "fixture", "--cwd", str(self.work),
+                                  "--prompt", "p", "--notify-route", name, expected=6)
+            self.assertEqual(result["error"], "route_unproven")
+        send.assert_not_called()
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM route_verifications").fetchone()[0], 0)
+        self.assert_no_secret()
+
+    def test_new_name_without_verification_does_not_get_legacy_proof(self):
+        self.add()
+        path = self.home / "notifier.json"
+        cfg = json.loads(path.read_text())
+        cfg["routes"]["new"] = {k: v for k, v in cfg["routes"]["bot"].items() if k != "verification"}
+        path.write_text(json.dumps(cfg))
+        self.assertFalse(self.command("migrate")["migrated"])
+        self.assert_unproven_without_probe("new")
+
+    def test_first_config_on_new_ledger_does_not_get_legacy_proof(self):
+        raw = {"source_id": "test-mac", "routes": {"new": {
+            "consumer": "bot", "chat": "bot-chat", "adapter": {"type": "command", "argv": ["/bin/true"]}}}}
+        self.assertFalse(notify.validate_config(raw)["routes"]["new"]["proven"])
+        (self.home / notify.CONFIG_NAME).write_text(json.dumps(raw))
+        self.assert_unproven_without_probe("new")
+
+    def test_renamed_unverified_route_without_verification_does_not_get_legacy_proof(self):
+        self.add()
+        path = self.home / "notifier.json"
+        cfg = json.loads(path.read_text())
+        cfg["routes"]["bot-renamed"] = cfg["routes"].pop("bot")
+        cfg["routes"]["bot-renamed"].pop("verification")
+        path.write_text(json.dumps(cfg))
+        self.assert_unproven_without_probe("bot-renamed")
+
     def test_old_proof_cannot_be_restored_after_remove_and_reregister(self):
         pending = self.pending()
         self.confirm(pending)
@@ -279,7 +317,7 @@ class SchemaTwoRouteMigration(DirectRouteCase):
                 route["verification"].pop("async_accepted", None)
         routes._save(self.home, cfg)
         with self.ledger.tx() as c:
-            for table in ("managed_routes", "route_verifications", "notification_fallbacks"):
+            for table in ("managed_routes", "route_verifications", "notification_fallbacks", "legacy_routes"):
                 c.execute(f"DROP TABLE {table}")
             c.execute("UPDATE meta SET v='2' WHERE k='notifier_schema'")
         path = self.home / notify.CONFIG_NAME
@@ -297,6 +335,8 @@ class SchemaTwoRouteMigration(DirectRouteCase):
         self.assertEqual(managed, {"unverified": None, "bot": None, "confirmed": None})
         self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM route_verifications").fetchone()[0], 0)
         cfg = notify.load_config(self.home)
+        legacy = dict(self.ledger.conn.execute("SELECT route, route_sha256 FROM legacy_routes").fetchall())
+        self.assertEqual(legacy, {"friday": notify.route_fingerprint(cfg["source_id"], cfg["routes"]["friday"])})
         self.assertTrue(cfg["routes"]["friday"]["proven"])
         for name in managed:
             self.assertFalse(cfg["routes"][name]["proven"])
@@ -311,6 +351,113 @@ class SchemaTwoRouteMigration(DirectRouteCase):
         self.prove()
         self.assertFalse(self.command("migrate")["migrated"])
         self.assertTrue(notify.load_config(self.home)["routes"]["bot"]["proven"])
+        self.assert_no_secret()
+
+
+class SchemaThreeRouteMigration(DirectRouteCase):
+    def migrate_friday(self):
+        cfg = notify.load_config(self.home) if notify.configured(self.home) else notify.validate_config({
+            "source_id": "test-mac", "routes": {}})
+        cfg["routes"]["friday"] = notify._route("friday", {
+            "consumer": "friday", "chat": "friday-chat",
+            "adapter": {"type": "http", "url_env": "ROUTE_URL", "token_env": "ROUTE_TOKEN"}})
+        cfg["default_route"] = "friday"
+        routes._save(self.home, cfg)
+        with self.ledger.tx() as c:
+            c.execute("DROP TABLE legacy_routes")
+            c.execute("UPDATE meta SET v='3' WHERE k='notifier_schema'")
+        path = self.home / notify.CONFIG_NAME
+        before, mtime = path.read_bytes(), path.stat().st_mtime_ns
+        cutoff = self.ledger.notifier_cutoff()
+        with mock.patch.object(notify, "_secret", side_effect=AssertionError("migration resolved a secret")), \
+                mock.patch.object(notify, "send") as send:
+            migrated = self.command("migrate")
+        send.assert_not_called()
+        self.assertTrue(migrated["migrated"])
+        self.assertEqual(self.ledger.notifier_cutoff(), cutoff)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(path.stat().st_mtime_ns, mtime)
+        return json.loads(before)
+
+    def test_migration_keeps_ledger_proofs_and_excludes_managed_names_with_stripped_receipts(self):
+        self.add("stripped")
+        self.add()
+        proof = self.prove()["verification"]
+        cfg = notify.load_config(self.home)
+        cfg["routes"]["stripped"].pop("verification")
+        routes._save(self.home, cfg)
+        self.migrate_friday()
+        cfg = notify.load_config(self.home)
+        self.assertTrue(cfg["routes"]["bot"]["proven"])
+        self.assertEqual(cfg["routes"]["bot"]["verification"], proof)
+        self.assertFalse(cfg["routes"]["stripped"]["proven"])
+        self.command("route", "set-default", "stripped", expected=6)
+        legacy = dict(self.ledger.conn.execute("SELECT route, route_sha256 FROM legacy_routes").fetchall())
+        self.assertEqual(legacy, {"friday": notify.route_fingerprint(cfg["source_id"], cfg["routes"]["friday"])})
+        self.assertTrue(cfg["routes"]["friday"]["proven"])
+        self.assertFalse(self.command("route", "set-default", "friday")["changed"])
+        with mock.patch.object(notify, "send") as send:
+            self.assertFalse(self.command("route", "verify", "friday")["sent"])
+        send.assert_not_called()
+        self.assertFalse(self.command("migrate")["migrated"])
+        self.assert_no_secret()
+
+    def test_migrated_legacy_exemption_does_not_follow_new_or_renamed_names(self):
+        original = self.migrate_friday()
+        path = self.home / notify.CONFIG_NAME
+        for renamed in (False, True):
+            with self.subTest(renamed=renamed):
+                raw = json.loads(json.dumps(original))
+                raw["routes"]["friday-renamed"] = dict(raw["routes"]["friday"])
+                if renamed:
+                    del raw["routes"]["friday"]
+                    raw["default_route"] = "friday-renamed"
+                path.write_text(json.dumps(raw))
+                self.assertFalse(self.command("migrate")["migrated"])
+                listed = {route["name"]: route for route in self.command("route", "list")["routes"]}
+                self.assertFalse(listed["friday-renamed"]["proven"])
+                if not renamed:
+                    self.assertTrue(listed["friday"]["proven"])
+                result = self.command("route", "set-default", "friday-renamed", expected=6)
+                self.assertEqual(result["error"], "route_unproven")
+        self.assert_no_secret()
+
+    def test_completed_migration_is_rechecked_before_importing_legacy_routes(self):
+        raw = self.migrate_friday()
+        raw["routes"]["new"] = dict(raw["routes"]["friday"])
+        (self.home / notify.CONFIG_NAME).write_text(json.dumps(raw))
+        # Simulate another migrator committing after the initial schema check.
+        with mock.patch.object(self.ledger, "has_notifier", side_effect=(False, True)):
+            self.assertFalse(self.ledger.migrate()["migrated"])
+        self.assertFalse(notify.load_config(self.home)["routes"]["new"]["proven"])
+        self.assertEqual(self.ledger.conn.execute("SELECT route FROM legacy_routes").fetchall()[0][0], "friday")
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM legacy_routes").fetchone()[0], 1)
+        self.assert_no_secret()
+
+    def test_migrated_legacy_exemption_is_bound_to_source_destination_and_credential_references(self):
+        original = self.migrate_friday()
+        path = self.home / notify.CONFIG_NAME
+        for target, key, value in (("root", "source_id", "another-mac"), ("route", "consumer", "other"),
+                                   ("route", "chat", "another-chat"), ("adapter", "url_env", "OTHER_URL"),
+                                   ("adapter", "token_env", "OTHER_TOKEN")):
+            with self.subTest(target=target, key=key):
+                raw = json.loads(json.dumps(original))
+                obj = raw if target == "root" else raw["routes"]["friday"]
+                if target == "adapter":
+                    obj = obj["adapter"]
+                obj[key] = value
+                path.write_text(json.dumps(raw))
+                self.assertFalse(self.command("migrate")["migrated"])
+                self.assertFalse(notify.load_config(self.home)["routes"]["friday"]["proven"])
+                result = self.command("route", "set-default", "friday", expected=6)
+                self.assertEqual(result["error"], "route_unproven")
+                for extra in ((), ("--notify-route", "friday")):
+                    result = self.command("submit", "--key", "unproven", "--engine", "fixture",
+                                          "--cwd", str(self.work), "--prompt", "p", *extra, expected=6)
+                    self.assertEqual(result["error"], "route_unproven")
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+        path.write_text(json.dumps(original))
+        self.assertTrue(notify.load_config(self.home)["routes"]["friday"]["proven"])
         self.assert_no_secret()
 
 

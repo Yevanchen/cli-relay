@@ -129,6 +129,10 @@ class FallbackReminders(DirectRouteCase):
             "friday": {"consumer": "friday", "chat": "friday-chat", "adapter": {
                 "type": "http", "url_env": "ROUTE_URL", "token_env": "ROUTE_TOKEN"}}}}
         (self.home / "notifier.json").write_text(json.dumps(raw))
+        with self.ledger.tx() as c:
+            c.execute("DROP TABLE legacy_routes")
+            c.execute("UPDATE meta SET v='3' WHERE k='notifier_schema'")
+        self.command("migrate")
         self.add(fallback="friday")
         cfg = notify.load_config(self.home)
         self.assertEqual(cfg["default_route"], "friday")
@@ -162,6 +166,10 @@ class FallbackReminders(DirectRouteCase):
         routes._save(self.home, notify.validate_config({"source_id": "test-mac", "routes": {
             "friday": {"consumer": "friday", "chat": "friday-chat", "adapter": {
                 "type": "http", "url_env": "ROUTE_URL", "token_env": "ROUTE_TOKEN"}}}}))
+        with self.ledger.tx() as c:
+            c.execute("DROP TABLE legacy_routes")
+            c.execute("UPDATE meta SET v='3' WHERE k='notifier_schema'")
+        self.command("migrate")
         self.add(fallback="friday")
         self.prove()
         _, event = self.finish(route="bot")

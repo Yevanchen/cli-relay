@@ -45,7 +45,7 @@ RESULT_EXCERPT_CHARS = 2000
 # The notifier extension (v0.2) is additive: new tables, indexes and routing columns.
 # schema_version stays 1 because v0.1.0 checks exactly that and ignores what it does not know,
 # so v0.1.0 can still open a migrated ledger. That is the rollback path.
-NOTIFIER_SCHEMA = "3"
+NOTIFIER_SCHEMA = "4"
 NOTIFIER_DDL = (
     """CREATE TABLE IF NOT EXISTS notifications (
   event_id TEXT NOT NULL REFERENCES events(event_id),
@@ -87,6 +87,7 @@ NOTIFIER_DDL = (
   receipt_json TEXT NOT NULL
 )""",
     "CREATE TABLE IF NOT EXISTS managed_routes (route TEXT PRIMARY KEY, verification_id TEXT)",
+    "CREATE TABLE IF NOT EXISTS legacy_routes (route TEXT PRIMARY KEY, route_sha256 TEXT NOT NULL)",
     """CREATE TABLE IF NOT EXISTS notification_fallbacks (
   event_id TEXT NOT NULL,
   original_route TEXT NOT NULL,
@@ -544,14 +545,21 @@ class Ledger:
         cutoff = self.notifier_cutoff() if self._meta("notifier_schema") else ("" if backfill else now_iso())
         from . import notify
 
-        managed = [name for name, route in notify.load_config(self.home)["routes"].items()
-                   if "verification" in route] if notify.configured(self.home) else []
+        cfg = notify.load_config(self.home) if notify.configured(self.home) else None
         with self.tx() as c:
+            if self.has_notifier():  # another migrator may have completed while we read the config
+                return {"migrated": False, "already": True, "cutoff": self.notifier_cutoff()}
             _apply_notifier_extension(c, cutoff=cutoff, historical=True)
             # Older managed routes must never regain the legacy exemption if their receipt
             # is removed. Register only their names; config-only proofs are not trusted.
             c.executemany("INSERT OR IGNORE INTO managed_routes (route, verification_id) VALUES (?,NULL)",
-                          ((name,) for name in managed))
+                          ((name,) for name, route in cfg["routes"].items() if "verification" in route) if cfg else ())
+            # Grandfather only routes present at migration, bound to their original identity.
+            # Existing managed names remain ineligible even if their verification key was removed.
+            c.executemany("INSERT OR IGNORE INTO legacy_routes (route, route_sha256) "
+                          "SELECT ?,? WHERE NOT EXISTS (SELECT 1 FROM managed_routes WHERE route=?)",
+                          ((name, notify.route_fingerprint(cfg["source_id"], route), name)
+                           for name, route in cfg["routes"].items() if "verification" not in route) if cfg else ())
         return {"migrated": True, "backup": str(dest_path), "cutoff": cutoff, "schema_version": SCHEMA_VERSION,
                 "notifier_schema": NOTIFIER_SCHEMA}
 

@@ -228,6 +228,11 @@ class RouteAndOriginTests(unittest.TestCase):
                "retry": {"max_attempts": 6, "base_delay_s": 30, "max_delay_s": 1800},
                "reminder": {"ack_timeout_s": 1800, "max_wakes": 2}}
         (self.home / "notifier.json").write_text(json.dumps(raw, indent=2) + "\n")
+        # The installer route existed before the ledger gained identity-bound legacy records.
+        with self.ledger.tx() as c:
+            c.execute("DROP TABLE legacy_routes")
+            c.execute("UPDATE meta SET v='3' WHERE k='notifier_schema'")
+        self.command("migrate")
         return raw
 
     def test_installer_template_friday_submits_delivers_and_keeps_config_bytes(self):
