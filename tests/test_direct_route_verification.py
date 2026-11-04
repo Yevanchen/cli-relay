@@ -44,6 +44,47 @@ class AsyncRouteVerification(DirectRouteCase):
         self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM acks").fetchone()[0], 0)
         self.assert_no_secret()
 
+    def test_async_acceptance_survives_failed_reminder_and_delayed_confirmation(self):
+        pending = self.pending()
+        with mock.patch.object(routes, "now_iso", return_value=pending["verification"]["next_at"]), \
+                FakeHTTPReceiver([401]) as receiver:
+            failed = self.command("route", "verify", "bot", expected=6)
+        self.assertEqual(failed["verification_id"], pending["verification_id"])
+        self.assertEqual(failed["verification"]["state"], "failed")
+        self.assertEqual(len(receiver.requests), 1)
+        self.assertFalse(failed["proven"])
+        with mock.patch.object(routes, "now_iso", return_value=notify._later(7200)), \
+                mock.patch.object(notify, "send") as send:
+            confirmed = self.confirm(pending)
+        send.assert_not_called()
+        self.assertTrue(confirmed["proven"])
+        self.assertTrue(confirmed["verification"]["async_accepted"])
+        stored = json.loads(self.ledger.conn.execute("SELECT receipt_json FROM route_verifications").fetchone()[0])
+        self.assertEqual(stored, confirmed["verification"])
+        self.assertTrue(notify.load_config(self.home)["routes"]["bot"]["proven"])
+        self.assert_no_secret()
+
+    def test_older_async_receipt_retains_acceptance_when_reminder_fails(self):
+        pending = self.pending()
+        cfg = notify.load_config(self.home)
+        cfg["routes"]["bot"]["verification"].pop("async_accepted", None)
+        routes._store_verification(self.home, cfg["routes"]["bot"])
+        routes._save(self.home, cfg)
+        with mock.patch.object(routes, "now_iso", return_value=pending["verification"]["next_at"]), \
+                FakeHTTPReceiver([401]):
+            self.command("route", "verify", "bot", expected=6)
+        self.assertTrue(self.confirm(pending)["proven"])
+
+    def test_failed_probe_and_new_retry_do_not_borrow_async_acceptance(self):
+        pending = self.pending()
+        with mock.patch.object(routes, "now_iso", return_value=pending["verification"]["next_at"]), \
+                FakeHTTPReceiver([401, 401]):
+            self.command("route", "verify", "bot", expected=6)
+            newer = self.command("route", "verify", "bot", "--retry", expected=6)
+        self.assertNotEqual(newer["verification_id"], pending["verification_id"])
+        self.assertEqual(self.confirm(pending, expected=6)["error"], "verification_mismatch")
+        self.assertEqual(self.confirm(newer, expected=6)["error"], "verification_not_confirmable")
+
     def test_wrong_id_route_and_asserted_identity_refused(self):
         pending = self.pending()
         self.command("route", "confirm", "bot", "--verification-id", "v-" + "0" * 32,
@@ -181,6 +222,58 @@ class AsyncRouteVerification(DirectRouteCase):
         self.assertFalse(current["sent"])
         self.assertEqual(receiver.requests, [])
         self.confirm(newer)
+
+
+class SchemaTwoRouteMigration(DirectRouteCase):
+    def test_migration_registers_historical_managed_routes_without_importing_proofs(self):
+        self.add("unverified")
+        self.add()
+        with FakeHTTPReceiver():
+            self.command("route", "verify", "bot", expected=6)
+        self.add("confirmed")
+        self.prove("confirmed")
+        cfg = notify.load_config(self.home)
+        cfg["routes"]["friday"] = notify._route("friday", {
+            "consumer": "friday", "chat": "friday-chat",
+            "adapter": {"type": "command", "argv": ["/bin/true"]}})
+        for route in cfg["routes"].values():
+            if route.get("verification"):
+                route["verification"].pop("async_accepted", None)
+        routes._save(self.home, cfg)
+        with self.ledger.tx() as c:
+            for table in ("managed_routes", "route_verifications", "notification_fallbacks"):
+                c.execute(f"DROP TABLE {table}")
+            c.execute("UPDATE meta SET v='2' WHERE k='notifier_schema'")
+        path = self.home / notify.CONFIG_NAME
+        before, mtime = path.read_bytes(), path.stat().st_mtime_ns
+        cutoff = self.ledger.notifier_cutoff()
+        with mock.patch.object(notify, "_secret", side_effect=AssertionError("migration resolved a secret")), \
+                mock.patch.object(notify, "send") as send:
+            migrated = self.command("migrate")
+        send.assert_not_called()
+        self.assertTrue(migrated["migrated"])
+        self.assertEqual(self.ledger.notifier_cutoff(), cutoff)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(path.stat().st_mtime_ns, mtime)
+        managed = dict(self.ledger.conn.execute("SELECT route, verification_id FROM managed_routes").fetchall())
+        self.assertEqual(managed, {"unverified": None, "bot": None, "confirmed": None})
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM route_verifications").fetchone()[0], 0)
+        cfg = notify.load_config(self.home)
+        self.assertTrue(cfg["routes"]["friday"]["proven"])
+        for name in managed:
+            self.assertFalse(cfg["routes"][name]["proven"])
+            cfg["routes"][name].pop("verification")
+        routes._save(self.home, cfg)
+        cfg = notify.load_config(self.home)
+        for name in managed:
+            self.assertFalse(cfg["routes"][name]["proven"])
+            self.command("route", "set-default", name, expected=6)
+        self.assertTrue(cfg["routes"]["friday"]["proven"])
+        self.assertFalse(self.command("migrate")["migrated"])
+        self.prove()
+        self.assertFalse(self.command("migrate")["migrated"])
+        self.assertTrue(notify.load_config(self.home)["routes"]["bot"]["proven"])
+        self.assert_no_secret()
 
 
 if __name__ == "__main__":

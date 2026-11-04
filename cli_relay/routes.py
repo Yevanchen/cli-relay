@@ -265,8 +265,7 @@ def confirm(home: Path, name: str, *, verification_id: str, message_id: str,
             return _receipt(cfg, route, state["ledger_id"], sent=False)
         if not state.get("expires_at") or state["expires_at"] <= now_iso():
             raise Refused("verification_expired", "probe has expired; run route verify --retry for a new id")
-        if (state["state"] not in ("awaiting_confirmation", "unacknowledged")
-                or state["last_result"] != "verification_awaiting_confirmation"):
+        if not state.get("async_accepted", state["last_result"] == "verification_awaiting_confirmation"):
             raise Refused("verification_not_confirmable", "probe needs a successful async transport acceptance")
         state.update(state="acked", message_id=message_id, acked_at=now_iso(), next_at=None)
         route.update(verification=state, proven=True)
@@ -315,7 +314,7 @@ def verify(home: Path, name: str, *, retry: bool = False,
             state = {"verification_id": "v-" + uuid.uuid4().hex, "route_sha256": fingerprint, "ledger_id": ledger_id,
                      "state": "pending", "attempts": 0, "wakes": 0, "next_at": now_iso(),
                      "created_at": now_iso(), "expires_at": notify._later(VERIFICATION_TTL_S),
-                     "message_id": None, "acked_at": None, "last_result": None}
+                     "message_id": None, "acked_at": None, "last_result": None, "async_accepted": False}
         route["verification"] = state
         if state["state"] in ("failed", "unacknowledged"):
             return _receipt(cfg, route, ledger_id, sent=False)
@@ -338,6 +337,8 @@ def verify(home: Path, name: str, *, retry: bool = False,
                    "status": "route_verify", "summary": summary,
                    "artifact": f"cli-relay:{cfg['source_id']}:{ledger_id}", "cli_relay": request}
         attempts, wakes = state["attempts"], state["wakes"]
+        # Preserve acceptance from older receipts before a reminder overwrites last_result.
+        state.setdefault("async_accepted", state["last_result"] == "verification_awaiting_confirmation")
         state.update(state="sending", attempts=attempts + 1, wakes=wakes + 1,
                      next_at=notify._later(cfg["reminder"]["ack_timeout_s"]), last_result="sending")
         _store_verification(home, route)
@@ -348,7 +349,7 @@ def verify(home: Path, name: str, *, retry: bool = False,
             result = {"outcome": "ambiguous", "why": "verification_receipt_invalid"}
         state.update(notify.delivery_result(cfg, result, attempts, wakes), last_result=result["why"])
         if result.get("why") == "verification_awaiting_confirmation":
-            state["state"] = "awaiting_confirmation"
+            state.update(state="awaiting_confirmation", async_accepted=True)
         if result["outcome"] == "accepted" and result.get("message_id"):
             # The validated receiver receipt is the probe ACK. A task's ACKs are never touched.
             state.update(state="acked", message_id=result["message_id"], acked_at=now_iso(), next_at=None)

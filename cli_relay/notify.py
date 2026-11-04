@@ -191,8 +191,10 @@ def _verification(value: Any) -> Optional[Dict[str, Any]]:
         return None
     fields = {"verification_id", "route_sha256", "ledger_id", "state", "attempts", "wakes", "next_at", "created_at",
               "message_id", "acked_at", "last_result"}
-    if not isinstance(value, dict) or set(value) - {"expires_at"} != fields:
+    if not isinstance(value, dict) or set(value) - {"expires_at", "async_accepted"} != fields:
         raise _bad("invalid route verification receipt")
+    if "async_accepted" in value and type(value["async_accepted"]) is not bool:
+        raise _bad("invalid route verification async acceptance")
     if (not isinstance(value["verification_id"], str)
             or not re.fullmatch(r"v-[0-9a-f]{32}", value["verification_id"])
             or not isinstance(value["route_sha256"], str)

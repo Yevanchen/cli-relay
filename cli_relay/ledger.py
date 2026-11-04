@@ -542,8 +542,16 @@ class Ledger:
             dest.close()
         os.chmod(str(dest_path), 0o600)
         cutoff = self.notifier_cutoff() if self._meta("notifier_schema") else ("" if backfill else now_iso())
+        from . import notify
+
+        managed = [name for name, route in notify.load_config(self.home)["routes"].items()
+                   if "verification" in route] if notify.configured(self.home) else []
         with self.tx() as c:
             _apply_notifier_extension(c, cutoff=cutoff, historical=True)
+            # Older managed routes must never regain the legacy exemption if their receipt
+            # is removed. Register only their names; config-only proofs are not trusted.
+            c.executemany("INSERT OR IGNORE INTO managed_routes (route, verification_id) VALUES (?,NULL)",
+                          ((name,) for name in managed))
         return {"migrated": True, "backup": str(dest_path), "cutoff": cutoff, "schema_version": SCHEMA_VERSION,
                 "notifier_schema": NOTIFIER_SCHEMA}
 
