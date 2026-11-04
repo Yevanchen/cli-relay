@@ -290,9 +290,10 @@ the form `{"code": "uncommitted_changes"}` or `{"code": "permission_denials", "t
 The summary also names warning codes and denied tools for the command adapter. A native success
 with exit 0 can carry denial warnings while remaining `succeeded`; a required completion marker
 still gates it. A structured Bash denial matching a task's requested command prefix also adds
-`{"code": "allowed_rule_denied", "commands": ["cp -n a b"]}`. The list is unique and sorted,
-with each command truncated to 200 characters; the summary reports the count and first command
-(up to 80 characters). No other tool-input fields are copied into the diagnostic. See the
+`{"code": "allowed_rule_denied", "commands": ["cp -n a b"]}`. Only matching prefixes requested
+by the user are copied, without runtime arguments. The list is unique and sorted, with each
+prefix truncated to 200 characters; the summary reports the prefix count and first prefix
+(up to 80 characters). No tool-input fields are copied into the diagnostic. See the
 [Claude prefix-rule limitation and submit warning](usage.md#allowed_bash_commands).
 Git observations and these diagnostics never change the outcome. Without these observations, the
 notification payload is unchanged; no empty warning list or non-Git placeholder is added.

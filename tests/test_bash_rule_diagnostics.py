@@ -27,7 +27,8 @@ class BashRuleWarnings(unittest.TestCase):
                 if warns:
                     self.assertEqual(warnings[0]["code"], "bash_rule_not_honoured")
                     self.assertEqual(warnings[0]["command"], command)
-                    for text in ("Claude Code", "2.1.312", "prefix rule is listed", "cp <src> <dst>", "test -e"):
+                    for text in ("Claude Code", "2.1.312", "prefix rule is listed", "cp <src> <dst>",
+                                 "drop -n only when overwriting the destination is acceptable", "test -e"):
                         self.assertIn(text, warnings[0]["hint"])
         self.assertEqual(engines.bash_rule_warnings("fixture", payload), [])
 
@@ -50,7 +51,7 @@ class BashDenialParsing(unittest.TestCase):
                     {"tool": "Bash", "tool_input": {"command": "python3 other.py"}}]
         parsed = self.parse(denials, ["cp -n a b", "python3", "python3 checker.py"])
         self.assertEqual(parsed["warnings"], [{"code": "allowed_rule_denied",
-                                               "commands": ["cp -n a b", "python3 checker.py"]}])
+                                               "commands": ["cp -n a b", "python3", "python3 checker.py"]}])
         self.assertEqual(parsed["native"], self.parse(denials)["native"])
         self.assertNotIn("not exported", json.dumps(parsed))
         self.assertNotIn("tool_input", json.dumps(parsed))
@@ -144,7 +145,7 @@ class BashDiagnosticsRoundTrip(RelayTestCase):
 
     def assert_diagnostics(self, done, outcome):
         expected = [{"code": "permission_denials", "tools": ["Bash", "Monitor"]},
-                    {"code": "allowed_rule_denied", "commands": ["cp -n a b", "python3 checker.py"]}]
+                    {"code": "allowed_rule_denied", "commands": ["cp -n a b", "python3"]}]
         self.assertEqual(done["task"]["state"], outcome)
         delivered = notification(done)
         for record in (done["attempts"][0]["evidence"], done["events"][0]["body"],
@@ -168,6 +169,32 @@ class BashDiagnosticsRoundTrip(RelayTestCase):
 
     def test_native_failure_keeps_needs_input_and_reports_diagnostics(self):
         self.assert_diagnostics(self.run_denials(ok=False), "needs_input")
+
+    def test_runtime_arguments_are_not_exported_after_bash_denial(self):
+        secret = "PLACEHOLDER-SECRET-123"
+        command = f'curl -H "Authorization: Bearer {secret}" https://example.invalid'
+        expected = [{"code": "permission_denials", "tools": ["Bash"]},
+                    {"code": "allowed_rule_denied", "commands": ["curl"]}]
+        for crash in (False, True):
+            with self.subTest(crash=crash):
+                denial = {"tool_name": "Bash", "tool_input": {"command": command}}
+                sub, env = self.submit_claude(["curl"], denials=[denial], ok=False, crash=crash)
+                done = self.finish(sub, env, crash=crash)
+                self.assertEqual(done["task"]["state"], "needs_input")
+                status = self.cli("status", sub["task_id"])
+                delivered = notification(done)
+                events = [json.loads(row["body_json"]) for row in db_rows(
+                    self.home, "SELECT body_json FROM events WHERE task_id=?", (sub["task_id"],))]
+                self.assertEqual(len(events), 1)
+                for record in (done["attempts"][0]["evidence"], status["attempts"][0]["evidence"],
+                               *events, delivered["cli_relay"]["events"][0]):
+                    self.assertNotIn(secret, json.dumps(record))
+                    self.assertEqual(record["warnings"], expected)
+                self.assertNotIn(secret, json.dumps(delivered))
+                self.assertNotIn(secret, delivered["summary"])
+                self.assertIn("allowed_rule_denied=1 first_command=curl", delivered["summary"])
+                if crash:
+                    self.assertEqual(events[0]["source"], "reconcile")
 
     def test_diagnostics_survive_keeper_crash(self):
         done = self.run_denials(crash=True)

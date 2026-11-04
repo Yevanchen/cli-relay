@@ -270,8 +270,9 @@ commands were each listed in the same `--allowedTools` argument:
 
 This is an observed Claude matching limitation for `cp` with flags, including `-n` and `-p`.
 The relay keeps the rule construction, settings and permission mode unchanged. Use
-`cp <src> <dst>` without flags, or check existence with `test -e` first (request a prefix for
-that check too). An existence check followed by a copy is not atomic.
+`cp <src> <dst>` without flags (remove `-n` only when overwriting the destination is acceptable),
+or check existence with `test -e` first (request a prefix for that check too). An existence
+check followed by a copy is not atomic.
 
 - Submit receipts include one `{"code": "bash_rule_not_honoured", "command": "cp -n a b", "hint": "…"}`
   per affected entry: its first word is `cp` and a later token starts with `-`. Only `cp` is on
@@ -281,14 +282,15 @@ that check too). An existence check followed by a copy is not atomic.
 - After a Claude run, structured Bash denials whose stripped `tool_input.command` equals a
   requested prefix or starts with that prefix plus a space add one
   `{"code": "allowed_rule_denied", "commands": ["cp -n a b"]}` warning. This applies to any
-  requested Bash prefix. Commands are matched before truncation, then each is limited to 200
-  characters; the displayed list is unique and sorted. No other tool-input fields are copied
-  into the diagnostic or native summary. Missing command details and older name-only denials
-  add no diagnostic.
+  requested Bash prefix. The diagnostic copies only matching requested prefixes, never runtime
+  arguments added to them. Prefixes are matched before truncation, then each is limited to 200
+  characters; the displayed list is unique and sorted. No tool-input fields are copied into
+  the diagnostic or native summary. Missing command details and older name-only denials add
+  no diagnostic.
 
 `allowed_rule_denied` follows the existing warnings path through `status`/`wait` attempt
 evidence, terminal events and notification entries. The notifier summary includes the command
-count and first command. These diagnostics do not change the outcome, grant permissions or
+prefix count and first prefix. These diagnostics do not change the outcome, grant permissions or
 retry a task. An inherited deny or ask rule can also explain a matching denial.
 
 ### Claude web tools
@@ -300,9 +302,9 @@ is `succeeded`, subject to the completion marker gate below. Without a confirmed
 denials still mean `needs_input`; cancellation keeps its existing precedence. `status`/`wait`
 attempt evidence, terminal events and notification event entries carry, for example,
 `warnings: [{"code": "permission_denials", "tools": ["Monitor"]}]`. This warning includes only
-tool names; the separate `allowed_rule_denied` diagnostic can include matching Bash commands
-as described above. `Monitor` is not added to the allowlist. To allow `WebSearch` or `WebFetch` for one
-task, name them:
+tool names; the separate `allowed_rule_denied` diagnostic can include matching Bash prefixes
+requested by the user as described above. `Monitor` is not added to the allowlist. To allow
+`WebSearch` or `WebFetch` for one task, name them:
 
 ```sh
 cli-relay submit --key research-1 --engine claude --cwd ~/code/app --prompt "Compare the current options for X" \

@@ -657,7 +657,8 @@ def bash_rule_warnings(engine: str, payload: Dict[str, Any]) -> List[Dict[str, A
             if words[0] in CLAUDE_BASH_FLAG_RULE_COMMANDS and any(word.startswith("-") for word in words[1:]):
                 warnings.append({"code": "bash_rule_not_honoured", "command": command,
                                  "hint": "Claude Code (observed 2.1.312) denies cp with flags even when its prefix "
-                                         "rule is listed; use cp <src> <dst> without flags, or check existence "
+                                         "rule is listed; use cp <src> <dst> without flags (drop -n only when "
+                                         "overwriting the destination is acceptable), or check existence "
                                          "with test -e first."})
     return warnings
 
@@ -1066,8 +1067,9 @@ def parse_output(engine: str, stdout_path: Path, last_message_path: Optional[Pat
                 command = tool_input.get("command") if isinstance(tool_input, dict) else None
                 if engine == "claude" and d.get("tool_name") == "Bash" and isinstance(command, str):
                     command = command.strip()
-                    if any(command == entry or command.startswith(entry + " ") for entry in allowed_bash_commands):
-                        denied_allowed_commands.add(command[:200])
+                    for entry in allowed_bash_commands:
+                        if command == entry or command.startswith(entry + " "):
+                            denied_allowed_commands.add(entry[:200])
         native = {
             "ok": bool(result.get("subtype") == "success" and not result.get("is_error")),
             "subtype": result.get("subtype"),
