@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import __version__, engines, notify, procs, routes
+from . import __version__, business_status, engines, notify, procs, routes
 from .errors import NotFound, Refused, RelayError, UsageError
 from .keeper import _hook
 from .ledger import Ledger, init_ledger
@@ -128,6 +128,7 @@ def attempt_view(a: Dict[str, Any], probe: bool = True) -> Dict[str, Any]:
     active = a["state"] in ("claimed", "running")
     keeper_alive = procs.same_process_alive(a["keeper_pid"], a["keeper_token"]) if probe and active else None
     cli_alive = procs.same_process_alive(a["cli_pid"], a["cli_token"]) if probe and active and a["cli_pid"] else None
+    evidence = _loads(a["evidence_json"])
     return {
         "attempt_no": a["attempt_no"], "attempt_id": a["attempt_id"], "reason": a["reason"], "state": a["state"],
         "outcome": a["outcome"], "host": a["host"], "cwd": a["cwd"],
@@ -135,7 +136,8 @@ def attempt_view(a: Dict[str, Any], probe: bool = True) -> Dict[str, Any]:
         "keeper": {"pid": a["keeper_pid"], "pgid": a["keeper_pgid"], "alive": keeper_alive},
         "cli": {"pid": a["cli_pid"], "alive": cli_alive},
         "exit": {"code": a["exit_code"], "signal": a["exit_signal"], "known": bool(a["exit_known"])},
-        "native": _loads(a["native_result_json"]), "evidence": _loads(a["evidence_json"]),
+        "native": _loads(a["native_result_json"]), "evidence": evidence,
+        **{key: evidence[key] for key in business_status.FIELDS if isinstance(evidence, dict) and key in evidence},
         "cancel_requested_at": a["cancel_requested_at"], "created_at": a["created_at"],
         "claimed_at": a["claimed_at"], "spawn_started_at": a["spawn_started_at"],
         "started_at": a["started_at"], "ended_at": a["ended_at"],
@@ -145,13 +147,16 @@ def attempt_view(a: Dict[str, Any], probe: bool = True) -> Dict[str, Any]:
 def task_view(ledger: Ledger, task_id: str, probe: bool = True) -> Dict[str, Any]:
     t = ledger.get_task(task_id)
     payload = json.loads(t["payload_json"])
+    attempts = [attempt_view(a, probe) for a in ledger.attempts(task_id)]
+    current = next((a for a in attempts if a["attempt_no"] == t["current_attempt"]), {})
     return {
         "task": {k: t[k] for k in ("task_id", "scope", "engine", "cwd", "state", "current_attempt", "submit_count",
                                    "payload_sha256", "created_at", "updated_at")} | {
                                        "key": t["request_key"], "options": payload.get("options", {}),
+                                       **{key: current[key] for key in business_status.FIELDS if key in current},
                                        **({"origin": payload["origin"]} if "origin" in payload else {}),
                                        **engines.request_details(t["engine"], payload)},
-        "attempts": [attempt_view(a, probe) for a in ledger.attempts(task_id)],
+        "attempts": attempts,
         "events": [{"event_id": e["event_id"], "attempt_no": e["attempt_no"], "kind": e["kind"],
                     "created_at": e["created_at"], "acked_by": e["acked_by"], "body": _loads(e["body_json"])}
                    for e in ledger.events_of_task(task_id)],
@@ -185,6 +190,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
     prompt = _read_prompt(args)
     cwd = os.path.realpath(args.cwd)
     raw_options = _parse_options(args.option)
+    if args.unset_env is not None:
+        names = engines.validate_unset_env(args.unset_env)
+        if "unset_env" in raw_options and engines.validate_unset_env(raw_options["unset_env"]) != names:
+            raise UsageError("--unset-env conflicts with --option unset_env")
+        raw_options["unset_env"] = names
     for flag, field in (("allow_write_dir", "allowed_write_dirs"),
                         ("allow_bash", "allowed_bash_commands"), ("network_access", "network_access")):
         value = getattr(args, flag, None)
@@ -662,6 +672,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Claude: allow a literal Bash command prefix (repeatable)")
     s.add_argument("--network-access", action="store_true", default=None,
                    help="Codex: enable network access; requires --option sandbox=workspace-write")
+    s.add_argument("--unset-env", action="append", metavar="NAME",
+                   help="remove a billing environment variable for this task, including resume (repeatable)")
     s.add_argument("--notify-route", help="route in notifier.json that is woken when the task ends")
     s.add_argument("--origin", metavar='JSON', help='optional origin metadata: {"bot":"NAME","chat":"ID"}')
     s.set_defaults(func=cmd_submit)

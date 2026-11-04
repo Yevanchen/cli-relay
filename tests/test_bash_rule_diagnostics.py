@@ -144,8 +144,8 @@ class BashDiagnosticsRoundTrip(RelayTestCase):
         self.assertEqual(self.finish(sub, env)["task"]["state"], "succeeded")
 
     def assert_diagnostics(self, done, outcome):
-        expected = [{"code": "permission_denials", "tools": ["Bash", "Monitor"]},
-                    {"code": "allowed_rule_denied", "commands": ["cp -n a b", "python3"]}]
+        expected = [{"code": "allowed_rule_denied", "commands": ["cp -n a b", "python3"]},
+                    {"code": "permission_denials", "tools": ["Bash", "Monitor"]}]
         self.assertEqual(done["task"]["state"], outcome)
         delivered = notification(done)
         for record in (done["attempts"][0]["evidence"], done["events"][0]["body"],
@@ -173,8 +173,8 @@ class BashDiagnosticsRoundTrip(RelayTestCase):
     def test_runtime_arguments_are_not_exported_after_bash_denial(self):
         secret = "PLACEHOLDER-SECRET-123"
         command = f'curl -H "Authorization: Bearer {secret}" https://example.invalid'
-        expected = [{"code": "permission_denials", "tools": ["Bash"]},
-                    {"code": "allowed_rule_denied", "commands": ["curl"]}]
+        expected = [{"code": "allowed_rule_denied", "commands": ["curl"]},
+                    {"code": "permission_denials", "tools": ["Bash"]}]
         for crash in (False, True):
             with self.subTest(crash=crash):
                 denial = {"tool_name": "Bash", "tool_input": {"command": command}}

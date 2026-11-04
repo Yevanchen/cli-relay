@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from . import engines, procs
+from . import business_status, engines, procs
 from .errors import Refused, UsageError
 from .keeper import _hook
 from .ledger import Ledger, canonical_json, now_iso
@@ -254,7 +254,8 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
             "kind": row["kind"], "outcome": body.get("outcome") or row["kind"], "key": row.get("request_key"),
             **{key: body[key] for key in ("sandbox", "full_access", "network_access", "allowed_tools", "permissions",
                                           "completion_marker_required", "completion_marker", "origin", "git", "warnings",
-                                          "codex_git_repo_check")
+                                          "codex_git_repo_check", "unset_env", "unset_env_present", "preflight",
+                                          *business_status.FIELDS)
                if key in body},
             "result_excerpt": _clean(body.get("result_excerpt"), EXCERPT_MAX)}
 
@@ -290,11 +291,16 @@ def build_payload(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, re
     # across runs: even a batched notification says exactly what each attempt requested.
     permissions = " | ".join(f"{r['task_id']}#{r['attempt_no']} permissions: {engines.permission_summary(r)}"
                              for r in refs)
+    # Business status, like permissions, must survive excerpt/header truncation for every run.
+    business = " | ".join(
+        f"{r['task_id']}#{r['attempt_no']} business_status={r['business_status']} "
+        f"denials={json.dumps(r.get('denials', {}).get('count'))}"
+        for r in refs if "business_status" in r)
     record = {"schema": PAYLOAD_SCHEMA, "source_id": cfg["source_id"], "ledger_id": ledger_id,
               "route": route["name"], "chat": route["chat"], "consumer": route["consumer"],
               "reminder": reminder, "count": len(refs), "events": refs}
     return {"job": route["adapter"]["job"], "stage": f"{cfg['source_id']}/{route['name']}", "status": status,
-            "summary": _clean(summary, SUMMARY_MAX) + " | " + permissions,
+            "summary": _clean(summary, SUMMARY_MAX) + (" | " + business if business else "") + " | " + permissions,
             "artifact": f"cli-relay:{cfg['source_id']}:{ledger_id}",
             "cli_relay": record}
 

@@ -62,6 +62,11 @@ Routes are configured per machine in `<home>/notifier.json`. Configuration, rout
 Model and effort can be set per task with `--option`. More engine options are documented in
 [`docs/usage.md`](docs/usage.md#engines), and their guards in [`docs/reliability.md`](docs/reliability.md).
 
+If preflight reports `billing_env_present`, add `--unset-env OPENAI_BASE_URL` (repeatable,
+using the names in the error) to `submit` with a new key. It removes only those billing
+variables for that task's preflight and CLI, including resume, and leaves the relay and
+machine environment unchanged. See [environment cleanup](docs/usage.md#per-task-environment-cleanup).
+
 ### Permission opt-ins
 
 Defaults stay minimal: Claude pins `dontAsk` and adds no allow rules; its existing
@@ -139,7 +144,7 @@ The decision is recorded in attempt evidence and terminal events; sandbox defaul
 
 1. Submit with a key derived from the request. If the reply is lost, submit the same key again.
 2. Wait or poll `status`. A wait timeout is not a task failure.
-3. Read `events --consumer <you>`, deliver the result, then `ack`. `succeeded` means the CLI finished without an error, not that the goal was reached; for tasks such as test runs, require the [completion marker](docs/usage.md#when-the-cli-finished-is-not-the-task-is-done-the-completion-marker).
+3. Read `events --consumer <you>`, deliver the result, then `ack`. `succeeded` means the CLI finished without an error. Check the separate [business status](docs/usage.md#business-status) (`ok`, `partial`, `stopped_for_approval`, `failed`, `unreported`) and denial count in status/events and notification summaries. Tasks can report a final `status=...` line or opt into `result_file=out/result.json`; `require_business_status=true` warns when no status is reported. The existing [completion marker](docs/usage.md#when-the-cli-finished-is-not-the-task-is-done-the-completion-marker) can still gate the process outcome.
 4. If the state is `unknown`, a human chooses `resume` or an explicit fresh re-run.
 
 ## Documentation

@@ -108,6 +108,57 @@ and [D16](decisions.md#d16-issue-4-registered-routes-visible-message-proof-and-o
 This change has only local fake/mock test evidence. No new live webhook route was approved or
 verified, and it makes no new 25-hour reliability claim.
 
+## Per-task environment cleanup
+
+`submit --unset-env NAME` removes an inherited billing environment variable for that task only.
+Repeat the flag for more names:
+
+```sh
+cli-relay submit --key clean-env-1 --engine codex --cwd ~/code/app --prompt "Run the tests." \
+  --unset-env OPENAI_BASE_URL --unset-env OPENAI_API_KEY
+```
+
+Like `--network-access`, this is a CLI flag mapped to a persisted task option, rather than an
+argv option passed to the engine. The equivalent is
+`--option 'unset_env=["OPENAI_BASE_URL","OPENAI_API_KEY"]'`. Both forms store a sorted, unique
+`options.unset_env` list; duplicate names are harmless. If both forms are supplied, their
+normalized lists must agree. Omitting both adds no field and preserves existing payload hashes.
+An explicit JSON `[]` is stored as an empty list. Changing the list under an existing scope/key
+is a payload conflict, so use a new key when adding it to an already-created task.
+
+Names must match `[A-Za-z_][A-Za-z0-9_]*`; assignments such as `NAME=value` are rejected without
+echoing their values. Cleanup is restricted to the union of the engines' billing variables:
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`,
+`CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`, `ANTHROPIC_BEDROCK_BASE_URL`,
+`ANTHROPIC_VERTEX_BASE_URL`, `ANTHROPIC_VERTEX_PROJECT_ID`, `OPENAI_API_KEY`, `CODEX_API_KEY`,
+`OPENAI_BASE_URL`, and `AZURE_OPENAI_API_KEY`. Any of these names is accepted for either engine
+and the fixture. Other names, including HOME, configuration directories and relay controls,
+are refused. The option only removes variables; it cannot set values or alter configuration files.
+
+### Preflight
+
+Cleanup happens before the billing/configuration/login checks and in the CLI child environment
+on first runs, exact resumes and explicit fresh reruns. The stored list is reused; resume cannot
+change it. The relay's own environment, launchd, shell profiles and unrelated tasks are unchanged.
+Existing session-marker and test-variable scrubbing still applies. Variables not named in the
+list retain the existing behavior, and subscription/configuration guards still apply.
+
+Without cleanup, `billing_env_present` keeps its reason code and `names` list. Its preflight
+details now also contain `fix.submit_flags` (for example `--unset-env OPENAI_BASE_URL`),
+`fix.env_prefix` (`env -u OPENAI_BASE_URL`) and a `message` containing both fixes. The prefix goes
+before `cli-relay`; flags go on `submit`. The `env -u` prefix applies only to that invocation;
+use `--unset-env` to retain cleanup for future resumes. `doctor --engine codex` /
+`--engine claude` shows the same hint when billing variables block it. Blocked terminal events
+include these billing preflight details too.
+
+Submit/resume receipts, task records and terminal events include `unset_env` only when requested.
+Once the keeper observes the attempt's environment, attempt evidence and terminal events also
+include `unset_env_present`: the requested names that existed before cleanup, even if their
+values were empty. An absent requested name is harmless. Values are never recorded by cleanup.
+The snapshot is taken again for each attempt and survives reconciliation; if the keeper never
+observed the environment, `unset_env_present` is omitted rather than guessed. Structured
+notification event entries carry the same fields. No ledger migration is needed.
+
 ## Engines
 
 | Engine | Runs | Resume |
@@ -132,7 +183,8 @@ Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--yolo`
 - Codex: the `codex exec --json` events that cli-relay reads carry no structured permission
   denial. A command refused by the sandbox reaches the model as a failed command, and the
   outcome follows Codex's own result: a run whose commands were refused still ends `succeeded`
-  if Codex ended its turn normally. Read the result text, or let the task require the
+  if Codex ended its turn normally. Inspect the separate
+  [business status](#business-status), or let the task require the
   [completion marker](#when-the-cli-finished-is-not-the-task-is-done-the-completion-marker).
 - The keeper refuses a run (`blocked`) before the CLI starts if it finds any of these:
   - API-key or gateway variables (only their names are reported);
@@ -368,6 +420,85 @@ effort constraints remain in force: a conflicting managed environment value or a
 server-delivered caps and the actual served model still require real-CLI acceptance evidence.
 These options record requested configuration, not proof of the provider's effective effort.
 
+### Business status
+
+`outcome` describes the CLI process, and its values and meaning are unchanged. New terminal and
+unknown event bodies and attempt evidence also carry:
+
+| Field | Values |
+|---|---|
+| `business_status` | `ok`, `partial`, `stopped_for_approval`, `failed`, `unreported` |
+| `business_status_source` | `status_line`, `result_file`, `outcome`, `denials`, `none` |
+| `denials` | `{"count": 2, "tools": ["Read"], "available": true}`; count entries, keep unique sorted tool names |
+| `business_status_counts` | Optional integer counters from the status line, e.g. `{"ok": 9, "fail": 4, "skip": 4}`; only present counters are included |
+
+`status` and `wait` expose these fields on each attempt and on the task for its current attempt,
+as well as in evidence and event bodies. Notifier event entries and summary text carry the
+business status and denials too, including when the status line falls beyond `result_excerpt`.
+Historical evidence/events without these fields remain readable and are not backfilled. An
+active attempt has no business status until it closes; starting a new attempt does not reuse the
+previous attempt's business status.
+
+All engines accept these optional task `options` (JSON payload or `--option`):
+
+- `result_file`: a literal relative file path inside the task cwd, for example
+  `--option result_file=out/result.json`. Absolute paths, `..` components, rule/glob syntax,
+  directories and symlink escapes are rejected at submit, and the path is checked again before
+  launch and at closing. It need not exist when submitted. At closing the relay reads only a
+  regular UTF-8 JSON file, at most 1 MiB (plus one byte to detect growth). It must be an object
+  with a string `status`; other contents are ignored. A missing file reports nothing. Invalid,
+  oversized or unreadable files add `business_status_result_file_invalid` with a fixed reason;
+  they never fail the task. Each attempt reads the configured file anew, so the task should
+  replace an earlier attempt's result when reporting new work.
+- `require_business_status`: a JSON boolean, e.g. `--option require_business_status=true`.
+  If the final business status is `unreported`, add warning `business_status_missing` without
+  changing `outcome`.
+
+Both options are absent by default; omitting them preserves existing payloads and hashes. When
+supplied, they participate in the payload/hash and are reused for exact resume and fresh reruns.
+They grant no filesystem or tool permissions.
+
+The rules are applied in this order:
+
+1. Inspect only the last non-empty line of Claude's final `result` or Codex's last message.
+   A whitespace-separated `status=<word>` token reports status. `done` and `ok` map to `ok`;
+   `partial` stays `partial`; `failed` and `fail` map to `failed`; `stopped_for_approval` and
+   `needs_approval` map to `stopped_for_approval`. Words are case-sensitive. An unknown word
+   maps to `unreported` with warning `business_status_unknown` identifying the source.
+   Earlier lines, quoted examples earlier in the answer, and prose such as `本次失败` do not
+   set business status. Optional whitespace-separated `ok=`, `fail=` and `skip=` tokens on
+   that same line are non-negative integers, kept in `business_status_counts`.
+2. Read the optional `result_file` and map its string `status` with the same aliases. If both
+   sources disagree after mapping, add `business_status_conflict` and take the more severe:
+   `failed > stopped_for_approval > partial > ok`. A known status wins over an unknown word;
+   equal statuses prefer `status_line`. Line counters remain line counters even if the file wins.
+3. For any outcome other than `succeeded` (`failed`, `blocked`, `needs_input`, `cancelled`, or
+   `unknown`), set business status to `failed` with source `outcome`, unless the selected report
+   is `stopped_for_approval`, which is kept with its reporting source.
+4. On `succeeded`, if Claude reported permission denials and the selected status is `ok` or
+   unreported, set business status to `partial` with source `denials`: the work cannot be
+   assumed complete. Count structured denial entries, including repeated names; the tool list
+   is unique. Claude final results (and fixture results using that format) have `available: true`
+   and count zero when no entries exist. Codex has no structured denial signal, so its denials
+   are always `{"count": null, "tools": [], "available": false}`. Without a final structured
+   result, denials are unavailable for Claude too.
+5. On `succeeded`, no report and no denials means `unreported` with source `none`.
+
+For example, ask the task to end its final message with:
+
+```text
+WHAT_IS_DIFY_DONE status=partial ok=9 fail=4 skip=4
+```
+
+A normal CLI exit then remains `outcome: "succeeded"`, with `business_status: "partial"`,
+`business_status_source: "status_line"`, and `business_status_counts: {"ok": 9, "fail": 4,
+"skip": 4}`. These are structured self-reports, not independent verification that work succeeded.
+The alias mapping is available as `cli_relay.business_status.normalize_status` for dispatchers.
+
+The existing completion-marker gate still applies independently. When using
+`require_completion_marker=true` too, keep its exact marker as the last line and report business
+status through `result_file`; the two distinct last-line conventions cannot share that line.
+
 ### When "the CLI finished" is not "the task is done": the completion marker
 
 `succeeded` means that the CLI ended its turn without an error (and exited 0). It does not mean
@@ -409,7 +540,8 @@ CLI-RELAY-STATUS: incomplete."
    `wait` once it has been pending for 5 s.
 3. Read `events --consumer <you>`. After the result has reached its destination, `ack` the event.
    Until then the event is delivered again on every read, with the same id. `succeeded` only says
-   that the CLI finished without an error; for tasks such as test runs, require the completion
+   that the CLI finished without an error. Check `business_status` and `denials` for the reported
+   work result; `unreported` makes no completion claim. Tasks can also require the completion
    marker (above) so that a run the CLI itself reports unfinished ends `needs_input`.
 4. If a task is `unknown` (the relay could not prove what happened), a human decides:
    - `resume` continues the exact native session;
