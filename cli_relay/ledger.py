@@ -45,7 +45,7 @@ RESULT_EXCERPT_CHARS = 2000
 # The notifier extension (v0.2) is additive: new tables, indexes and routing columns.
 # schema_version stays 1 because v0.1.0 checks exactly that and ignores what it does not know,
 # so v0.1.0 can still open a migrated ledger. That is the rollback path.
-NOTIFIER_SCHEMA = "2"
+NOTIFIER_SCHEMA = "4"
 NOTIFIER_DDL = (
     """CREATE TABLE IF NOT EXISTS notifications (
   event_id TEXT NOT NULL REFERENCES events(event_id),
@@ -81,6 +81,30 @@ NOTIFIER_DDL = (
   detail_json TEXT
 )""",
     "CREATE INDEX IF NOT EXISTS events_by_created ON events (created_at)",
+    """CREATE TABLE IF NOT EXISTS route_verifications (
+  verification_id TEXT PRIMARY KEY,
+  route TEXT NOT NULL,
+  receipt_json TEXT NOT NULL
+)""",
+    "CREATE TABLE IF NOT EXISTS managed_routes (route TEXT PRIMARY KEY, verification_id TEXT)",
+    "CREATE TABLE IF NOT EXISTS legacy_routes (route TEXT PRIMARY KEY, route_sha256 TEXT NOT NULL)",
+    """CREATE TABLE IF NOT EXISTS notification_fallbacks (
+  event_id TEXT NOT NULL,
+  original_route TEXT NOT NULL,
+  route TEXT NOT NULL,
+  consumer TEXT NOT NULL,
+  chat TEXT NOT NULL,
+  state TEXT NOT NULL,
+  claim_id TEXT,
+  claimed_by INTEGER,
+  claimed_token TEXT,
+  started_at TEXT,
+  ended_at TEXT,
+  last_result_json TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (event_id, original_route),
+  FOREIGN KEY (event_id, original_route) REFERENCES notifications(event_id, route)
+)""",
 )
 
 
@@ -97,6 +121,10 @@ def _apply_notifier_extension(c: sqlite3.Connection, cutoff: str, *, historical:
         # Old task/transport rows did not record the receiving identity. Today's config
         # is not evidence of the original consumer or chat; restoration must be explicit.
         c.execute("UPDATE tasks SET notify_bound=-1")
+    ack_columns = {r[1] for r in c.execute("PRAGMA table_info(acks)").fetchall()}
+    for name in ("message_id", "chat"):
+        if name not in ack_columns:
+            c.execute(f"ALTER TABLE acks ADD COLUMN {name} TEXT")
     c.execute("INSERT INTO meta (k, v) VALUES ('notifier_schema', ?) "
               "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (NOTIFIER_SCHEMA,))
     c.execute("INSERT OR IGNORE INTO meta (k, v) VALUES ('notifier_cutoff', ?)", (cutoff,))
@@ -423,8 +451,12 @@ class Ledger:
 
     def task_notification_owners(self, task_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         ids = sorted(set(task_ids))
-        if not ids or not self.has_notifier():
+        if not ids:
             return {}
+        if not self.has_notifier():
+            columns = {r[1] for r in self.conn.execute("PRAGMA table_info(tasks)")}
+            if not {"notify_route", "notify_consumer", "notify_chat", "notify_bound"} <= columns:
+                return {}
         rows = self.conn.execute(
             "SELECT task_id, notify_route, notify_consumer, notify_chat, notify_bound FROM tasks "
             f"WHERE task_id IN ({','.join('?' * len(ids))})", tuple(ids)).fetchall()
@@ -511,8 +543,23 @@ class Ledger:
             dest.close()
         os.chmod(str(dest_path), 0o600)
         cutoff = self.notifier_cutoff() if self._meta("notifier_schema") else ("" if backfill else now_iso())
+        from . import notify
+
+        cfg = notify.load_config(self.home) if notify.configured(self.home) else None
         with self.tx() as c:
+            if self.has_notifier():  # another migrator may have completed while we read the config
+                return {"migrated": False, "already": True, "cutoff": self.notifier_cutoff()}
             _apply_notifier_extension(c, cutoff=cutoff, historical=True)
+            # Older managed routes must never regain the legacy exemption if their receipt
+            # is removed. Register only their names; config-only proofs are not trusted.
+            c.executemany("INSERT OR IGNORE INTO managed_routes (route, verification_id) VALUES (?,NULL)",
+                          ((name,) for name, route in cfg["routes"].items() if "verification" in route) if cfg else ())
+            # Grandfather only routes present at migration, bound to their original identity.
+            # Existing managed names remain ineligible even if their verification key was removed.
+            c.executemany("INSERT OR IGNORE INTO legacy_routes (route, route_sha256) "
+                          "SELECT ?,? WHERE NOT EXISTS (SELECT 1 FROM managed_routes WHERE route=?)",
+                          ((name, notify.route_fingerprint(cfg["source_id"], route), name)
+                           for name, route in cfg["routes"].items() if "verification" not in route) if cfg else ())
         return {"migrated": True, "backup": str(dest_path), "cutoff": cutoff, "schema_version": SCHEMA_VERSION,
                 "notifier_schema": NOTIFIER_SCHEMA}
 
@@ -569,6 +616,9 @@ class Ledger:
             ev = dict(r)
             ev["acked_by"] = [a[0] for a in self.conn.execute(
                 "SELECT consumer FROM acks WHERE event_id=? ORDER BY consumer", (ev["event_id"],)).fetchall()]
+            ev["acks"] = [dict(a) for a in self.conn.execute(
+                f"SELECT consumer, acked_at, {self._ack_receipt_columns()} FROM acks "
+                "WHERE event_id=? ORDER BY consumer", (ev["event_id"],)).fetchall()]
             out.append(ev)
         return out
 
@@ -842,6 +892,8 @@ class Ledger:
         details.update({key: payload[key] for key in SCHEDULING_FIELDS if key in payload})
         if "origin" in payload:
             details["origin"] = payload["origin"]
+        if "result_file" in payload.get("options", {}):
+            details["result_file"] = business_status.result_file_details(payload)
         if details["completion_marker_required"]:
             # The marker line sits at the end of the result, often past the excerpt: name it here.
             details["completion_marker"] = engines.completion_marker((native or {}).get("result"))
@@ -952,8 +1004,9 @@ class Ledger:
     def events_for(self, consumer: str, *, task_id: Optional[str] = None,
                    include_acked: bool = False) -> List[Dict[str, Any]]:
         sql = ("SELECT e.*, t.current_attempt AS current_attempt, "
-               "(SELECT acked_at FROM acks a WHERE a.event_id=e.event_id AND a.consumer=?) AS acked_at "
-               "FROM events e JOIN tasks t ON t.task_id=e.task_id WHERE (? IS NULL OR e.task_id=?) ")
+               f"a.acked_at, {self._ack_receipt_columns('a.')} "
+               "FROM events e JOIN tasks t ON t.task_id=e.task_id "
+               "LEFT JOIN acks a ON a.event_id=e.event_id AND a.consumer=? WHERE (? IS NULL OR e.task_id=?) ")
         params: List[Any] = [consumer, task_id, task_id]
         if not include_acked:
             # Filtered in SQL (primary-key lookup in acks): an empty poll reads no acknowledged history.
@@ -976,19 +1029,55 @@ class Ledger:
                                         (eid, consumer)).fetchone()[0]
         return counts
 
-    def ack(self, *, task_id: str, attempt_no: int, event_id: str, consumer: str) -> Dict[str, Any]:
+    def _ack_receipt_columns(self, prefix: str = "") -> str:
+        # Old ledgers stay readable and the original ACK works before explicit migration.
+        columns = {r[1] for r in self.conn.execute("PRAGMA table_info(acks)").fetchall()}
+        return ", ".join(f"{prefix}{key}" if key in columns else f"NULL AS {key}"
+                         for key in ("message_id", "chat"))
+
+    def ack(self, *, task_id: str, attempt_no: int, event_id: str, consumer: str,
+            message_id: Optional[str] = None, chat: Optional[str] = None) -> Dict[str, Any]:
+        return self.ack_many([{"task_id": task_id, "attempt_no": attempt_no, "event_id": event_id}],
+                             consumer=consumer, message_id=message_id, chat=chat)[0]
+
+    def ack_many(self, events: Sequence[Dict[str, Any]], *, consumer: str,
+                 message_id: Optional[str] = None, chat: Optional[str] = None) -> List[Dict[str, Any]]:
+        """All-or-nothing, including duplicates; the first ACK's receipt is never overwritten.
+
+        Consumers remain independent, as in the original single ACK. Batch references also
+        carry the intended consumer/ledger, so editing either part of a printed command fails.
+        Source identity is checked by the CLI, which owns notifier configuration access.
+        """
+        if message_id is not None or chat is not None:
+            self.require_notifier()
+        results = []
         with self.tx() as c:
-            ev = c.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
-            if ev is None:
-                raise AckMismatch("no such event", event_id=event_id)
-            if ev["task_id"] != task_id or ev["attempt_no"] != attempt_no:
-                raise AckMismatch("event does not belong to this task/attempt", event_id=event_id,
-                                  event_task_id=ev["task_id"], event_attempt_no=ev["attempt_no"],
-                                  given_task_id=task_id, given_attempt_no=attempt_no)
-            cur = c.execute("INSERT OR IGNORE INTO acks (event_id, consumer, task_id, attempt_no, acked_at) "
-                            "VALUES (?,?,?,?,?)", (event_id, consumer, task_id, attempt_no, now_iso()))
-            duplicate = cur.rowcount == 0
-            acked_at = c.execute("SELECT acked_at FROM acks WHERE event_id=? AND consumer=?",
-                                 (event_id, consumer)).fetchone()[0]
-        return {"event_id": event_id, "consumer": consumer, "task_id": task_id, "attempt_no": attempt_no,
-                "duplicate": duplicate, "acked_at": acked_at}
+            for ref in events:
+                if ref.get("ledger_id", self.ledger_id) != self.ledger_id:
+                    raise Refused("wrong_ledger", "this event belongs to another ledger")
+                if ref.get("consumer", consumer) != consumer:
+                    raise Refused("wrong_consumer", "batch event names a different consumer")
+                task_id, attempt_no, event_id = ref["task_id"], ref["attempt_no"], ref["event_id"]
+                ev = c.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
+                if ev is None:
+                    raise AckMismatch("no such event", event_id=event_id)
+                if ev["task_id"] != task_id or ev["attempt_no"] != attempt_no:
+                    raise AckMismatch("event does not belong to this task/attempt", event_id=event_id,
+                                      event_task_id=ev["task_id"], event_attempt_no=ev["attempt_no"],
+                                      given_task_id=task_id, given_attempt_no=attempt_no)
+                if message_id is None and chat is None:
+                    cur = c.execute("INSERT OR IGNORE INTO acks (event_id, consumer, task_id, attempt_no, acked_at) "
+                                    "VALUES (?,?,?,?,?)", (event_id, consumer, task_id, attempt_no, now_iso()))
+                else:
+                    cur = c.execute("INSERT OR IGNORE INTO acks "
+                                    "(event_id, consumer, task_id, attempt_no, acked_at, message_id, chat) "
+                                    "VALUES (?,?,?,?,?,?,?)",
+                                    (event_id, consumer, task_id, attempt_no, now_iso(), message_id, chat))
+                row = c.execute(f"SELECT acked_at, {self._ack_receipt_columns()} FROM acks "
+                                "WHERE event_id=? AND consumer=?", (event_id, consumer)).fetchone()
+                results.append({"event_id": event_id, "consumer": consumer, "task_id": task_id,
+                                "attempt_no": attempt_no, "duplicate": cur.rowcount == 0,
+                                "acked_at": row["acked_at"],
+                                **({"message_id": row["message_id"], "chat": row["chat"]}
+                                   if message_id is not None or chat is not None else {})})
+        return results

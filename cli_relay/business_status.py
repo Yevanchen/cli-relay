@@ -47,6 +47,18 @@ def validate_result_file(value: str, cwd: Optional[str]) -> str:
     return path.as_posix()
 
 
+def result_file_details(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Path/existence metadata only; never read or export the file's contents here."""
+    value = payload.get("options", {}).get("result_file")
+    if value is None:
+        return None
+    path = Path(os.path.abspath(Path(payload["cwd"]) / value))
+    try:
+        return {"path": str(path.resolve()), "exists": path.is_file()}
+    except (OSError, RuntimeError):
+        return {"path": str(path), "exists": False}
+
+
 def _file_status(value: str, cwd: str, warnings: List[Dict[str, Any]]) -> Optional[str]:
     def invalid(reason):
         warnings.append({"code": "business_status_result_file_invalid", "reason": reason})

@@ -16,7 +16,7 @@ from unittest import mock
 from helpers import RelayTestCase, db_rows, side_effects
 from notify_helpers import http_config, write_config
 from cli_relay import cli, notify, routes
-from cli_relay.ledger import Ledger, init_ledger, now_iso, payload_hash
+from cli_relay.ledger import Ledger, canonical_json, init_ledger, now_iso, payload_hash
 
 TOKEN = "SYNTHETIC_SECRET_NEVER_PERSIST_77"
 URL = "http://127.0.0.1:1/SYNTHETIC_PRIVATE_URL_88"
@@ -128,6 +128,10 @@ class RouteAndOriginTests(unittest.TestCase):
     def due(self):
         raw = self.raw()
         raw["routes"]["bot"]["verification"]["next_at"] = "2000-01-01T00:00:00.000Z"
+        state = raw["routes"]["bot"]["verification"]
+        with self.ledger.tx() as c:
+            c.execute("UPDATE route_verifications SET receipt_json=? WHERE verification_id=?",
+                      (canonical_json(state), state["verification_id"]))
         self.save(raw)
 
     def finish(self, sub):
@@ -224,6 +228,11 @@ class RouteAndOriginTests(unittest.TestCase):
                "retry": {"max_attempts": 6, "base_delay_s": 30, "max_delay_s": 1800},
                "reminder": {"ack_timeout_s": 1800, "max_wakes": 2}}
         (self.home / "notifier.json").write_text(json.dumps(raw, indent=2) + "\n")
+        # The installer route existed before the ledger gained identity-bound legacy records.
+        with self.ledger.tx() as c:
+            c.execute("DROP TABLE legacy_routes")
+            c.execute("UPDATE meta SET v='3' WHERE k='notifier_schema'")
+        self.command("migrate")
         return raw
 
     def test_installer_template_friday_submits_delivers_and_keeps_config_bytes(self):

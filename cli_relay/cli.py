@@ -1,6 +1,6 @@
 """JSON command line: init, submit, status, wait, events, ack, cancel, resume, reconcile, doctor.
 
-Every command prints exactly one JSON object on stdout (only --help and --version print text).
+Every command prints one JSON object on stdout (brief --text, --help and --version print text).
 Exit codes: 0 ok, 1 internal error, 2 usage, 3 conflict, 4 not found, 5 ledger/storage error,
 6 refused (precondition not met), 130 interrupted.
 """
@@ -12,6 +12,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import sys
@@ -23,7 +24,7 @@ from typing import Any, Dict, List, Optional
 from . import __version__, business_status, engines, notify, procs, routes
 from .errors import NotFound, Refused, RelayError, UsageError
 from .keeper import _hook
-from .ledger import ACTIVE_STATES, AFTER_REQUIRE, SCHEDULING_FIELDS, Ledger, init_ledger
+from .ledger import ACTIVE_STATES, AFTER_REQUIRE, SCHEDULING_FIELDS, Ledger, canonical_json, init_ledger
 from .reconcile import old_run_stopped, reconcile_all, reconcile_task
 from .spawn import SpawnFailed, spawn_keeper, spawn_notifier_pass
 
@@ -162,7 +163,8 @@ def task_view(ledger: Ledger, task_id: str, probe: bool = True) -> Dict[str, Any
                                        **engines.request_details(t["engine"], payload)},
         "attempts": attempts,
         "events": [{"event_id": e["event_id"], "attempt_no": e["attempt_no"], "kind": e["kind"],
-                    "created_at": e["created_at"], "acked_by": e["acked_by"], "body": _loads(e["body_json"])}
+                    "created_at": e["created_at"], "acked_by": e["acked_by"], "acks": e["acks"],
+                    "body": _loads(e["body_json"])}
                    for e in ledger.events_of_task(task_id)],
     }
 
@@ -363,6 +365,7 @@ def cmd_events(args: argparse.Namespace) -> int:
     # Every event names its machine, its ledger and its route, so two hosts are never mixed up.
     events = [{"event_id": r["event_id"], "task_id": r["task_id"], "attempt_no": r["attempt_no"], "kind": r["kind"],
                "created_at": r["created_at"], "acked_at": r["acked_at"],
+               "message_id": r["message_id"], "chat": r["chat"],
                "superseded": r["attempt_no"] < r["current_attempt"], "delivery_count": counts.get(r["event_id"]),
                **source, "route": owners.get(r["task_id"], {}).get("route"),
                "owner_consumer": owners.get(r["task_id"], {}).get("consumer"),
@@ -377,8 +380,111 @@ def cmd_events(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_brief(args: argparse.Namespace) -> int:
+    """Read committed terminal snapshots only: no reconciliation, binding or delivery writes."""
+    consumer = _check_name("consumer", args.consumer)
+    ledger = Ledger(args.home)
+    try:
+        ledger.require_notifier()  # the printed --message-id ACK must be executable on this schema
+        source = _source(args.home, ledger)
+        source.pop("default_route")
+        rows = ledger.events_for(consumer, task_id=args.task)
+        owners = ledger.task_notification_owners([row["task_id"] for row in rows])
+        events, refs = [], []
+        for row in rows:
+            if row["kind"] not in ("terminal", "unknown"):
+                continue
+            owner = owners.get(row["task_id"], {})
+            if owner.get("consumer") is not None and owner["consumer"] != consumer:
+                continue
+            if args.route is not None and owner.get("route") != args.route:
+                continue
+            task = ledger.get_task(row["task_id"])
+            body = _loads(row["body_json"])
+            result_file = body.get("result_file") or business_status.result_file_details(json.loads(task["payload_json"]))
+            if result_file:
+                try:
+                    exists = Path(result_file["path"]).is_file()
+                except OSError:
+                    exists = False
+                result_file = {**result_file, "exists": exists}
+            outcome = body.get("outcome") or row["kind"]
+            status = body.get("business_status", "unreported")
+            if status == "stopped_for_approval":
+                conclusion = "等待批准"
+            elif outcome != "succeeded":
+                conclusion = {"failed": "执行失败", "blocked": "执行受阻", "needs_input": "需要输入",
+                              "unknown": "执行结果未知", "cancelled": "已取消"}.get(outcome, "执行结果未知")
+            else:
+                conclusion = {"ok": "已完成", "partial": "部分完成", "failed": "业务失败",
+                              "unreported": "CLI 已结束，业务结果未报告"}.get(status, "业务结果未报告")
+            identity = {key: row[key] for key in ("event_id", "task_id", "attempt_no")}
+            short = {"task_last8": row["task_id"][-8:], "event_last8": row["event_id"][-8:]}
+            path = result_file["path"] if result_file else "无结果文件"
+            path = "".join(ch if ch.isprintable() else f"\\u{ord(ch):04x}" for ch in path)
+            message = (f"CLI_RELAY {source['source_id'] or 'local'} {short['task_last8']}/{short['event_last8']} "
+                       f"{notify._clean(task['request_key'], 256)}：{conclusion} | {path}")
+            events.append({**identity, **source, **short, "key": task["request_key"], "origin": body.get("origin"),
+                           "route": owner.get("route"), "owner_chat": owner.get("chat"), "outcome": outcome,
+                           "business_status": status, "business_status_source": body.get("business_status_source", "none"),
+                           "warnings": body.get("warnings", []), "result_file": result_file, "message": message})
+            refs.append({**identity, **source, "consumer": consumer})
+        command = None
+        if refs:
+            argv = ["cli-relay", "--home", str(args.home), "ack", "--consumer", consumer,
+                    "--ledger-id", ledger.ledger_id]
+            if source["source_id"] is not None:
+                argv += ["--source-id", source["source_id"]]
+            chats = {event["owner_chat"] for event in events}
+            chat = next(iter(chats)) if len(chats) == 1 else None
+            if chat and chat.isprintable():
+                argv += ["--chat", chat]
+            argv += ["--events", canonical_json(refs)]
+            command = shlex.join(argv) + " --message-id '<MESSAGE_ID>'"
+        if args.text:
+            for event in events:
+                sys.stdout.write(" ".join(f"{key}={canonical_json(value)}" for key, value in event.items()
+                                          if key != "message") + "\n" + event["message"] + "\n")
+            if command:
+                sys.stdout.write(command + "\n")
+        else:
+            emit({"ok": True, "consumer": consumer, **source, "events": events, "ack_command": command})
+        return 0
+    finally:
+        ledger.close()
+
+
+def _batch_events(raw: str) -> List[Dict[str, Any]]:
+    try:
+        refs = json.loads(raw)
+    except ValueError as exc:
+        raise UsageError("--events requires the JSON array printed by brief") from exc
+    keys = {"event_id", "task_id", "attempt_no", "ledger_id", "source_id", "consumer"}
+    if not isinstance(refs, list) or not refs:
+        raise UsageError("--events requires a non-empty JSON array")
+    for ref in refs:
+        if (not isinstance(ref, dict) or set(ref) != keys
+                or any(not isinstance(ref[key], str) or not ref[key] for key in keys - {"attempt_no", "source_id"})
+                or type(ref["attempt_no"]) is not int or ref["attempt_no"] < 1
+                or (ref["source_id"] is not None and not isinstance(ref["source_id"], str))):
+            raise UsageError("each batch event needs event_id, task_id, attempt_no, ledger_id, source_id and consumer")
+    return refs
+
+
 def cmd_ack(args: argparse.Namespace) -> int:
     consumer = _check_name("consumer", args.consumer)
+    if args.events is not None:
+        if any(value is not None for value in (args.task, args.attempt, args.event)):
+            raise UsageError("--events cannot be combined with --task/--attempt/--event")
+        refs = _batch_events(args.events)
+    else:
+        if any(value is None for value in (args.task, args.attempt, args.event)):
+            raise UsageError("give --task, --attempt and --event, or --events from brief")
+        refs = [{"task_id": args.task, "attempt_no": args.attempt, "event_id": args.event}]
+    if args.message_id is not None and not notify.MESSAGE_ID_RE.fullmatch(args.message_id):
+        raise UsageError("invalid --message-id: use 1-256 chars of [A-Za-z0-9._:@/+-]")
+    if args.chat is not None and (not 1 <= len(args.chat) <= 256 or any(not c.isprintable() for c in args.chat)):
+        raise UsageError("--chat must be 1-256 printable characters")
     ledger = Ledger(args.home)
     # A consumer serving two machines names the ledger it means; an ACK never lands on another one.
     source = _source(args.home, ledger)
@@ -388,9 +494,12 @@ def cmd_ack(args: argparse.Namespace) -> int:
     if args.source_id is not None and args.source_id != source["source_id"]:
         raise Refused("wrong_source", "this event belongs to another machine", source_id=source["source_id"],
                       given_source_id=args.source_id)
-    res = ledger.ack(task_id=args.task, attempt_no=args.attempt, event_id=args.event, consumer=consumer)
+    for ref in refs:
+        if "source_id" in ref and ref["source_id"] != source["source_id"]:
+            raise Refused("wrong_source", "batch event belongs to another machine")
+    res = ledger.ack_many(refs, consumer=consumer, message_id=args.message_id, chat=args.chat)
     source.pop("default_route")
-    emit({"ok": True, "acked": True, **res, **source})
+    emit({"ok": True, "acked": True, **({"events": res} if args.events is not None else res[0]), **source})
     return 0
 
 
@@ -647,13 +756,21 @@ def cmd_route(args: argparse.Namespace) -> int:
         adapter.update({key: getattr(args, key) for key in ("url_env", "url_file", "token_env", "token_file")
                         if getattr(args, key) is not None})
         result = routes.add(args.home, args.name, consumer=args.consumer, chat=args.chat,
-                            adapter=adapter, source_id=args.source_id)
+                            adapter=adapter, source_id=args.source_id, fallback_route=args.fallback_route)
     elif args.route_cmd == "list":
         result = routes.list_routes(args.home)
     elif args.route_cmd == "remove":
         result = routes.remove(args.home, args.name)
     elif args.route_cmd == "set-default":
         result = routes.set_default(args.home, args.name)
+    elif args.route_cmd == "set-fallback":
+        if (args.fallback is None) == (not args.clear):
+            raise UsageError("give a fallback route or --clear")
+        result = routes.set_fallback(args.home, args.name, args.fallback)
+    elif args.route_cmd == "confirm":
+        result = routes.confirm(args.home, args.name, verification_id=args.verification_id,
+                                message_id=args.message_id, source_id=args.source_id, ledger_id=args.ledger_id,
+                                consumer=args.consumer, chat=args.chat)
     else:
         result = routes.verify(args.home, args.name, retry=args.retry)
         emit({"ok": result["proven"], **result})
@@ -725,11 +842,21 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--no-reconcile", action="store_true")
     e.set_defaults(func=cmd_events)
 
+    b = sub.add_parser("brief", help="read-only terminal results, message lines and a batch ACK command")
+    b.add_argument("--consumer", required=True)
+    b.add_argument("--task")
+    b.add_argument("--route")
+    b.add_argument("--text", action="store_true", help="print ready-to-send lines and the ACK command as text")
+    b.set_defaults(func=cmd_brief)
+
     a = sub.add_parser("ack", help="acknowledge an event (idempotent)")
     a.add_argument("--consumer", required=True)
-    a.add_argument("--task", required=True)
-    a.add_argument("--attempt", required=True, type=int)
-    a.add_argument("--event", required=True)
+    a.add_argument("--task")
+    a.add_argument("--attempt", type=int)
+    a.add_argument("--event")
+    a.add_argument("--events", metavar="JSON", help="atomic batch using the event references printed by brief")
+    a.add_argument("--message-id", help="visible delivery message id, recorded in the ledger")
+    a.add_argument("--chat", help="delivery chat label/id, recorded with the ACK")
     a.add_argument("--ledger-id", help="refuse unless the event belongs to this ledger")
     a.add_argument("--source-id", help="refuse unless this machine has this notifier source id")
     a.set_defaults(func=cmd_ack)
@@ -791,6 +918,7 @@ def build_parser() -> argparse.ArgumentParser:
         reference.add_argument(f"--{kind}-env", metavar="NAME")
         reference.add_argument(f"--{kind}-file", metavar="ABSOLUTE_PATH")
     ra.add_argument("--timeout", type=float, default=20, help="adapter timeout in seconds (1-600)")
+    ra.add_argument("--fallback-route", help="one fallback reminder to an existing proven route")
     ra.set_defaults(func=cmd_route)
     route_sub.add_parser("list", help="list routes, references and verification receipts").set_defaults(func=cmd_route)
     for command, helptext in (("remove", "remove a route and clear it as default; keep task events"),
@@ -801,6 +929,18 @@ def build_parser() -> argparse.ArgumentParser:
         if command == "verify":
             rp.add_argument("--retry", action="store_true", help="explicitly grant a failed verification a new budget/id")
         rp.set_defaults(func=cmd_route)
+    rf = route_sub.add_parser("set-fallback", help="choose a proven fallback route, or clear it")
+    rf.add_argument("name")
+    rf.add_argument("fallback", nargs="?")
+    rf.add_argument("--clear", action="store_true")
+    rf.set_defaults(func=cmd_route)
+    confirm = route_sub.add_parser("confirm", help="confirm a visible test message for an async verification")
+    confirm.add_argument("name")
+    confirm.add_argument("--verification-id", required=True)
+    confirm.add_argument("--message-id", required=True)
+    for key in ("source-id", "ledger-id", "consumer", "chat"):
+        confirm.add_argument("--" + key, help="optional assertion of the verification destination")
+    confirm.set_defaults(func=cmd_route)
 
     k = sub.add_parser("_keeper", help="(internal) supervise one attempt")
     k.add_argument("task_id")

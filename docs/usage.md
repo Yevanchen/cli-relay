@@ -22,6 +22,7 @@ cli-relay submit --key fix-tests-42 --engine claude --cwd ~/code/app \
 cli-relay wait t-… --timeout 600   # a timeout only stops waiting; the task keeps running
 cli-relay events --consumer grok   # waiting/result events not yet ACKed by this consumer
 cli-relay ack --consumer grok --task t-… --attempt 1 --event e-…
+cli-relay brief --consumer grok --text # read-only message lines and one batch ACK command
 cli-relay status t-…               # full record: attempts, identities, exit status, native result
 cli-relay resume t-… --prompt "Continue with the next failing test."   # exact native session
 cli-relay cancel t-…
@@ -33,8 +34,8 @@ cli-relay notify run --interval 60 # periodic pass (retries, reminders, catch-up
 cli-relay notify status            # per event: transport state and consumer ACK
 ```
 
-Every command prints exactly one JSON object on stdout. Only `--help` and `--version` print
-plain text. Exit codes:
+Every command prints exactly one JSON object on stdout. `brief --text`, `--help` and `--version`
+print plain text. Exit codes:
 
 - `0` ok
 - `1` internal error (`"error": "internal"`)
@@ -144,9 +145,12 @@ cli-relay --home /path/to/ledger doctor
 
 # Only after the receiver and the visible test message are approved:
 cli-relay --home /path/to/ledger route verify github
-# Exit 0 / proven=true only after a matching visible-message receipt with message_id.
-# Exit 6 leaves it unproven; inspect verification.next_at before invoking again.
+# A synchronous visible-message receipt with message_id proves it immediately (exit 0).
+# A bare 2xx leaves state=awaiting_confirmation (exit 6) and prints verification_id.
+# The bot posts: cli-relay 接通测试，无需处理
+cli-relay --home /path/to/ledger route confirm github --verification-id v-… --message-id platform-message-id
 cli-relay --home /path/to/ledger route set-default github  # optional, proven only
+cli-relay --home /path/to/ledger route set-fallback github friday # optional; friday must already be proven
 
 cli-relay --home /path/to/ledger submit --key issue-4 --engine claude --cwd ~/code/app \
   --prompt 'Implement the agreed change.' --notify-route github \
@@ -187,6 +191,26 @@ and at most 2 possible wakes, separated by a 1800-second ACK timeout. Unproven t
 bounded readiness checks without sending. Exhaustion keeps the event/receipt for inspection;
 only an explicit retry grants a new budget. See the [receiver protocol and commands](notifier.md)
 and [D16](decisions.md#d16-issue-4-registered-routes-visible-message-proof-and-origin).
+
+Async confirmation must use the current verification id and a visible chat message id on the
+same Mac/ledger, within 24 hours of probe creation. Route, source, consumer, chat and adapter
+references must still match. Optional `route confirm --source-id S --ledger-id L --consumer C
+--chat LABEL` assert those identities explicitly. Wrong, expired or superseded ids are refused.
+Budgets and `next_at` still bound sends; only `route verify NAME --retry` after expiry/exhaustion
+creates a new id. Confirmation never sends or ACKs a task. Managed proofs and registrations are
+also stored in the ledger, so editing a receipt or removing its verification key cannot prove a
+registered route. The current verification id/budget also belongs to the ledger; an old config
+snapshot cannot restore a superseded or removed proof. Run `migrate` for existing ledgers; older config-only managed proofs require a
+fresh `verify` (and `confirm` for an async receiver). Keep the existing legacy Friday route intact.
+
+`route add … --fallback-route friday` or `route set-fallback NAME friday` selects an existing
+proven route other than NAME. `route set-fallback NAME --clear` removes the setting. Once an
+original notification has no owner ACK for `reminder.ack_timeout_s` (default 1800 seconds), or
+ends `failed`, the next notifier pass attempts one fallback reminder. The fallback is recorded
+across restarts and is never repeated, even after `notify retry`. It names the original route,
+consumer, chat, event ids, age and reason, and never ACKs for that consumer. `notify status`
+includes the fallback state/result. This setting does not change the default route or the
+Friday route. Routes with no fallback retain their previous behavior. See [fallback details](notifier.md#fallback-reminders).
 
 This change has only local fake/mock test evidence. No new live webhook route was approved or
 verified, and it makes no new 25-hour reliability claim.
@@ -541,6 +565,13 @@ Both options are absent by default; omitting them preserves existing payloads an
 supplied, they participate in the payload/hash and are reused for exact resume and fresh reruns.
 They grant no filesystem or tool permissions.
 
+With `result_file`, each new terminal/unknown event and notifier `cli_relay.events[]` entry also
+contains `result_file: {"path": "/absolute/task/cwd/out/result.json", "exists": true}`. This is
+path/existence metadata at terminal time, including when the file is absent; its contents are
+not exported. The summary includes the path when it fits. `brief` refreshes the existence flag
+without reading contents. Without the option the event/payload field is omitted and the request
+payload/hash stays unchanged.
+
 The rules are applied in this order:
 
 1. Inspect only the last non-empty line of Claude's final `result` or Codex's last message.
@@ -635,6 +666,57 @@ the machine's existing notifier script or a webhook, with bounded retries and pe
 deduplication. The consumer still reads the task by id and ACKs it after reporting. What a
 wake-up means, and does not mean, is in [`notifier.md`](notifier.md). Whether a chat,
 a phone or a person ever sees the result is outside what the relay can know.
+
+### Direct delivery after a bot's own route wakes it
+
+1. On the named Mac run `cli-relay --home /path/to/ledger brief --consumer C --route R --text`
+   (omit `--text` for JSON). Optional `--task T` restricts it to one task.
+2. Send all printed message lines together as one visible message to the route's chat.
+3. Obtain that message's platform message id.
+4. Execute the printed batch `ack` command after replacing `<MESSAGE_ID>` with that id.
+
+One message line per event is computed by the tool, for example:
+
+```text
+CLI_RELAY mac-a 12345678/90abcdef article：部分完成 | /absolute/task/cwd/out/result.json
+```
+
+The conclusion uses outcome and business status; an unreported status makes no completion claim.
+JSON has `events[]` with full `event_id`, `task_id`, `attempt_no`, `ledger_id`, `source_id`,
+`task_last8`, `event_last8`, `key`, `origin`, `outcome`, `business_status`,
+`business_status_source`, `warnings`, `result_file` (object above or null) and `message`.
+`ack_command` is shell-quoted for the selected home and all listed event identities. No
+text-mode ids need to be copied by hand: each `CLI_RELAY` line is preceded by its full metadata
+as `field=value` pairs, and the final line is the batch command. Send only the `CLI_RELAY` lines.
+Control characters in a display path are escaped to keep its message on one line. No
+unacknowledged terminal events means `events: []`, `ack_command: null`, and empty text output.
+Brief includes events owned by C and events without a known consumer; it excludes other consumers'
+bound events and informational `waiting` events. It reads committed state only: no reconciliation,
+owner binding, send, ACK or delivery-count write. It exports no credentials, task prompt or native
+result text. Run `migrate` before using brief on an old ledger, so its printed message-id ACK can
+execute. Use `status` separately if more evidence is needed.
+
+`ack --message-id M [--chat C]` adds an optional delivery receipt. `events --include-acked` shows
+`message_id` and `chat` for that consumer; `status` keeps `acked_by` and adds an `acks[]` list
+containing consumer, time, message id and chat per event. The first ACK wins: duplicate ACKs do
+not replace its time or receipt. Historical ACKs have null message/chat. The ledger, specifically
+`acks.message_id`, is the record of delivery; no separate registry is needed.
+
+The original single-event command keeps working. The batch form is:
+
+```sh
+cli-relay --home /path/to/ledger ack --consumer bot --events \
+  '[{"task_id":"t-…","attempt_no":1,"event_id":"e-…","ledger_id":"l-…","source_id":"mac-a","consumer":"bot"}]' \
+  --message-id MESSAGE_ID --chat original-chat
+```
+
+Use the exact JSON printed by `brief`. Each reference requires those six fields; `source_id`
+is null for an unconfigured ledger. Every reference must match the current ledger/source and
+the command's consumer, and its event must belong to its task/attempt. Like single-event ACKs,
+consumer records are independent. All events commit in **one transaction** or none commit;
+duplicates return `duplicate: true` per entry and are harmless. Batch output is `events[]`
+with a result per input entry. `--events` cannot be mixed with `--task/--attempt/--event`.
+Optional top-level `--ledger-id` and `--source-id` remain extra assertions for either form.
 
 ## Limits
 

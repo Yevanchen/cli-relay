@@ -48,7 +48,7 @@ from urllib.parse import urlsplit
 from . import business_status, engines, procs
 from .errors import Refused, UsageError
 from .keeper import _hook
-from .ledger import Ledger, canonical_json, now_iso
+from .ledger import Ledger, canonical_json, iso_age_seconds, now_iso
 
 CONFIG_NAME = "notifier.json"
 LOG_NAME = "notifier.log"
@@ -85,12 +85,28 @@ def load_config(home: Path) -> Dict[str, Any]:
     except (OSError, ValueError) as exc:
         raise _bad("unreadable or not JSON", error=type(exc).__name__) from exc
     cfg = validate_config(raw)
-    verified_routes = [route for route in cfg["routes"].values() if route["proven"] and route.get("verification")]
-    if verified_routes:
+    if cfg["routes"]:
         ledger = Ledger(home)
         try:
-            for route in verified_routes:
-                route["proven"] = route["verification"]["ledger_id"] == ledger.ledger_id
+            managed = dict(ledger.conn.execute("SELECT route, verification_id FROM managed_routes").fetchall()) \
+                if ledger.has_notifier() else {}
+            legacy = dict(ledger.conn.execute("SELECT route, route_sha256 FROM legacy_routes").fetchall()) \
+                if ledger.has_notifier() else {}
+            for route in cfg["routes"].values():
+                if not route.get("verification"):
+                    route["proven"] = bool("verification" not in route and route["name"] not in managed
+                                           and legacy.get(route["name"]) == route_fingerprint(cfg["source_id"], route))
+                    continue
+                proof = route["verification"]
+                stored = ledger.conn.execute(
+                    "SELECT receipt_json FROM route_verifications WHERE verification_id=? AND route=?",
+                    (proof["verification_id"], route["name"])).fetchone() if ledger.has_notifier() else None
+                # Configuration alone cannot grant a managed route proof. Only verify/confirm
+                # write this ledger record. Legacy exemptions also require a stored identity.
+                route["proven"] = bool(managed.get(route["name"]) == proof["verification_id"]
+                                       and stored and stored[0] == canonical_json(proof)
+                                       and proof["state"] == "acked" and proof["ledger_id"] == ledger.ledger_id
+                                       and proof["route_sha256"] == route_fingerprint(cfg["source_id"], route))
         finally:
             ledger.close()
     return cfg
@@ -114,12 +130,11 @@ def validate_config(raw: Any) -> Dict[str, Any]:
     if default_route is not None and (not isinstance(default_route, str) or default_route not in clean_routes):
         raise _bad("default_route is not one of the routes")
     for route in clean_routes.values():
-        verification = route.get("verification")
-        # Installer-managed legacy routes have no verification key. Preserve their existing
-        # behavior without migrating the file; an explicit null or pending receipt is not legacy.
-        route["proven"] = "verification" not in route or bool(
-            verification and verification["state"] == "acked"
-            and verification["route_sha256"] == route_fingerprint(source_id, route))
+        # Validation alone cannot grant proof or a legacy exemption; load_config checks the ledger.
+        route["proven"] = False
+        fallback = route.get("fallback_route")
+        if fallback is not None and (fallback == route["name"] or fallback not in clean_routes):
+            raise _bad("fallback_route must be another existing route")
     outcomes = raw.get("notify_outcomes", list(DEFAULT_OUTCOMES))
     if (not isinstance(outcomes, list) or not outcomes
             or any(o not in KNOWN_OUTCOMES for o in outcomes)):
@@ -147,7 +162,7 @@ def _numbers(spec: Any, fields: Dict[str, Tuple[Any, Any, Any]], where: str) -> 
 def _route(name: str, spec: Any) -> Dict[str, Any]:
     if not isinstance(name, str) or not _ID_RE.fullmatch(name):
         raise _bad("route names must be 1-32 chars of [A-Za-z0-9._-]")
-    if not isinstance(spec, dict) or set(spec) - {"consumer", "chat", "adapter", "verification"}:
+    if not isinstance(spec, dict) or set(spec) - {"consumer", "chat", "adapter", "verification", "fallback_route"}:
         raise _bad(f"route {name} must have consumer, chat and adapter")
     consumer = spec.get("consumer")
     if not isinstance(consumer, str) or not _NAME_RE.fullmatch(consumer):
@@ -158,6 +173,11 @@ def _route(name: str, spec: Any) -> Dict[str, Any]:
     route = {"name": name, "consumer": consumer, "chat": chat, "adapter": _adapter(name, spec.get("adapter"))}
     if "verification" in spec:
         route["verification"] = _verification(spec["verification"])
+    if "fallback_route" in spec:
+        fallback = spec["fallback_route"]
+        if not isinstance(fallback, str) or not ROUTE_RE.fullmatch(fallback):
+            raise _bad(f"route {name}: invalid fallback_route")
+        route["fallback_route"] = fallback
     return route
 
 
@@ -172,22 +192,25 @@ def _verification(value: Any) -> Optional[Dict[str, Any]]:
         return None
     fields = {"verification_id", "route_sha256", "ledger_id", "state", "attempts", "wakes", "next_at", "created_at",
               "message_id", "acked_at", "last_result"}
-    if not isinstance(value, dict) or set(value) != fields:
+    if not isinstance(value, dict) or set(value) - {"expires_at", "async_accepted"} != fields:
         raise _bad("invalid route verification receipt")
+    if "async_accepted" in value and type(value["async_accepted"]) is not bool:
+        raise _bad("invalid route verification async acceptance")
     if (not isinstance(value["verification_id"], str)
             or not re.fullmatch(r"v-[0-9a-f]{32}", value["verification_id"])
             or not isinstance(value["route_sha256"], str)
             or not re.fullmatch(r"[0-9a-f]{64}", value["route_sha256"])
             or not isinstance(value["ledger_id"], str)
             or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", value["ledger_id"])
-            or value["state"] not in ("pending", "sending", "unconfirmed", "failed", "unacknowledged", "acked")):
+            or value["state"] not in ("pending", "sending", "awaiting_confirmation", "unconfirmed", "failed",
+                                       "unacknowledged", "acked")):
         raise _bad("invalid route verification identity or state")
     for key in ("attempts", "wakes"):
         if type(value[key]) is not int or not 0 <= value[key] <= 50:
             raise _bad("invalid route verification budget")
-    for key in ("next_at", "created_at", "acked_at"):
-        if value[key] is not None and (not isinstance(value[key], str)
-                                      or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", value[key])):
+    for key in ("next_at", "created_at", "acked_at", "expires_at"):
+        if value.get(key) is not None and (not isinstance(value[key], str)
+                                          or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", value[key])):
             raise _bad("invalid route verification timestamp")
     if value["message_id"] is not None and (not isinstance(value["message_id"], str)
                                             or not MESSAGE_ID_RE.fullmatch(value["message_id"])):
@@ -256,6 +279,7 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
                                           "completion_marker_required", "completion_marker", "origin", "git", "warnings",
                                           "codex_git_repo_check", "after", "after_require", "queue",
                                           "reason_code", "details", "summary", "unset_env", "unset_env_present", "preflight",
+                                          "result_file",
                                           *business_status.FIELDS)
                if key in body},
             "result_excerpt": _clean(body.get("result_excerpt"), EXCERPT_MAX)}
@@ -286,6 +310,11 @@ def build_payload(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, re
     if len(refs) > 3:
         parts.append(f"+{len(refs) - 3} more")
     summary = head + " | " + " ; ".join(parts)
+    for ref in refs:
+        if ref.get("result_file"):
+            addition = " | result_file=" + ref["result_file"]["path"]
+            if len(summary + addition) <= SUMMARY_MAX:
+                summary += addition
     if single and single["result_excerpt"]:
         summary += " | " + single["result_excerpt"]
     # Excerpts/identifiers remain bounded, but permissions must never be truncated or merged
@@ -342,6 +371,8 @@ def send_command(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str
             # Existing command adapters can implement the same receipt protocol over stdin/stdout.
             message_id = _proof_message_id(p.stdout[:65536], payload["cli_relay"], ())
             if message_id is None:
+                if _async_receipt(p.stdout[:65536]):
+                    return {"outcome": "accepted", "why": "verification_awaiting_confirmation"}
                 return {"outcome": "ambiguous", "why": "verification_receipt_invalid"}
             return {"outcome": "accepted", "why": "visible_message_confirmed", "message_id": message_id}
         if adapter["exit_status"] == "verified":
@@ -389,6 +420,8 @@ def send_http(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str, s
         if payload.get("cli_relay", {}).get("schema") == "cli-relay.route-verify.v1":
             message_id = _proof_message_id(response_body, payload["cli_relay"], (url, token))
             if message_id is None:
+                if _async_receipt(response_body):
+                    return {"outcome": "accepted", "why": "verification_awaiting_confirmation", "status": status}
                 return {"outcome": "ambiguous", "why": "verification_receipt_invalid", "status": status}
             return {"outcome": "accepted", "why": "visible_message_confirmed", "status": status,
                     "message_id": message_id}
@@ -419,6 +452,20 @@ def _proof_message_id(body: bytes, request: Dict[str, Any], secrets: Tuple[str, 
             or any(secret in message_id for secret in secrets if secret)):
         return None
     return message_id
+
+
+def _async_receipt(body: bytes) -> bool:
+    """A run-start acknowledgement is not a failed visible-message receipt.
+
+    An explicit but invalid proof must not silently become confirmable. Raw responses and
+    run ids are never persisted; the later confirm is bound to our own verification identity.
+    """
+    try:
+        receipt = json.loads(body)
+    except (ValueError, UnicodeError):
+        return True
+    return isinstance(receipt, dict) and not set(receipt).intersection(
+        {"visible", "message_id", "verification_id", "source_id", "ledger_id", "route", "consumer", "chat"})
 
 
 def _retry_after(value: Optional[str]) -> Optional[float]:
@@ -526,6 +573,8 @@ def recover(ledger: Ledger, cfg: Dict[str, Any]) -> Dict[str, int]:
                 out["reclaimed"] += 1
             else:
                 c.execute("UPDATE notifications SET state='unconfirmed', wakes=wakes+1, attempts=attempts+1, next_at=?, "
+                          "first_sent_at=COALESCE(first_sent_at, updated_at), "
+                          "last_sent_at=COALESCE(last_sent_at, updated_at), "
                           "last_result_json=?, claimed_by=NULL, claimed_token=NULL, claim_id=NULL, updated_at=? "
                           "WHERE event_id=? AND route=? AND state='sending'",
                           (_later(cfg["reminder"]["ack_timeout_s"]),
@@ -632,6 +681,147 @@ def _record(ledger: Ledger, cfg: Dict[str, Any], claim_id: str, result: Dict[str
                           (r["event_id"], r["route"], claim_id, started, now, outcome, canonical_json(result)))
 
 
+def _recover_fallbacks(ledger: Ledger) -> None:
+    """A fallback may be attempted only once. A lost sender after 'sending' is final."""
+    with ledger.tx() as c:
+        for row in c.execute("SELECT * FROM notification_fallbacks WHERE state IN ('claimed','sending')").fetchall():
+            with _CLAIMS_LOCK:
+                abandoned_here = row["claimed_by"] == os.getpid() and row["claim_id"] not in _ACTIVE_CLAIMS
+            if not abandoned_here and procs.same_process_alive(row["claimed_by"], row["claimed_token"]) is not False:
+                continue
+            sending = row["state"] == "sending"
+            c.execute("UPDATE notification_fallbacks SET state=?, claim_id=NULL, claimed_by=NULL, claimed_token=NULL, "
+                      "ended_at=?, last_result_json=? WHERE event_id=? AND original_route=?",
+                      ("unconfirmed" if sending else "pending", now_iso() if sending else None,
+                       canonical_json({"why": "fallback_sender_died"}) if sending else None,
+                       row["event_id"], row["original_route"]))
+        c.execute("UPDATE notification_fallbacks SET state='skipped', ended_at=?, last_result_json=? "
+                  "WHERE state='pending' AND EXISTS (SELECT 1 FROM acks a JOIN events e ON e.event_id=a.event_id "
+                  "JOIN tasks t ON t.task_id=e.task_id WHERE a.event_id=notification_fallbacks.event_id "
+                  "AND a.consumer=t.notify_consumer)",
+                  (now_iso(), canonical_json({"why": "original_consumer_acked"})))
+
+
+def _claim_fallbacks(ledger: Ledger, cfg: Dict[str, Any], original: str,
+                     target: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
+    claim_id = uuid.uuid4().hex
+    with _CLAIMS_LOCK:
+        _ACTIVE_CLAIMS.add(claim_id)
+    try:
+        with ledger.tx() as c:
+            rows = c.execute(
+                "SELECT n.*, e.task_id, e.attempt_no, e.kind, e.body_json, t.request_key, "
+                "t.notify_consumer AS original_consumer, t.notify_chat AS original_chat "
+                "FROM notifications n JOIN events e ON e.event_id=n.event_id JOIN tasks t ON t.task_id=e.task_id "
+                "LEFT JOIN notification_fallbacks f ON f.event_id=n.event_id AND f.original_route=n.route "
+                "WHERE n.route=? AND t.notify_bound=1 AND t.notify_consumer IS NOT NULL "
+                "AND n.state NOT IN ('acked','skipped','claimed','sending') "
+                "AND (n.state='failed' OR (n.first_sent_at IS NOT NULL AND n.first_sent_at <= ?)) "
+                "AND (f.event_id IS NULL OR f.state='pending') "
+                "AND NOT EXISTS (SELECT 1 FROM acks a WHERE a.event_id=n.event_id AND a.consumer=t.notify_consumer) "
+                "ORDER BY e.created_at, e.event_id",
+                (original, _later(-cfg["reminder"]["ack_timeout_s"]))).fetchall()
+            claimed = []
+            for row in rows:
+                existing = c.execute("SELECT * FROM notification_fallbacks WHERE event_id=? AND original_route=?",
+                                     (row["event_id"], original)).fetchone()
+                if existing:
+                    if (existing["route"], existing["consumer"], existing["chat"]) != (
+                            target["name"], target["consumer"], target["chat"]):
+                        c.execute("UPDATE notification_fallbacks SET state='failed', ended_at=?, last_result_json=? "
+                                  "WHERE event_id=? AND original_route=?",
+                                  (now_iso(), canonical_json({"why": "fallback_owner_changed"}), row["event_id"], original))
+                        continue
+                    c.execute("UPDATE notification_fallbacks SET state='claimed', claim_id=?, claimed_by=?, "
+                              "claimed_token=? WHERE event_id=? AND original_route=? AND state='pending'",
+                              (claim_id, os.getpid(), procs.start_token(os.getpid()), row["event_id"], original))
+                else:
+                    c.execute("INSERT INTO notification_fallbacks (event_id, original_route, route, consumer, chat, "
+                              "state, claim_id, claimed_by, claimed_token, created_at) VALUES (?,?,?,?,?,'claimed',?,?,?,?)",
+                              (row["event_id"], original, target["name"], target["consumer"], target["chat"],
+                               claim_id, os.getpid(), procs.start_token(os.getpid()), now_iso()))
+                claimed.append(dict(row))
+    except BaseException:
+        with _CLAIMS_LOCK:
+            _ACTIVE_CLAIMS.discard(claim_id)
+        raise
+    if not claimed:
+        with _CLAIMS_LOCK:
+            _ACTIVE_CLAIMS.discard(claim_id)
+    return claim_id, claimed
+
+
+def _send_fallbacks(ledger: Ledger, cfg: Dict[str, Any], env: Dict[str, str]) -> List[Dict[str, Any]]:
+    from .routes import _locked
+
+    _recover_fallbacks(ledger)
+    sends = []
+    for original, route in cfg["routes"].items():
+        if not route.get("fallback_route"):
+            continue
+        claim_id = None
+        try:
+            # Normal sends may have outlived a route edit. Recheck proof and the target
+            # under the management lock, holding it until the send is committed.
+            with _locked(ledger.home):
+                current_cfg = load_config(ledger.home)
+                route = current_cfg["routes"].get(original, {})
+                target = current_cfg["routes"].get(route.get("fallback_route"))
+                if target is None or target["name"] == original or not target["proven"]:
+                    continue
+                claim_id, rows = _claim_fallbacks(ledger, current_cfg, original, target)
+                if not rows:
+                    continue
+                _hook("fallback_after_claim")
+                started = now_iso()
+                with ledger.tx() as c:
+                    # Recheck the original owner's ACK immediately before committing the send.
+                    c.execute("UPDATE notification_fallbacks SET state='skipped', ended_at=?, last_result_json=?, "
+                              "claim_id=NULL, claimed_by=NULL, claimed_token=NULL WHERE claim_id=? "
+                              "AND EXISTS (SELECT 1 FROM acks a JOIN events e ON e.event_id=a.event_id "
+                              "JOIN tasks t ON t.task_id=e.task_id WHERE a.event_id=notification_fallbacks.event_id "
+                              "AND a.consumer=t.notify_consumer)",
+                              (started, canonical_json({"why": "original_consumer_acked"}), claim_id))
+                    c.execute("UPDATE notification_fallbacks SET state='sending', started_at=? "
+                              "WHERE claim_id=? AND state='claimed'", (started, claim_id))
+                    ids = {row[0] for row in c.execute("SELECT event_id FROM notification_fallbacks "
+                                                     "WHERE claim_id=? AND state='sending'", (claim_id,))}
+            rows = [row for row in rows if row["event_id"] in ids]
+            if not rows:
+                continue
+            refs = []
+            for row in rows:
+                refs.append({**_event_ref(row), "original_route": original,
+                             "original_consumer": row["original_consumer"], "original_chat": row["original_chat"],
+                             "notification_age_s": round(max(0, iso_age_seconds(row["first_sent_at"] or row["created_at"]) or 0)),
+                             "fallback_reason": "send_failed" if row["state"] == "failed" else "ack_timeout"})
+            payload = build_payload(current_cfg, target, ledger.ledger_id, refs, reminder=True)
+            payload["status"] = "fallback_reminder"
+            payload["cli_relay"].update(fallback=True, original_route=original)
+            origins = " ; ".join(
+                f"{ref['event_id']} original_consumer={ref['original_consumer']} "
+                f"original_chat={_clean(ref['original_chat'], 80)} age_s={ref['notification_age_s']} "
+                f"reason={ref['fallback_reason']}" for ref in refs)
+            payload["summary"] = (f"cli-relay FALLBACK REMINDER original_route={original} | {origins} | "
+                                  "仅提醒，不代原 consumer ACK | " + payload["summary"])
+            _hook("fallback_before_send")
+            result = send(target["adapter"], payload, env)
+            _hook("fallback_after_send")
+            state = {"accepted": "accepted", "handed_off": "handed_off", "ambiguous": "unconfirmed"}.get(
+                result["outcome"], "failed")
+            with ledger.tx() as c:
+                c.execute("UPDATE notification_fallbacks SET state=?, ended_at=?, last_result_json=?, "
+                          "claim_id=NULL, claimed_by=NULL, claimed_token=NULL WHERE claim_id=? AND state='sending'",
+                          (state, now_iso(), canonical_json(result), claim_id))
+            sends.append({"original_route": original, "route": target["name"], "events": [r["event_id"] for r in refs],
+                          "outcome": result["outcome"], "why": result.get("why"), "status": result.get("status")})
+        finally:
+            if claim_id is not None:
+                with _CLAIMS_LOCK:
+                    _ACTIVE_CLAIMS.discard(claim_id)
+    return sends
+
+
 def flush(home: Path, env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """One pass: enqueue new events, close ACKed ones, recover dead claims, schedule reminders, and
     send what is due, one batch per route. Safe to run concurrently with other passes."""
@@ -670,6 +860,7 @@ def flush(home: Path, env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
                     _ACTIVE_CLAIMS.discard(claim_id)
         summary["sends"] = sends
         summary["blocked"] = blocked
+        summary["fallback_sends"] = _send_fallbacks(ledger, cfg, env)
         return summary
     finally:
         ledger.close()
@@ -683,6 +874,8 @@ def status(home: Path, *, task_id: Optional[str] = None, event_id: Optional[str]
             "SELECT n.*, e.task_id, e.attempt_no, e.kind FROM notifications n JOIN events e ON e.event_id=n.event_id "
             "WHERE (? IS NULL OR e.task_id=?) AND (? IS NULL OR n.event_id=?) ORDER BY n.created_at",
             (task_id, task_id, event_id, event_id)).fetchall()
+        fallbacks = {(r["event_id"], r["original_route"]): dict(r)
+                     for r in ledger.conn.execute("SELECT * FROM notification_fallbacks").fetchall()}
     finally:
         ledger.close()
     out = []
@@ -692,6 +885,10 @@ def status(home: Path, *, task_id: Optional[str] = None, event_id: Optional[str]
         d["last_result"] = json.loads(r["last_result_json"]) if r["last_result_json"] else None
         d["transport_accepted"] = r["accepted_at"] is not None
         d["consumer_acked"] = r["acked_at"] is not None
+        fallback = fallbacks.get((r["event_id"], r["route"]))
+        d["fallback"] = ({key: fallback[key] for key in ("route", "consumer", "chat", "state", "started_at", "ended_at")}
+                         | {"last_result": json.loads(fallback["last_result_json"]) if fallback["last_result_json"] else None}
+                         if fallback else None)
         out.append(d)
     return out
 

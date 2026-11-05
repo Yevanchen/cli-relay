@@ -75,6 +75,54 @@ def free_port() -> int:
     return port
 
 
+class FakeHTTPReceiver:
+    """In-process HTTP stand-in for sandbox tests where binding localhost is forbidden.
+
+    A response is bytes, a JSON value, an HTTP status, or a callable of the request record.
+    Both connection classes are patched, so no request can accidentally reach the network.
+    """
+
+    def __init__(self, responses=None):
+        self.responses = list(responses or [])
+        self.requests = []
+
+    def __enter__(self):
+        import contextlib
+        from unittest import mock
+        from cli_relay import notify
+
+        self.stack = contextlib.ExitStack()
+
+        def connection(*args, **kwargs):
+            conn = mock.Mock()
+            request = {}
+
+            def send(method, path, *, body, headers):
+                request.update(json.loads(body))
+                self.requests.append(request)
+
+            def response():
+                value = self.responses.pop(0) if self.responses else {}
+                value = value(request["cli_relay"]) if callable(value) else value
+                if isinstance(value, BaseException):
+                    raise value
+                resp = mock.Mock(status=value if type(value) is int else 200)
+                resp.getheader.return_value = None
+                resp.read.return_value = value if isinstance(value, bytes) else json.dumps(value).encode()
+                return resp
+
+            conn.request.side_effect = send
+            conn.getresponse.side_effect = response
+            return conn
+
+        for cls in ("HTTPConnection", "HTTPSConnection"):
+            self.stack.enter_context(mock.patch.object(notify.http.client, cls, side_effect=connection))
+        return self
+
+    def __exit__(self, *args):
+        return self.stack.__exit__(*args)
+
+
 def http_config(tmp: Path, url: str, *, source_id: str = "host-a", max_attempts: int = 4, ack_timeout_s: float = 2.0,
                 max_wakes: int = 2, outcomes: Optional[List[str]] = None, default_route: Optional[str] = "bot",
                 consumer: str = "bot") -> Dict[str, Any]:
@@ -97,22 +145,29 @@ def http_config(tmp: Path, url: str, *, source_id: str = "host-a", max_attempts:
 
 def write_config(home: Path, cfg: Dict[str, Any]) -> None:
     """Transport tests start after synthetic verification; no real chat is certified here."""
-    from cli_relay import notify
+    from unittest import mock
+    from cli_relay import notify, routes
     from cli_relay.errors import UsageError
-    from cli_relay.ledger import now_iso
+    from cli_relay.ledger import Ledger
 
     cfg = copy.deepcopy(cfg)
+    clean = None
     try:
         clean = notify.validate_config(cfg)
     except UsageError:
         pass  # invalid-config tests need the exact invalid input
     else:
-        for name, route in clean["routes"].items():
-            cfg["routes"][name]["verification"] = {
-                "verification_id": "v-" + "a" * 32,
-                "route_sha256": notify.route_fingerprint(clean["source_id"], route),
-                "ledger_id": json.loads((Path(home) / "LEDGER.json").read_text())["ledger_id"],
-                "state": "acked", "attempts": 1, "wakes": 1, "next_at": None,
-                "created_at": now_iso(), "message_id": "synthetic-test-message", "acked_at": now_iso(),
-                "last_result": "visible_message_confirmed"}
+        for name in clean["routes"]:
+            cfg["routes"][name]["verification"] = None
     (Path(home) / "notifier.json").write_text(json.dumps(cfg))
+    ledger = Ledger(home)
+    try:
+        migrated = ledger.has_notifier()
+    finally:
+        ledger.close()
+    if migrated and clean is not None:
+        # Exercise the actual proof-writing path rather than forging a config receipt.
+        with mock.patch.object(notify, "send", return_value={"outcome": "accepted",
+                "why": "visible_message_confirmed", "message_id": "synthetic-test-message"}):
+            for name in clean["routes"]:
+                routes.verify(home, name, env={})
