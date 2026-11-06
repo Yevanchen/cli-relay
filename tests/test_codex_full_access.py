@@ -289,10 +289,13 @@ class FullAccessRoundTrip(RelayTestCase):
         self.assertFalse((self.tmp / "calls.jsonl").exists())
 
     def test_opt_in_does_not_bypass_subscription_billing_checks(self) -> None:
+        fake = Path(self.env["CLI_RELAY_CODEX_BIN"])
+        fake.write_text(fake.read_text().replace("Logged in using ChatGPT", "Logged in using an API key"))
         sub = self.submit_codex(env={**self.env, "OPENAI_API_KEY": "test-value"})
         done = self.cli("wait", sub["task_id"], "--timeout", "30")
         self.assertEqual(done["task"]["state"], "blocked")
-        self.assertEqual(done["attempts"][0]["evidence"]["preflight"]["reason"], "billing_env_present")
+        self.assertEqual(done["attempts"][0]["evidence"]["preflight"]["reason"], "auth_not_subscription")
+        self.assertEqual(done["attempts"][0]["evidence"]["billing_env_removed"], ["OPENAI_API_KEY"])
         self.assertFalse((self.tmp / "calls.jsonl").exists())
 
     def test_doctor_explains_opt_in_default_and_risk(self) -> None:

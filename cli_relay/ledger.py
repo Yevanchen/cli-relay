@@ -899,7 +899,9 @@ class Ledger:
             details["completion_marker"] = engines.completion_marker((native or {}).get("result"))
         details.update({key: observations[key] for key in ("git", "warnings", "codex_git_repo_check",
                                                           "reason_code", "details", "summary",
-                                                          "unset_env_present", *business_status.FIELDS)
+                                                          "unset_env_present", "billing_env_present",
+                                                          "billing_env_removed", "billing_env_preserved",
+                                                          *business_status.FIELDS)
                         if key in observations})
         if observations.get("preflight", {}).get("reason") == "billing_env_present":
             details["preflight"] = observations["preflight"]

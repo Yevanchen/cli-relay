@@ -26,8 +26,8 @@ from .errors import UsageError
 
 ENGINES = ("claude", "codex", "fixture")
 
-# Variables that route a CLI to API-key or third-party billing. Presence blocks the run;
-# only the variable *names* are ever reported.
+# Variables that route a CLI to API-key or third-party billing. Codex subscription tasks
+# remove them from the child environment; Claude still blocks. Only names are reported.
 BILLING_ENV: Dict[str, tuple] = {
     "claude": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
                "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "ANTHROPIC_BEDROCK_BASE_URL",
@@ -36,6 +36,7 @@ BILLING_ENV: Dict[str, tuple] = {
     "fixture": (),
 }
 UNSETTABLE_ENV = tuple(sorted({name for names in BILLING_ENV.values() for name in names}))
+CODEX_BILLING_MODES = ("subscription", "api")
 
 # Markers of a calling Claude Code session; they must not leak into a child CLI.
 SCRUB_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET",
@@ -54,7 +55,7 @@ _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
                "allowed_write_dirs": (list,), "allowed_bash_commands": (list,), "require_completion_marker": (bool,)},
     "codex": {"model": (str,), "effort": (str,), "sandbox": (str,), "allow_full_access": (bool,),
               "allow_network": (bool,), "network_access": (bool,),
-              "skip_git_repo_check": (bool,), "require_completion_marker": (bool,)},
+              "skip_git_repo_check": (bool,), "require_completion_marker": (bool,), "billing_mode": (str,)},
     "fixture": {"duration_s": (int, float), "exit_code": (int,), "result": (str,), "side_effect_file": (str,),
                 "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,),
                 "descendant_s": (int, float), "descendant_pid_file": (str,), "require_completion_marker": (bool,)},
@@ -210,6 +211,8 @@ def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str]
             raise UsageError("network_access and allow_network must agree")
         clean["allow_network"] = clean.pop("network_access")
     if engine == "codex":
+        if "billing_mode" in clean and clean["billing_mode"] not in CODEX_BILLING_MODES:
+            raise UsageError("codex billing_mode must be subscription or api", allowed=list(CODEX_BILLING_MODES))
         sandboxes = (*CODEX_SANDBOXES, CODEX_FULL_ACCESS)
         if "sandbox" in clean and clean["sandbox"] not in sandboxes:
             raise UsageError("codex sandbox must be read-only, workspace-write or danger-full-access "
@@ -262,6 +265,34 @@ def resolve_bin(engine: str, env: Dict[str, str]) -> Optional[str]:
 def child_env(env: Dict[str, str], *, unset_env: Iterable[str] = ()) -> Dict[str, str]:
     return {k: v for k, v in env.items()
             if k not in unset_env and k not in SCRUB_ENV and not k.startswith("CLI_RELAY_TEST_")}
+
+
+def billing_policy(engine: str, options: Dict[str, Any]) -> Dict[str, str]:
+    """An omitted persisted mode always means subscription, including on legacy resumes."""
+    if engine != "codex":
+        return {}
+    mode = options.get("billing_mode", "subscription")
+    return {"billing_mode": mode,
+            "billing_env_policy": "explicit_api" if mode == "api" else "subscription_isolation"}
+
+
+def task_unset_env(engine: str, options: Dict[str, Any]) -> List[str]:
+    names = set(validate_unset_env(options.get("unset_env", [])))
+    if billing_policy(engine, options).get("billing_mode") == "subscription":
+        names.update(BILLING_ENV[engine])
+    return sorted(names)
+
+
+def billing_env_evidence(engine: str, env: Dict[str, str], options: Dict[str, Any]) -> Dict[str, Any]:
+    """Names-only snapshot before task cleanup; empty strings count as present."""
+    policy = billing_policy(engine, options)
+    if not policy:
+        return {}
+    present = sorted(name for name in BILLING_ENV[engine] if name in env)
+    removed = task_unset_env(engine, options)
+    return {**policy, "billing_env_present": present,
+            "billing_env_removed": [name for name in present if name in removed],
+            "billing_env_preserved": [name for name in present if name not in removed]}
 
 
 def _first_json_object(text: str) -> Optional[Dict[str, Any]]:
@@ -535,49 +566,59 @@ def preflight(engine: str, env: Dict[str, str], cwd: Optional[str] = None, *,
               options: Optional[Dict[str, Any]] = None) -> Preflight:
     """Everything that decides which account serves the run is checked before the CLI starts:
     billing variables, the CLI's configuration layers that apply to ``cwd``, and the login."""
-    if options is not None and "unset_env" in options:
-        env = child_env(env, unset_env=validate_unset_env(options["unset_env"]))
-    present = [name for name in BILLING_ENV[engine] if env.get(name)]
+    opts = options or {}
+    if engine == "codex":
+        opts = validate_options(engine, opts, cwd=cwd)
+    billing = billing_env_evidence(engine, env, opts)
+    env = child_env(env, unset_env=task_unset_env(engine, opts))
+    api = billing.get("billing_mode") == "api"
+
+    def result(ok: bool, reason: Optional[str] = None, detail: Optional[Dict[str, Any]] = None) -> Preflight:
+        return Preflight(ok, reason, {**billing, **(detail or {})})
+
+    present = [name for name in BILLING_ENV[engine] if env.get(name)] if not api else []
     if present:
         flags = " ".join(f"--unset-env {name}" for name in present)
         prefix = "env " + " ".join(f"-u {name}" for name in present)
-        return Preflight(False, "billing_env_present", {
+        return result(False, "billing_env_present", {
             "names": present, "fix": {"submit_flags": flags, "env_prefix": prefix},
             "message": f"Billing environment variables block subscription login. Submit with a new key and "
                        f"{flags}, or prefix the cli-relay command with {prefix}.",
         })
     if engine == "fixture":
-        return Preflight(True)
-    opts = validate_options(engine, options or {}, cwd=cwd)
+        return result(True)
     if engine == "codex":
         problems, layers = codex_config_problems(env, cwd)
     else:
+        opts = validate_options(engine, opts, cwd=cwd)
         problems, layers = claude_settings_problems(env, cwd, permission_mode=CLAUDE_PERMISSION_MODE,
                                                    effort=opts.get("effort"))
     if problems:
-        return Preflight(False, "config_not_subscription", {"settings": problems})
+        return result(False, "config_not_subscription", {"settings": problems})
     binary = resolve_bin(engine, env)
     if not binary:
-        return Preflight(False, "cli_not_found", {"engine": engine})
+        return result(False, "cli_not_found", {"engine": engine})
     argv = [binary, "auth", "status"] if engine == "claude" else [binary, "login", "status"]
     try:
         out = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=child_env(env),
                              stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as exc:
-        return Preflight(False, "auth_unverified", {"error": type(exc).__name__})
+        return result(False, "auth_unverified", {"error": type(exc).__name__})
     if engine == "claude":
         info = _first_json_object(out.stdout) or {}
         auth = {k: info.get(k) for k in ("loggedIn", "authMethod", "apiProvider", "subscriptionType")}
         if (info.get("loggedIn") is True and info.get("authMethod") == "claude.ai"
                 and info.get("apiProvider") in (None, "firstParty")):
-            return Preflight(True, None, {"auth": auth, "config_layers": layers})
-        return Preflight(False, "auth_not_subscription", {"auth": auth, "returncode": out.returncode})
+            return result(True, None, {"auth": auth, "config_layers": layers})
+        return result(False, "auth_not_subscription", {"auth": auth, "returncode": out.returncode})
     text = (out.stdout + "\n" + out.stderr).lower()
     if "api key" in text:
-        return Preflight(False, "auth_not_subscription", {"auth": "api_key"})
+        if api and out.returncode == 0:
+            return result(True, None, {"auth": "api_key", "config_layers": layers})
+        return result(False, "auth_not_subscription", {"auth": "api_key"})
     if out.returncode == 0 and "chatgpt" in text:
-        return Preflight(True, None, {"auth": "chatgpt", "config_layers": layers})
-    return Preflight(False, "auth_unverified", {"auth": "unknown", "returncode": out.returncode})
+        return result(True, None, {"auth": "chatgpt", "config_layers": layers})
+    return result(False, "auth_unverified", {"auth": "unknown", "returncode": out.returncode})
 
 
 def codex_rollout(env: Dict[str, str], thread_id: str) -> Optional[Path]:
@@ -721,6 +762,7 @@ def request_details(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     options = payload.get("options") or {}
     return {**details, "permissions": permission_summary(details),
             "completion_marker_required": completion_marker_required(payload),
+            **billing_policy(engine, options),
             **({"unset_env": options["unset_env"]} if "unset_env" in options else {})}
 
 
@@ -865,7 +907,7 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
     cwd = payload["cwd"]
     opts = validate_options(engine, payload.get("options", {}), cwd=cwd)
     resume = attempt.get("resume_session_id")
-    cenv = child_env(env, unset_env=opts.get("unset_env", ()))
+    cenv = child_env(env, unset_env=task_unset_env(engine, opts))
     last_message = None
     evidence: Dict[str, Any] = {}
     if engine == "claude":

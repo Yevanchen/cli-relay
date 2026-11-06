@@ -57,7 +57,8 @@ the 30-minute ACK timeout, or its notification fails; it keeps the task's origin
 ## Requirements
 
 - macOS or Linux, Python ≥ 3.11 (stdlib only), local disk for the ledger
-- For real runs: `claude` and/or `codex` installed and logged in with a **subscription** (API-key routes are refused)
+- For real runs: `claude` and/or `codex` installed and logged in with a **subscription** by default
+  (Codex API billing requires an explicit per-task `--billing-mode api`)
 
 ## Engines
 
@@ -70,10 +71,14 @@ the 30-minute ACK timeout, or its notification fails; it keeps the task's origin
 Model and effort can be set per task with `--option`. More engine options are documented in
 [`docs/usage.md`](docs/usage.md#engines), and their guards in [`docs/reliability.md`](docs/reliability.md).
 
-If preflight reports `billing_env_present`, add `--unset-env OPENAI_BASE_URL` (repeatable,
-using the names in the error) to `submit` with a new key. It removes only those billing
-variables for that task's preflight and CLI, including resume, and leaves the relay and
-machine environment unchanged. See [environment cleanup](docs/usage.md#per-task-environment-cleanup).
+Codex tasks default to subscription billing and remove inherited `OPENAI_API_KEY`, `CODEX_API_KEY`,
+`OPENAI_BASE_URL` and `AZURE_OPENAI_API_KEY` before preflight and CLI startup, including resume.
+Only variable names and the policy are recorded; the relay and machine environment stay unchanged.
+Deliberate Codex API billing requires `submit --billing-mode api` (or `--option billing_mode=api`),
+persisted for that task's resumes. Configuration, provider and permission guards still apply.
+Claude retains its subscription guards. Before this fix is deployed, dispatchers should keep the
+temporary `--unset-env OPENAI_BASE_URL` workaround (repeat it for other names in the billing error).
+See [environment cleanup](docs/usage.md#per-task-environment-cleanup).
 
 ### Permission opt-ins
 

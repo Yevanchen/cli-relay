@@ -56,16 +56,22 @@ class UnsetEnvOptionsAndArgv(unittest.TestCase):
                     engines.validate_options(engine, {"unset_env": value})
                 self.assertNotIn(CANARY, json.dumps(caught.exception.to_json()))
 
-    def test_first_and_resumed_builds_remove_only_requested_names_and_keep_existing_scrubbing(self):
+    def test_first_and_resumed_builds_keep_explicit_cleanup_and_codex_subscription_default(self):
         original = dict(self.env)
         for engine in engines.ENGINES:
             for resume in (None, "old-session"):
                 with self.subTest(engine=engine, resume=resume):
                     default = self.build(engine, {}, resume)
-                    self.assertEqual(default.env["OPENAI_BASE_URL"], CANARY)
+                    if engine == "codex":
+                        self.assertNotIn("OPENAI_BASE_URL", default.env)
+                    else:
+                        self.assertEqual(default.env["OPENAI_BASE_URL"], CANARY)
                     spec = self.build(engine, {"unset_env": ["OPENAI_BASE_URL"]}, resume)
                     self.assertNotIn("OPENAI_BASE_URL", spec.env)
-                    self.assertEqual(spec.env["OPENAI_API_KEY"], CANARY)
+                    if engine == "codex":
+                        self.assertNotIn("OPENAI_API_KEY", spec.env)
+                    else:
+                        self.assertEqual(spec.env["OPENAI_API_KEY"], CANARY)
                     self.assertEqual(spec.env["RELAY_ENV_KEEP"], "keep")
                     self.assertNotIn("CLAUDECODE", spec.env)
                     self.assertNotIn("CLI_RELAY_TEST_CRASH", spec.env)
@@ -97,12 +103,16 @@ class UnsetEnvPreflight(unittest.TestCase):
             f"CLI_RELAY_{engine.upper()}_BIN": str(recording_cli(self.work, engine))
             for engine in ("claude", "codex")})
 
-    def test_each_billing_name_still_blocks_by_default_and_passes_with_explicit_cleanup(self):
+    def test_each_billing_name_is_isolated_for_codex_and_still_blocks_claude_without_cleanup(self):
         for engine in ("claude", "codex"):
             for name in engines.BILLING_ENV[engine]:
                 with self.subTest(engine=engine, name=name):
                     env = dict(self.env, **{name: CANARY})
                     blocked = engines.preflight(engine, env, cwd=str(self.work))
+                    if engine == "codex":
+                        self.assertTrue(blocked.ok)
+                        self.assertEqual(blocked.detail["billing_env_removed"], [name])
+                        continue
                     self.assertEqual((blocked.ok, blocked.reason), (False, "billing_env_present"))
                     self.assertEqual(blocked.detail["names"], [name])
                     fix = {"submit_flags": "--unset-env " + name, "env_prefix": "env -u " + name}
@@ -115,7 +125,7 @@ class UnsetEnvPreflight(unittest.TestCase):
                     self.assertEqual(env[name], CANARY)
 
     def test_names_keep_original_order_and_partial_cleanup_does_not_bypass_guard(self):
-        for engine in ("claude", "codex"):
+        for engine in ("claude",):
             names = list(engines.BILLING_ENV[engine])
             env = dict(self.env, **dict.fromkeys(reversed(names), CANARY))
             blocked = engines.preflight(engine, env)
@@ -215,7 +225,7 @@ class UnsetEnvRoundTrip(RelayTestCase):
                 self.assertNotIn(CANARY.encode(), path.read_bytes(), str(path))
 
     def test_billing_blocks_without_flag_and_event_and_doctor_include_copyable_fixes(self):
-        for engine in ("claude", "codex"):
+        for engine in ("claude",):
             names = list(engines.BILLING_ENV[engine])
             env = base_env(dict.fromkeys(names, CANARY))
             done = self.finish(self.cli(*self.args(engine, engine), env=env))
@@ -261,9 +271,9 @@ class UnsetEnvRoundTrip(RelayTestCase):
             self.assert_cleanup(done, NAMES, NAMES)
             checks = [json.loads(line) for line in observed.read_text().splitlines()]
             self.assertEqual(checks, [{**dict.fromkeys(NAMES, False), "kept": True, "scrubbed": True}] * 4)
-            # The same caller environment still blocks a different task without the opt-in.
-            blocked = self.finish(self.cli(*self.args("still-blocked-" + engine, engine), env=env))
-            self.assertEqual(blocked["task"]["state"], "blocked")
+            # Claude still needs explicit cleanup; Codex now isolates its own billing names.
+            default = self.finish(self.cli(*self.args("default-" + engine, engine), env=env))
+            self.assertEqual(default["task"]["state"], "succeeded" if engine == "codex" else "blocked")
 
 
 if __name__ == "__main__":

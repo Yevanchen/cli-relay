@@ -392,6 +392,14 @@ prefix truncated to 200 characters; the summary reports the prefix count and fir
 Git observations and these diagnostics never change the outcome. Without these observations, no
 empty warning list or non-Git placeholder is added.
 
+Codex event bodies and structured notification event entries carry `billing_mode` and
+`billing_env_policy` (`subscription_isolation` or `explicit_api`). After a keeper takes its
+environment snapshot, they also carry `billing_env_present`, `billing_env_removed` and
+`billing_env_preserved`, including names whose values were empty. These sorted lists distinguish
+observed absence from removal and explicit API preservation. Only names are recorded, never
+environment values. Snapshot fields are omitted if no keeper observed the environment; historical
+events are unchanged. See [Codex billing policy](usage.md#codex-billing-default-and-explicit-api-selection).
+
 Tasks submitted with `--unset-env NAME` carry `unset_env` in event bodies and structured
 notification event entries. `unset_env_present` lists the requested names observed before
 cleanup for that attempt, including empty values; it is omitted if the keeper never took a

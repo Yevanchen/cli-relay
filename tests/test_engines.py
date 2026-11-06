@@ -1,4 +1,4 @@
-"""Engine adapters: no permission relaxation, subscription-only auth, faithful result parsing."""
+"""Engine adapters: no permission relaxation, subscription auth by default, faithful parsing."""
 
 from __future__ import annotations
 
@@ -91,7 +91,9 @@ class ArgvSafety(unittest.TestCase):
         self.assertIn("env -u ANTHROPIC_API_KEY", pf.detail["message"])
         self.assertNotIn("sk-secret", json.dumps(pf.detail))
         pf = engines.preflight("codex", dict(self.env, OPENAI_API_KEY="sk-other"))
-        self.assertEqual((pf.ok, pf.reason), (False, "billing_env_present"))
+        self.assertTrue(pf.ok)
+        self.assertEqual(pf.detail["billing_env_removed"], ["OPENAI_API_KEY"])
+        self.assertNotIn("sk-other", json.dumps(pf.detail))
 
     def test_auth_must_be_the_subscription_login(self) -> None:
         self.assertTrue(engines.preflight("claude", self.env).ok)
