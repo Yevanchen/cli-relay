@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env, isolated_env, needs_clean_cli_config, wait_until
+from helpers import RelayTestCase, base_env, isolated_env, needs_clean_cli_config, wait_until, production_args
 from test_audit_03_provider_bypass import fake_claude, fake_codex
 
 from cli_relay import engines
@@ -68,7 +68,7 @@ class AnomalousConfigurationConvergesToBlocked(RelayTestCase):
         (codex_home / "config.toml").write_text("model_providers = 1\n")
         marker = self.tmp / "spawned"
         env = base_env({"CODEX_HOME": str(codex_home), "CLI_RELAY_CODEX_BIN": str(fake_codex(self.tmp, marker))})
-        sub = self.cli("submit", "--key", "k-ind06", "--engine", "codex", "--cwd", str(self.work), "--prompt", "hi",
+        sub = self.cli("submit", *production_args('codex'), "--key", "k-ind06", "--engine", "codex", "--cwd", str(self.work), "--prompt", "hi",
                        env=env)
         done = wait_until(lambda: (lambda s: s if s["task"]["state"] not in ("accepted", "running") else None)(
             self.status(sub["task_id"])), timeout=30, interval=0.5)

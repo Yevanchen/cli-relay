@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from . import business_status, engines
+from . import business_status, engines, policy
 from .errors import (
     AckMismatch,
     Conflict,
@@ -643,6 +643,7 @@ class Ledger:
                               (now, existing["task_id"]))
                 task_id = existing["task_id"]
             else:
+                policy.validate_new(payload)
                 if "after" in payload:
                     # Dependencies must predate this transaction: no forward/self edges or cycles.
                     dependency = c.execute("SELECT task_id FROM tasks WHERE scope=? AND task_id=?",
@@ -685,7 +686,8 @@ class Ledger:
             if task is None:
                 return False
             payload = json.loads(task["payload_json"])
-            state = "waiting" if "after" in payload or "queue" in payload else "claimed"
+            waiting, rejected = self._waiting_on(c, task)
+            state = "waiting" if "after" in payload or "queue" in payload or waiting or rejected else "claimed"
             cur = c.execute(
                 "UPDATE attempts SET state=?, keeper_pid=?, keeper_token=?, keeper_pgid=?, host=?, "
                 "claimed_at=?, updated_at=? WHERE attempt_id=? AND state='pending'",
@@ -698,7 +700,7 @@ class Ledger:
         return True
 
     # ------------------------------------------------------------------ dependency / queue admission
-    def _waiting_on(self, c: sqlite3.Connection, task: sqlite3.Row) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    def _gates(self, c: sqlite3.Connection, task: sqlite3.Row) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         payload = json.loads(task["payload_json"])
         waiting: Dict[str, Any] = {}
         rejected = None
@@ -708,13 +710,15 @@ class Ledger:
                 "ON a.task_id=t.task_id AND a.attempt_no=t.current_attempt WHERE t.task_id=?",
                 (payload["after"],)).fetchone()
             require = payload.get("after_require", "ok")
-            status = json.loads(dependency["evidence_json"] or "{}").get("business_status", "unreported")
+            business = json.loads(dependency["evidence_json"] or "{}")
+            status = business.get("business_status", "unreported")
             outcome = dependency["outcome"] or ("unknown" if dependency["state"] == "unknown" else None)
             details = {"dependency_task_id": payload["after"], "dependency_outcome": outcome,
                        "dependency_business_status": status, "require": require}
             terminal = dependency["state"] in ("finished", "unknown")
             satisfied = require == "any_terminal" or (
-                outcome == "succeeded" and (status == "ok" or (require == "ok_or_partial" and status == "partial")))
+                outcome == "succeeded" and not business.get("business_stop_reason") and
+                (status == "ok" or (require == "ok_or_partial" and status == "partial")))
             if terminal and not satisfied:
                 rejected = details
             if not terminal or not satisfied:
@@ -737,6 +741,47 @@ class Ledger:
                         ahead.append(row["task_id"])
             if ahead:
                 waiting["queue"] = {"name": payload["queue"], "position": len(ahead) + 1, "ahead_task_ids": ahead}
+        return waiting, rejected
+
+    def _waiting_on(self, c: sqlite3.Connection, task: sqlite3.Row) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        waiting, rejected = self._gates(c, task)
+        if waiting or rejected:
+            return waiting, rejected
+        # One SQLite write transaction serializes all engines/bots/scopes in this home.
+        # Unknown attempts keep their slot until process termination is proven. Never expire
+        # a lease by age: a paused keeper or an orphaned CLI may still own the machine.
+        rows = c.execute(
+            "SELECT t.*, a.state AS attempt_state, a.evidence_json, a.created_at AS attempt_created, "
+            "a.rowid AS attempt_order FROM tasks t JOIN attempts a ON a.task_id=t.task_id "
+            "WHERE a.state IN ('pending','waiting','claimed','running','unknown') "
+            "ORDER BY a.created_at, a.rowid").fetchall()
+        active = [r for r in rows if r['attempt_state'] in ('claimed', 'running') or
+                  (r['attempt_state'] == 'unknown' and
+                   not json.loads(r['evidence_json'] or '{}').get('processes_stopped'))]
+        used = len(active)
+        cu = sum(policy.uses_cu_budget(json.loads(r['payload_json'])) for r in active)
+        ahead = []
+        for row in rows:
+            if row['attempt_state'] not in ('pending', 'waiting'):
+                continue
+            gates, refusal = self._gates(c, row)
+            if gates or refusal:
+                continue  # a dependency wait does not reserve a slot
+            row_payload = json.loads(row['payload_json'])
+            is_cu = policy.uses_cu_budget(row_payload)
+            fits = used < policy.LOCAL_MAX_ACTIVE and (not is_cu or cu < policy.LOCAL_MAX_COMPUTER_USE)
+            if row['task_id'] == task['task_id']:
+                if not fits:
+                    waiting['capacity'] = {'max_active': policy.LOCAL_MAX_ACTIVE,
+                        'max_computer_use': policy.LOCAL_MAX_COMPUTER_USE,
+                        'active_task_ids': [r['task_id'] for r in active], 'ready_ahead_task_ids': ahead,
+                        'resource_class': row_payload.get('resource_class', 'standard' if row['engine'] == 'fixture' else 'unknown'),
+                        'computer_use_budget_reserved': is_cu, 'scope': 'relay_home'}
+                return waiting, rejected
+            if fits:
+                used += 1
+                cu += int(is_cu)
+                ahead.append(row['task_id'])
         return waiting, rejected
 
     def waiting_on(self, task_id: str) -> Dict[str, Any]:
@@ -853,7 +898,10 @@ class Ledger:
             observations.pop(key, None)
         warnings = [w for w in observations.pop("warnings", [])
                     if not w["code"].startswith("business_status_")]
-        business = business_status.evaluate(task["engine"], payload, outcome or "unknown", native)
+        warnings.extend(policy.warnings(task["engine"], payload))
+        frozen_business = observations.pop("terminal_business", None)
+        business = (dict(frozen_business) if kind == "terminal" and isinstance(frozen_business, dict) else
+                    business_status.evaluate(task["engine"], payload, outcome or "unknown", native))
         warnings.extend(business.pop("warnings", []))
         observations.update(business)
         if native and native.get("permission_denials"):
@@ -893,7 +941,8 @@ class Ledger:
         if "origin" in payload:
             details["origin"] = payload["origin"]
         if "result_file" in payload.get("options", {}):
-            details["result_file"] = business_status.result_file_details(payload)
+            frozen = observations.get("result_evidence", {})
+            details["result_file"] = {k: frozen[k] for k in ("path", "exists", "sha256", "validation") if k in frozen}
         if details["completion_marker_required"]:
             # The marker line sits at the end of the result, often past the excerpt: name it here.
             details["completion_marker"] = engines.completion_marker((native or {}).get("result"))

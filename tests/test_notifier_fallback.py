@@ -15,6 +15,20 @@ PAST = "2000-01-01T00:00:00.000Z"
 
 
 class FallbackReminders(DirectRouteCase):
+    def test_waiting_unknown_and_skipped_events_never_trigger_fallback(self):
+        self.configure()
+        for kind in ("waiting", "unknown", "terminal"):
+            task, event = self.finish(kind, route="bot")
+            with self.ledger.tx() as c:
+                c.execute("UPDATE events SET kind=? WHERE event_id=?", (kind, event))
+            notify.enqueue(self.ledger, notify.load_config(self.home))
+            with self.ledger.tx() as c:
+                c.execute("UPDATE notifications SET state=?, first_sent_at=? WHERE event_id=?",
+                          ("skipped" if kind == "terminal" else "failed", PAST, event))
+        with mock.patch.object(notify, "send") as send:
+            self.assertEqual(notify._send_fallbacks(self.ledger, notify.load_config(self.home), {}), [])
+        send.assert_not_called()
+        self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM notification_fallbacks").fetchone()[0], 0)
     def configure(self, *, fallback=True, max_wakes=1):
         for name in ("friday", "bot"):
             self.add(name)

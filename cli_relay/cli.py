@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import __version__, business_status, engines, notify, procs, routes
+from . import __version__, business_status, engines, notify, policy, procs, routes
 from .errors import NotFound, Refused, RelayError, UsageError
 from .keeper import _hook
 from .ledger import ACTIVE_STATES, AFTER_REQUIRE, SCHEDULING_FIELDS, Ledger, canonical_json, init_ledger
@@ -211,6 +211,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
             raw_options[field] = value
     options = engines.validate_options(engine, raw_options, cwd=cwd)
     payload = {"engine": engine, "cwd": cwd, "prompt": prompt, "options": options, **_parse_origin(args.origin)}
+    for field in ("task_class", "resource_class", "test_only_reason"):
+        value = getattr(args, field, None)
+        if value is not None:
+            payload[field] = value
     if args.after_require is not None and not args.after:
         raise UsageError("--after-require requires --after")
     if args.after and len(args.after) != 1:
@@ -270,7 +274,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             keeper = "kicked"
         task = ledger.get_task(task["task_id"])
         att = ledger.current_attempt(task["task_id"])
-    warnings = engines.bash_rule_warnings(engine, payload)
+    warnings = engines.bash_rule_warnings(engine, payload) + policy.warnings(engine, payload)
     emit({"ok": True, "accepted": True, "status": status, "task_id": task["task_id"], "state": task["state"],
           "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
           "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper,
@@ -402,17 +406,19 @@ def cmd_brief(args: argparse.Namespace) -> int:
                 continue
             task = ledger.get_task(row["task_id"])
             body = _loads(row["body_json"])
-            result_file = body.get("result_file") or business_status.result_file_details(json.loads(task["payload_json"]))
-            if result_file:
-                try:
-                    exists = Path(result_file["path"]).is_file()
-                except OSError:
-                    exists = False
-                result_file = {**result_file, "exists": exists}
+            result_file = body.get("result_file")  # terminal snapshot; never reread a reused path
+            if result_file is None:
+                payload = json.loads(task["payload_json"])
+                declared = payload.get("options", {}).get("result_file")
+                if declared:
+                    result_file = {"path": str(Path(task["cwd"]) / declared), "exists": None,
+                                   "validation": "historical_unverified"}
             outcome = body.get("outcome") or row["kind"]
             status = body.get("business_status", "unreported")
-            if status == "stopped_for_approval":
-                conclusion = "等待批准"
+            stop = body.get("business_stop_reason")
+            if stop or status == "stopped_for_approval":
+                conclusion = {"blocked": "业务受阻", "needs_user": "需要用户处理",
+                              "stopped_for_approval": "等待批准"}.get(stop, "等待批准")
             elif outcome != "succeeded":
                 conclusion = {"failed": "执行失败", "blocked": "执行受阻", "needs_input": "需要输入",
                               "unknown": "执行结果未知", "cancelled": "已取消"}.get(outcome, "执行结果未知")
@@ -424,10 +430,13 @@ def cmd_brief(args: argparse.Namespace) -> int:
             path = result_file["path"] if result_file else "无结果文件"
             path = "".join(ch if ch.isprintable() else f"\\u{ord(ch):04x}" for ch in path)
             message = (f"CLI_RELAY {source['source_id'] or 'local'} {short['task_last8']}/{short['event_last8']} "
-                       f"{notify._clean(task['request_key'], 256)}：{conclusion} | {path}")
+                       f"{notify._clean(task['request_key'], 256)}：{conclusion} | process={outcome} business={status} "
+                       f"stop_reason={stop} artifacts={body.get('artifact_verification', {}).get('state', 'unverified')} | {path}")
             events.append({**identity, **source, **short, "key": task["request_key"], "origin": body.get("origin"),
                            "route": owner.get("route"), "owner_chat": owner.get("chat"), "outcome": outcome,
                            "business_status": status, "business_status_source": body.get("business_status_source", "none"),
+                           **{key: body[key] for key in business_status.FIELDS if key in body},
+                           **({"effective_settings": body["effective_settings"]} if "effective_settings" in body else {}),
                            "warnings": body.get("warnings", []), "result_file": result_file, "message": message})
             refs.append({**identity, **source, "consumer": consumer})
         command = None
@@ -819,6 +828,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--after-require", choices=AFTER_REQUIRE,
                    help="dependency release condition (default: ok; requires --after)")
     s.add_argument("--queue", metavar="NAME", help="FIFO queue in this home and scope; one running task at a time")
+    s.add_argument("--task-class", choices=tuple(policy.TIERS), help="required for new production work; fixes engine/model/effort")
+    s.add_argument("--resource-class", choices=policy.RESOURCE_CLASSES, help="explicit standard or computer_use; shared home cap 2, CU cap 1")
+    s.add_argument("--test-only-reason", help="audited exemption reason; only engine=fixture can use this")
     s.set_defaults(func=cmd_submit)
 
     for name, func, helptext in (("status", cmd_status, "show a task (reconciles first)"),

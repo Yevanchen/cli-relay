@@ -78,7 +78,7 @@ fallback route. It must already exist, be proven and differ from the original ro
 its references are cleared. Neither command changes `default_route` or Friday's proof/identity.
 
 On the next notifier pass after an original notification has no owner ACK for
-`reminder.ack_timeout_s` (default 1800 seconds), one fallback reminder is attempted. It also
+`reminder.ack_timeout_s` (default 1800 seconds), one fallback reminder is attempted for unacked terminal events only; waiting/unknown informational events and skipped sends are excluded. It also
 triggers immediately in a pass that records the original notification as `failed`. Timeout age
 starts at the first send, so an original-route reminder does not delay the fallback. An original
 owner ACK before the fallback send suppresses it. Routes without a fallback behave as before.
@@ -309,7 +309,7 @@ Every new terminal/unknown event entry includes `business_status`, `business_sta
 `denials`, copied from the event without changing `outcome` or the five-field `status`. Optional
 `business_status_counts` contains integer counters from the final status line. Values and
 precedence follow the [business-status rules](usage.md#business-status): reports can be `ok`,
-`partial`, `stopped_for_approval`, `failed`, or `unreported`. Sources are `status_line`,
+`partial`, `failed`, or `unreported`, with a separate `business_stop_reason`. Sources are `status_line`,
 `result_file`, `outcome`, `denials`, or `none`. A succeeded Claude run with structured permission
 denials becomes business `partial` when its report is `ok` or absent; its process outcome remains
 `succeeded`. Denial counts count entries, including repeated tool names, with a unique tool list.
@@ -328,7 +328,9 @@ Tasks opting into `result_file` also add `result_file: {"path": "/absolute/task/
 resolved against the task cwd at closing, even for a missing file (`exists: false`). The summary
 includes it when there is room; `artifact` keeps its existing `cli-relay:<source>:<ledger>` form.
 No file contents are exported. Without the option, the new field is omitted and request hashes
-are unchanged. `brief` displays the path and refreshes existence with a filesystem metadata read.
+are unchanged. `brief` uses the frozen terminal-time observation. It never refreshes history from
+a reused path. New records also carry bounded `result_evidence` snapshots/hashes and artifact checks.
+See [result precedence and limits](migration-20261106.md#result-contract).
 
 Dependency-blocked terminal events and HTTP event entries also carry `reason_code`, `details`
 and a one-line `summary`, for example `dependency t-… business_status=partial outcome=succeeded
@@ -551,6 +553,8 @@ file alone do not prevent duplicate execution.
 - A Grok routine answers 200 when it starts a run. A run that fails afterwards (for example on the
   shared rate limit) is not retried by the platform. Here it shows up as a missing ACK and gets
   the bounded reminder.
-- DNS resolution is not covered by the HTTP timeout.
+- HTTP has a total worker deadline including DNS/TCP/TLS/request/response. Timing/phase evidence,
+  cleanup bounds, suspend uncertainty and command-adapter limits are described in the
+  [transport migration notes](migration-20261106.md#transport-and-operator-boundary).
 - Notifications follow the ledger of one machine. Two machines are two ledgers, two notifiers and
   two `source_id`s. Nothing is shared or merged between them.

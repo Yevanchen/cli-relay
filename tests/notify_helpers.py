@@ -117,6 +117,8 @@ class FakeHTTPReceiver:
 
         for cls in ("HTTPConnection", "HTTPSConnection"):
             self.stack.enter_context(mock.patch.object(notify.http.client, cls, side_effect=connection))
+        self.stack.enter_context(mock.patch.object(notify.transport, "run_http", side_effect=inline_http))
+        self.stack.enter_context(mock.patch.object(notify.socket, "getaddrinfo", return_value=[]))
         return self
 
     def __exit__(self, *args):
@@ -171,3 +173,11 @@ def write_config(home: Path, cfg: Dict[str, Any]) -> None:
                 "why": "visible_message_confirmed", "message_id": "synthetic-test-message"}):
             for name in clean["routes"]:
                 routes.verify(home, name, env={})
+
+
+def inline_http(adapter, payload, env):
+    """HTTP unit tests run the exchange inline; supervisor has separate fake-clock tests."""
+    from cli_relay import notify
+    phases = []
+    result = notify._http_exchange(adapter, payload, env, phases.append)
+    return {**result, "phase": phases[-1] if phases else "starting"}

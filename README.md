@@ -28,7 +28,7 @@ git clone https://github.com/Yevanchen/cli-relay && cd cli-relay
 pip install .            # or run in place: PYTHONPATH=. python3 -m cli_relay …
 cli-relay init           # ledger under $CLI_RELAY_HOME or ~/.cli-relay
 
-cli-relay submit --key fix-tests-42 --engine claude --cwd ~/code/app \
+cli-relay submit --key fix-tests-42 --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
   --prompt "Run the unit tests and summarise failures."
 
 cli-relay wait t-… --timeout 600    # a timeout only stops waiting; the task keeps running
@@ -42,7 +42,7 @@ With the notifier (v0.2):
 
 ```sh
 cli-relay migrate                   # upgrade an existing ledger; consistent backup first
-cli-relay submit --key k --engine claude --cwd ~/code/app --prompt "…" --notify-route bot
+cli-relay submit --key k --engine claude --cwd ~/code/app --prompt "…" --notify-route bot --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"'
 cli-relay notify run --interval 60  # periodic pass: retries, reminders, catch-up after a restart
 ```
 
@@ -65,10 +65,13 @@ the 30-minute ACK timeout, or its notification fails; it keeps the task's origin
 | Engine | Role |
 |---|---|
 | `claude` | Claude Code (`dontAsk`; tools follow your existing Claude settings) |
-| `codex` | Codex (`read-only` by default; `workspace-write` / full access only with explicit options) |
+| `codex` | Codex (explicit sandbox required for new production work) |
 | `fixture` | Local stand-in for tests |
 
-Model and effort can be set per task with `--option`. More engine options are documented in
+New production work requires explicit task/resource class and tier-matched model/effort.
+All scopes in one relay home share at most two active jobs and one computer-use job.
+See [migration notes](docs/migration-20261106.md); deployment and cross-machine coordination remain operator work.
+Model and effort are set per task with `--option`. More engine options are documented in
 [`docs/usage.md`](docs/usage.md#engines), and their guards in [`docs/reliability.md`](docs/reliability.md).
 
 Codex tasks default to subscription billing and remove inherited `OPENAI_API_KEY`, `CODEX_API_KEY`,
@@ -90,7 +93,7 @@ settings layer, including user/project defaults. Codex defaults to `read-only`.
 Claude can opt into Edit and Write within specific task subdirectories and Bash command prefixes:
 
 ```sh
-cli-relay submit --key reports --engine claude --cwd ~/code/app \
+cli-relay submit --key reports --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
   --prompt "Generate reports in out and run the Python checker." \
   --allow-write-dir './out/**' --allow-write-dir './reports' \
   --allow-bash python3 --allow-bash 'pip install --user'
@@ -118,7 +121,7 @@ symlinks changing after launch.
 Codex network access requires an explicit `workspace-write` sandbox:
 
 ```sh
-cli-relay submit --key network-tests --engine codex --cwd ~/code/app \
+cli-relay submit --key network-tests --engine codex --cwd ~/code/app --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' \
   --prompt "Run tests that bind localhost." \
   --option sandbox=workspace-write --network-access
 ```
@@ -157,7 +160,7 @@ The decision is recorded in attempt evidence and terminal events; sandbox defaul
 
 1. Submit with a key derived from the request. If the reply is lost, submit the same key again.
 2. Wait or poll `status`. A wait timeout is not a task failure.
-3. Read `events --consumer <you>`, deliver the result, then `ack`. `succeeded` means the CLI finished without an error. Check the separate [business status](docs/usage.md#business-status) (`ok`, `partial`, `stopped_for_approval`, `failed`, `unreported`) and denial count in status/events and notification summaries. Tasks can report a final `status=...` line or opt into `result_file=out/result.json`; `require_business_status=true` warns when no status is reported. The existing [completion marker](docs/usage.md#when-the-cli-finished-is-not-the-task-is-done-the-completion-marker) can still gate the process outcome.
+3. Read `events --consumer <you>`, deliver the result, then `ack`. `succeeded` means the CLI finished without an error. Check the separate [business status](docs/usage.md#business-status) (`ok`, `partial`, `failed`, `unreported`, with a separate stop reason) and denial count in status/events and notification summaries. Tasks can report a final `status=...` line or opt into `result_file=out/result.json`; `require_business_status=true` warns when no status is reported. The existing [completion marker](docs/usage.md#when-the-cli-finished-is-not-the-task-is-done-the-completion-marker) can still gate the process outcome.
 4. If the state is `unknown`, a human chooses `resume` or an explicit fresh re-run.
 
 A bot woken by its own route uses these four steps on the named Mac:

@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, wait_until
+from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, wait_until, production_args, production_options
 from test_terminal_observations import notification
 
 from cli_relay import engines, procs
@@ -190,7 +190,7 @@ class GitRepoCheckRoundTrip(RelayTestCase):
         self.env = base_env(isolated_env(self.tmp, {"CLI_RELAY_CODEX_BIN": str(fixture_codex(self.tmp))}))
 
     def submit_codex(self, key="job", options=None, prompt="do it", crash=False, expect=0):
-        args = ["submit", "--key", key, "--engine", "codex", "--cwd", str(self.work), "--prompt", prompt]
+        args = ["submit", *production_args('codex'), "--key", key, "--engine", "codex", "--cwd", str(self.work), "--prompt", prompt]
         for name, value in (options or {}).items():
             args += ["--option", f"{name}={json.dumps(value)}"]
         env = dict(self.env)
@@ -224,7 +224,7 @@ class GitRepoCheckRoundTrip(RelayTestCase):
         self.assertEqual(done["task"]["state"], "succeeded", done)
         self.assert_observations(done, "auto_skipped")
         stored = json.loads(db_rows(self.home, "SELECT payload_json FROM tasks")[0]["payload_json"])
-        expected = {"engine": "codex", "cwd": str(self.work.resolve()), "prompt": "do it", "options": {}}
+        expected = {"engine": "codex", "cwd": str(self.work.resolve()), "prompt": "do it", "options": production_options('codex'), "task_class": "complex", "resource_class": "standard"}
         self.assertEqual(stored, expected)
         self.assertEqual(sub["payload_sha256"], payload_hash(expected))
         again = self.submit_codex()

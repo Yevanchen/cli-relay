@@ -112,7 +112,7 @@ class AfterAndQueue(RelayTestCase):
                 dep = self.scheduled("dep-" + status, result="status=" + status if status != "unreported" else "done")
                 self.finish(dep)
                 sub = self.scheduled("after-" + status, after=dep["task_id"], require="ok_or_partial")
-                self.assert_blocked(sub, dep, status=status, require="ok_or_partial")
+                self.assert_blocked(sub, dep, status="partial" if status == "stopped_for_approval" else status, require="ok_or_partial")
 
     def test_cancelled_and_blocked_dependencies_never_pass_success_gate(self):
         dep = self.scheduled("pending", duration=20)
@@ -128,7 +128,7 @@ class AfterAndQueue(RelayTestCase):
                 self.cli("reconcile", waiting["task_id"])
             for require in ("ok", "ok_or_partial"):
                 sub = self.scheduled(outcome + require, after=waiting["task_id"], require=require)
-                self.assert_blocked(sub, waiting, status="failed", outcome=outcome, require=require)
+                self.assert_blocked(sub, waiting, status="partial" if outcome == "blocked" else "failed", outcome=outcome, require=require)
 
     def test_unknown_ref_and_self_reference_reject_without_creating_tasks(self):
         for ref in ("missing", "t-" + "0" * 32, "self"):

@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from helpers import RelayTestCase, base_env, isolated_env, needs_clean_cli_config, wait_until
+from helpers import RelayTestCase, base_env, isolated_env, needs_clean_cli_config, wait_until, production_args
 from test_audit_03_provider_bypass import fake_claude
 
 from cli_relay import engines, procs
@@ -67,8 +67,8 @@ class TaskLocalOptions(unittest.TestCase):
 
     def test_new_and_resumed_codex_pin_model_effort_without_widening_sandbox(self) -> None:
         for resume in (None, "22222222-2222-4222-8222-222222222222"):
-            args = self.build("codex", {"model": "gpt-6-astra", "effort": "max"}, resume).argv
-            self.assertEqual(args[args.index("-m") + 1], "gpt-6-astra")
+            args = self.build("codex", {"model": "gpt-6.1-sol", "effort": "max"}, resume).argv
+            self.assertEqual(args[args.index("-m") + 1], "gpt-6.1-sol")
             self.assertEqual(args[args.index("--sandbox") + 1], "read-only")
             configs = [args[i + 1] for i, arg in enumerate(args) if arg == "-c"]
             self.assertIn('model_reasoning_effort="max"', configs)
@@ -236,8 +236,8 @@ class TaskLocalConfigClosedLoop(RelayTestCase):
         return base_env(isolated_env(self.tmp, {f"CLI_RELAY_{engine.upper()}_BIN": str(fake)}))
 
     def submit_model(self, engine, env):
-        return self.cli("submit", "--key", "k-model-" + engine, "--engine", engine, "--cwd", str(self.work),
-                        "--prompt", "first", "--option", f'model="{"claude-opus-5-5" if engine == "claude" else "gpt-6-astra"}"',
+        return self.cli("submit", *production_args(engine), "--key", "k-model-" + engine, "--engine", engine, "--cwd", str(self.work),
+                        "--prompt", "first", "--option", f'model="{"claude-opus-5-5" if engine == "claude" else "gpt-6.1-sol"}"',
                         "--option", 'effort="max"', env=env)
 
     def test_claude_new_and_exact_resume_preserve_global_settings(self) -> None:
@@ -272,7 +272,7 @@ class TaskLocalConfigClosedLoop(RelayTestCase):
         self.assertIn("offset", done["attempts"][1]["evidence"]["codex_permission_checkpoint"])
         self.assertEqual(config.read_text(), saved)
         for args in map(json.loads, (self.tmp / "calls.jsonl").read_text().splitlines()):
-            self.assertEqual(args[args.index("-m") + 1], "gpt-6-astra")
+            self.assertEqual(args[args.index("-m") + 1], "gpt-6.1-sol")
             self.assertIn('model_reasoning_effort="max"', args)
 
     def test_different_runtime_mode_stays_blocked_after_keeper_crash(self) -> None:

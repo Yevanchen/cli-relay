@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import engines, git_state, procs
+from . import business_status, engines, git_state, procs
 from .errors import RelayError
 from .ledger import Ledger, atomic_write_text, canonical_json, now_iso
 from .spawn import spawn_notifier_pass
@@ -146,6 +146,9 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
             time.sleep(delay)
             delay = min(WAIT_POLL_MAX_S, delay * 2)
 
+    if cancel["set"] or ledger.cancel_requested(attempt_id):
+        close("cancelled", {"cancelled_before_start": True})
+        return 0
     git_before = git_state.snapshot(payload["cwd"])
     if git_before is not None:
         ledger.add_evidence(attempt_id, {"git_before": git_before})
@@ -341,10 +344,12 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
     # Persist the end snapshot with the exit, so reconciliation never substitutes later edits.
     git_result = git_state.completion(payload["cwd"], git_before)
     exit_info.update(git_result)
+    exit_info["terminal_business"] = business_status.evaluate(engine, payload, outcome, parsed["native"])
     atomic_write_text(run_dir / "exit.json", canonical_json(exit_info) + "\n")
     _hook("after_exit_before_commit")
 
-    evidence: Dict[str, Any] = {"exit_source": "keeper_waitpid", **decided, **git_result}
+    evidence: Dict[str, Any] = {"exit_source": "keeper_waitpid", **decided, **git_result,
+                               "terminal_business": exit_info["terminal_business"]}
     if parsed.get("warnings"):
         evidence["warnings"] = parsed["warnings"]
     if "process_group_cleanup" in exit_info or "remaining_after_normal_exit" in cleanup:

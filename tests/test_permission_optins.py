@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env, isolated_env, needs_clean_cli_config
+from helpers import RelayTestCase, base_env, isolated_env, needs_clean_cli_config, production_args
 from test_task_local_model_config import recording_cli
 from cli_relay import engines, notify
 from cli_relay.errors import UsageError
@@ -146,8 +146,8 @@ class ScopedPermissions(unittest.TestCase):
 class PermissionFlags(RelayTestCase):
     def test_claude_flags_json_and_resume_report_exact_rules(self):
         env = base_env(isolated_env(self.tmp, {"CLI_RELAY_CLAUDE_BIN": str(recording_cli(self.tmp, "claude"))}))
-        args = ["submit", "--key", "scoped", "--engine", "claude", "--cwd", str(self.work), "--prompt", "work",
-                "--option", "model=test-model"]
+        args = ["submit", *production_args('claude'), "--key", "scoped", "--engine", "claude", "--cwd", str(self.work), "--prompt", "work",
+                "--option", 'model="claude-opus-5-5"']
         sub = self.cli(*args, "--allow-write-dir", "./out/**", "--allow-write-dir", "reports",
                        "--allow-bash", "python3", "--allow-bash", "pip install --user", env=env)
         expected = ["Bash(pip install --user:*)", "Bash(python3:*)", "Edit(./out/**)", "Edit(./reports/**)",
@@ -184,7 +184,7 @@ class PermissionFlags(RelayTestCase):
 
     def test_network_flag_and_json_alias_are_the_same_payload(self):
         # No real CLI is launched: receipt validation and persistence precede preflight.
-        args = ["submit", "--key", "network", "--engine", "codex", "--cwd", str(self.work), "--prompt", "work",
+        args = ["submit", *production_args('codex'), "--key", "network", "--engine", "codex", "--cwd", str(self.work), "--prompt", "work",
                 "--option", "sandbox=workspace-write"]
         sub = self.cli(*args, "--network-access")
         self.assertEqual(sub["permissions"], "sandbox=workspace-write; network_access=true")

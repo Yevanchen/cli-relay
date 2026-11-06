@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from helpers import RelayTestCase, db_rows, side_effects
-from notify_helpers import http_config, write_config
+from notify_helpers import http_config, write_config, inline_http
 from cli_relay import cli, notify, routes
 from cli_relay.ledger import Ledger, canonical_json, init_ledger, now_iso, payload_hash
 
@@ -34,6 +34,11 @@ class RouteAndOriginTests(unittest.TestCase):
         self.ledger = Ledger(self.home)
         self.addCleanup(self.ledger.close)
         self.outputs, self.requests, self.behaviours, self.connections = [], [], [], []
+        for target, value in (("cli_relay.notify.transport.run_http", inline_http),
+                              ("cli_relay.notify.socket.getaddrinfo", lambda *a, **k: [])):
+            patcher = mock.patch(target, side_effect=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         for target, value in (("cli_relay.cli.spawn_keeper", None),
                                ("cli_relay.cli.spawn_notifier_pass", None),
                                ("cli_relay.cli.reconcile_task", [])):

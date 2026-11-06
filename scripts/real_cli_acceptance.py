@@ -173,9 +173,12 @@ def main() -> int:
         return 3
 
     if a.engine == "codex":
-        opts, ok_opts, fail_opts = ["--option", 'sandbox="read-only"'], [], ["--option", 'model="cli-relay-no-such-model"']
+        opts, ok_opts, fail_opts = ["--task-class", "complex", "--resource-class", "standard",
+            "--option", 'model="gpt-6.1-sol"', "--option", 'effort="max"',
+            "--option", 'sandbox="read-only"'], [], ["--option", 'model="cli-relay-no-such-model"']
     elif a.engine == "claude":
-        opts, ok_opts, fail_opts = [], [], ["--option", 'model="cli-relay-no-such-model"']
+        opts, ok_opts, fail_opts = ["--task-class", "highest_quality", "--resource-class", "standard",
+            "--option", 'model="claude-opus-5-5"', "--option", 'effort="max"'], [], ["--option", 'model="cli-relay-no-such-model"']
     else:
         opts, ok_opts, fail_opts = [], ["--option", f'result="{PHRASE}"'], ["--option", "exit_code=1"]
     preassigned = a.engine in ("claude", "fixture")
@@ -201,13 +204,19 @@ def main() -> int:
     t0 = time.monotonic()
     code, sub, cmd = relay(a.home, "submit", "--key", f"real-{a.engine}-fail-{stamp}", "--engine", a.engine,
                            "--cwd", str(a.workdir), "--prompt", "Reply with exactly: unused", *opts, *fail_opts)
-    _, done, _ = relay(a.home, "wait", sub["task_id"], "--timeout", "600")
-    att = done["attempts"][0]
-    failed_ok = done["task"]["state"] == "failed" and att["exit"]["known"] and att["exit"]["code"] not in (0, None)
-    step("failure_parsing", "PASS" if failed_ok else "FAIL", command=cmd, task_id=sub["task_id"],
-         state=done["task"]["state"], exit=att["exit"], native=att.get("native"),
-         seconds=round(time.monotonic() - t0, 1))
-    fail_task = sub["task_id"]
+    fail_task = None
+    if a.engine == "fixture":
+        _, done, _ = relay(a.home, "wait", sub["task_id"], "--timeout", "600")
+        att = done["attempts"][0]
+        failed_ok = done["task"]["state"] == "failed" and att["exit"]["known"] and att["exit"]["code"] not in (0, None)
+        step("failure_parsing", "PASS" if failed_ok else "FAIL", command=cmd, task_id=sub["task_id"],
+             state=done["task"]["state"], exit=att["exit"], native=att.get("native"),
+             seconds=round(time.monotonic() - t0, 1))
+        fail_task = sub["task_id"]
+    else:
+        # Production unknown models must be rejected before any paid CLI execution.
+        step("tier_validation", "PASS" if code == 2 and sub.get("error") == "usage" else "FAIL",
+             command=cmd, exit_code=code, seconds=round(time.monotonic() - t0, 1))
 
     t0 = time.monotonic()
     if a.sabotage_resume:
@@ -230,7 +239,7 @@ def main() -> int:
          thread_record=record, seconds=round(time.monotonic() - t0, 1))
 
     # Exactly one terminal event per attempt of this run; acknowledge those and nothing else.
-    expected = sorted([(ok_task, 1), (fail_task, 1), (ok_task, 2)])
+    expected = sorted([(ok_task, 1), (ok_task, 2)] + ([(fail_task, 1)] if fail_task else []))
     _, evs, cmd = relay(a.home, "events", "--consumer", CONSUMER)
     mine = [ev for ev in evs["events"] if ev["task_id"] in (ok_task, fail_task)]
     seen = sorted((ev["task_id"], ev["attempt_no"]) for ev in mine)

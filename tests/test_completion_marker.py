@@ -11,10 +11,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, wait_until
+from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, wait_until, production_args
 
 from notify_helpers import write_config
-from cli_relay import engines, notify, procs
+from cli_relay import policy, engines, notify, procs
 from cli_relay.errors import UsageError
 from cli_relay.ledger import payload_hash
 
@@ -109,9 +109,11 @@ class OutcomeGate(unittest.TestCase):
         self.assertEqual(engines.request_details("codex", {"options": {}}),
                          {"sandbox": "read-only", "full_access": False, "network_access": False,
                           "billing_mode": "subscription", "billing_env_policy": "subscription_isolation",
-                          "completion_marker_required": False, "permissions": "default minimal"})
+                          "completion_marker_required": False, "permissions": "default minimal",
+                          **policy.settings("codex", {}), "settings_warnings": policy.warnings("codex", {})})
         self.assertEqual(engines.request_details("claude", {"options": {}}),
-                         {"allowed_tools": [], "completion_marker_required": False, "permissions": "default minimal"})
+                         {"allowed_tools": [], "completion_marker_required": False, "permissions": "default minimal",
+                          **policy.settings("claude", {}), "settings_warnings": policy.warnings("claude", {})})
 
 
 class MarkerRoundTrip(RelayTestCase):
@@ -237,7 +239,7 @@ for event in ({"type": "thread.started", "thread_id": thread},
 class MarkerPerAttempt(RelayTestCase):
     def test_each_attempt_is_judged_by_its_own_final_message(self) -> None:
         env = base_env(isolated_env(self.tmp, {"CLI_RELAY_CODEX_BIN": str(echo_codex(self.tmp))}))
-        sub = self.cli("submit", "--key", "k-codex-marker", "--engine", "codex", "--cwd", str(self.work),
+        sub = self.cli("submit", *production_args('codex'), "--key", "k-codex-marker", "--engine", "codex", "--cwd", str(self.work),
                        "--prompt", f"Ran 203/235; 32 need localhost.\n{OPEN}", "--option", MARK, env=env)
         done = self.cli("wait", sub["task_id"], "--timeout", "30", env=env)
         self.assertEqual(done["task"]["state"], "needs_input", done)
