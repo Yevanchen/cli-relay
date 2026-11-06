@@ -279,6 +279,8 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
                                           "completion_marker_required", "completion_marker", "origin", "git", "warnings",
                                           "codex_git_repo_check", "after", "after_require", "queue",
                                           "reason_code", "details", "summary", "unset_env", "unset_env_present", "preflight",
+                                          "billing_mode", "billing_env_policy", "billing_env_present",
+                                          "billing_env_removed", "billing_env_preserved",
                                           "result_file",
                                           *business_status.FIELDS)
                if key in body},

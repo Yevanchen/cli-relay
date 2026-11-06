@@ -112,6 +112,10 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         names = payload["options"]["unset_env"]
         ledger.add_evidence(attempt_id, {"unset_env": names,
                                          "unset_env_present": [name for name in names if name in env]})
+    billing = engines.billing_env_evidence(engine, env, payload.get("options", {}))
+    if billing:
+        ledger.add_evidence(attempt_id, billing)
+        log("billing environment: " + canonical_json(billing))
     git_before = None
 
     def notify_pass() -> None:

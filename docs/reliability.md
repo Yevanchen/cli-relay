@@ -220,11 +220,20 @@ Permission posture does not depend on the CLIs' configuration of the moment:
     replacement or truncation of that file is unverified; reconciliation uses the same saved
     boundary, so an earlier safe turn cannot certify a later attempt.
 
-The relay refuses to run, or stops and closes as `blocked`, whatever it can see routing a run
-away from the subscription login. It checks:
+Subscription is the default. Codex removes its recognized billing variables from the child
+environment before preflight and spawn; only an explicit persisted `billing_mode=api` permits
+preserving them and accepting successful API-key authentication. The mode, policy and observed
+removed/preserved names are recorded without values. Missing stored mode means subscription on
+first run and resume, preserving legacy payload hashes. `--unset-env` always wins, including in
+API mode. Claude still blocks inherited billing variables. See
+[billing policy and compatibility](usage.md#codex-billing-default-and-explicit-api-selection).
+
+Outside this targeted Codex opt-out, the relay refuses to run, or stops and closes as `blocked`,
+whatever it can see routing a run away from the subscription login. It checks:
 
 1. **Before the CLI starts (keeper preflight; also `doctor --engine E --cwd D`):**
-   - billing or gateway variables in the environment (names only are reported);
+   - billing or gateway variables in the environment (Codex's default child cleanup runs first;
+     explicit Codex API mode preserves them; Claude blocks; names only are reported);
    - the CLI's configuration layers that apply to the task directory:
      - Codex: system, user (`$CODEX_HOME` or `~/.codex`), the active profile and the
        config-profile file it selects, every `.codex/config.toml` from `/` down to the task
@@ -240,7 +249,8 @@ away from the subscription login. It checks:
        non-claude.ai `forceLoginMethod`, or a billing variable in `env` blocks the run.
      - An unreadable layer or an invalid checked routing/permission value blocks. This is
        not a complete validator for every value accepted by the vendor configuration format.
-   - the login (`claude auth status` → claude.ai / firstParty; `codex login status` → ChatGPT).
+   - the login (`claude auth status` → claude.ai / firstParty; `codex login status` → ChatGPT,
+     or successful API-key authentication only for an explicit `billing_mode=api` task).
 2. **While it runs:** a Claude init event that reports an API-key source or a different permission mode
    stops the CLI.
 3. **After it ran:** the Codex thread's own record must name `openai`

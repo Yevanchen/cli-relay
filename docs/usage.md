@@ -217,6 +217,58 @@ verified, and it makes no new 25-hour reliability claim.
 
 ## Per-task environment cleanup
 
+### Codex billing default and explicit API selection
+
+Codex defaults to `billing_mode=subscription`. Before configuration/login preflight and process
+spawn, cli-relay removes every name in the existing `BILLING_ENV["codex"]` set from a copy of the
+task's child environment: `OPENAI_API_KEY`, `CODEX_API_KEY`, `OPENAI_BASE_URL` and
+`AZURE_OPENAI_API_KEY`. Empty values are removed too. Their inherited presence no longer causes
+`billing_env_present` for Codex. Unrelated variables and the relay/parent environment are preserved;
+existing session-marker and test-variable scrubbing still applies. This never selects API billing
+or changes credentials, configuration files, launchd or shell profiles. Claude defaults are unchanged.
+
+For a deliberately API-billed Codex task, select it explicitly at submission:
+
+```sh
+cli-relay submit --key intentional-api-1 --engine codex --cwd ~/code/app --prompt "Run the tests." \
+  --billing-mode api
+# Equivalent: --option billing_mode=api
+```
+
+This opt-out preserves inherited Codex billing variables, except names explicitly removed by
+`--unset-env`, and permits a successful `codex login status` reporting API-key authentication.
+It authorizes possible API charges; it does not configure a key or guarantee which billing route
+the CLI ultimately uses. A successful ChatGPT login is still accepted. Failed or unknown login,
+configuration-layer billing/provider overrides (including a configured API login method),
+requirements, permissions and the runtime `openai` provider/sandbox checks still block as before.
+This targeted opt-out does not enable arbitrary custom providers or alter Claude guards.
+No CLI flag or environment value can implicitly opt a task into API billing.
+
+`--billing-mode subscription` makes the default explicit. Both flag and JSON forms are Codex-only
+and accept only `subscription` or `api`; if both are supplied they must agree. The explicit choice
+is stored in `options.billing_mode` and participates in the payload hash. Changing it under an
+existing scope/key is a conflict; submit a new key instead. Resume has no billing override and
+reuses the saved choice on exact resume and explicit fresh rerun.
+
+Compatibility: an omitted stored mode means subscription, including old tasks. Omitting the new
+option adds no payload field and keeps existing payload hashes/idempotency behavior. No ledger
+migration is required. After upgrading, future attempts of old Codex tasks also use isolation;
+already-running children and historical evidence are unchanged. This is a documented default
+change for Codex only. Until the upgraded relay is deployed, dispatchers should continue to add
+`--unset-env OPENAI_BASE_URL` (and other reported names) to new tasks. It remains supported after
+upgrade. A bare `env -u` workaround applies only to that command invocation.
+
+Receipts, task views and terminal events report `billing_mode` and `billing_env_policy`
+(`subscription_isolation` or `explicit_api`) for Codex. Once a keeper observes an attempt,
+its evidence, keeper log, terminal event and structured notification also report
+`billing_env_present`, `billing_env_removed` and `billing_env_preserved`: sorted lists of Codex
+variable **names only**, including presence with empty values. Empty lists mean observed absence;
+missing snapshot fields mean the keeper never observed the environment. Each attempt takes a new
+snapshot, so resume may report different presence while keeping the same policy.
+`doctor --engine codex` reports the default subscription policy and its names-only snapshot without starting a task.
+
+### Explicit cleanup (`--unset-env`, unchanged)
+
 `submit --unset-env NAME` removes an inherited billing environment variable for that task only.
 Repeat the flag for more names:
 
@@ -247,15 +299,16 @@ are refused. The option only removes variables; it cannot set values or alter co
 Cleanup happens before the billing/configuration/login checks and in the CLI child environment
 on first runs, exact resumes and explicit fresh reruns. The stored list is reused; resume cannot
 change it. The relay's own environment, launchd, shell profiles and unrelated tasks are unchanged.
-Existing session-marker and test-variable scrubbing still applies. Variables not named in the
-list retain the existing behavior, and subscription/configuration guards still apply.
+Existing session-marker and test-variable scrubbing still applies. Codex also applies the billing
+policy above; an empty `unset_env=[]` does not disable subscription isolation. Explicit cleanup
+always wins over `billing_mode=api`. Subscription/configuration guards otherwise still apply.
 
-Without cleanup, `billing_env_present` keeps its reason code and `names` list. Its preflight
-details now also contain `fix.submit_flags` (for example `--unset-env OPENAI_BASE_URL`),
-`fix.env_prefix` (`env -u OPENAI_BASE_URL`) and a `message` containing both fixes. The prefix goes
+For Claude without cleanup, `billing_env_present` keeps its reason code and `names` list. Its preflight
+details also contain `fix.submit_flags` (for example `--unset-env ANTHROPIC_API_KEY`),
+`fix.env_prefix` (`env -u ANTHROPIC_API_KEY`) and a `message` containing both fixes. The prefix goes
 before `cli-relay`; flags go on `submit`. The `env -u` prefix applies only to that invocation;
-use `--unset-env` to retain cleanup for future resumes. `doctor --engine codex` /
-`--engine claude` shows the same hint when billing variables block it. Blocked terminal events
+use `--unset-env` to retain cleanup for future resumes. `doctor --engine claude` shows
+the same hint when billing variables block it. Blocked terminal events
 include these billing preflight details too.
 
 Submit/resume receipts, task records and terminal events include `unset_env` only when requested.
@@ -294,12 +347,14 @@ Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--yolo`
   [business status](#business-status), or let the task require the
   [completion marker](#when-the-cli-finished-is-not-the-task-is-done-the-completion-marker).
 - The keeper refuses a run (`blocked`) before the CLI starts if it finds any of these:
-  - API-key or gateway variables (only their names are reported);
+  - Claude API-key or gateway variables; Codex isolates its billing variables by default
+    (see [billing policy](#codex-billing-default-and-explicit-api-selection));
   - a configuration layer that applies to the task directory and routes away from the
     subscription (e.g. a Codex custom provider or base URL, a Claude `apiKeyHelper`);
   - a configuration layer it cannot read;
-  - a login that is not a subscription.
-- It also stops the run if the CLI itself reports an API-key source.
+  - a login that is not a subscription, except successful Codex API-key authentication with
+    the task's explicit `billing_mode=api` selection.
+- It also stops a Claude run if the CLI itself reports an API-key source.
 - After a Codex run, the thread's own record must name the built-in `openai` provider, and
   every turn must have run in the requested sandbox (or a narrower one), without network access
   unless the task opted in, and with no named permission profile. An exact resume also needs a new turn record after its saved pre-run file boundary; old history alone

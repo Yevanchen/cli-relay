@@ -225,11 +225,18 @@ task requires the completion marker (D15). The Codex sandbox is always explicit 
 default).
 
 Before spawning, the keeper refuses (`blocked`) when it sees:
-- API-key or gateway environment variables (names are reported, values never);
+- Claude API-key or gateway environment variables. Codex now isolates its recognized billing
+  variables by default before preflight and spawn; an explicit persisted `billing_mode=api`
+  preserves them, except `--unset-env` names (names are reported, values never);
 - a configuration layer that applies to the task directory and routes away from the
   subscription, or that cannot be read (layers and keys: [`reliability.md`](reliability.md));
 - a non-subscription login (`claude auth status` must report `claude.ai` /
-  `firstParty`; `codex login status` must report ChatGPT).
+  `firstParty`; `codex login status` must report ChatGPT, or successful API-key authentication
+  only with the task's explicit `billing_mode=api` selection).
+
+The Codex exception is task-local and persists on resume. Omitted mode means subscription,
+including legacy tasks, without changing their payload hashes. Configuration, runtime provider
+and permission checks remain in force. See [billing policy](usage.md#codex-billing-default-and-explicit-api-selection).
 
 A login check alone is not enough. A Codex custom provider can take its key from any
 environment variable while the ChatGPT login stays in place (audit #3).

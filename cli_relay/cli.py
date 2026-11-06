@@ -202,7 +202,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
             raise UsageError("--unset-env conflicts with --option unset_env")
         raw_options["unset_env"] = names
     for flag, field in (("allow_write_dir", "allowed_write_dirs"),
-                        ("allow_bash", "allowed_bash_commands"), ("network_access", "network_access")):
+                        ("allow_bash", "allowed_bash_commands"), ("network_access", "network_access"),
+                        ("billing_mode", "billing_mode")):
         value = getattr(args, flag, None)
         if value is not None:
             if field in raw_options and raw_options[field] != value:
@@ -809,6 +810,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Codex: enable network access; requires --option sandbox=workspace-write")
     s.add_argument("--unset-env", action="append", metavar="NAME",
                    help="remove a billing environment variable for this task, including resume (repeatable)")
+    s.add_argument("--billing-mode", choices=engines.CODEX_BILLING_MODES,
+                   help="Codex: subscription (default) isolates billing env; api explicitly permits API billing "
+                        "and preserves billing env except --unset-env; persisted for resume")
     s.add_argument("--notify-route", help="route in notifier.json that is woken when the task ends")
     s.add_argument("--origin", metavar='JSON', help='optional origin metadata: {"bot":"NAME","chat":"ID"}')
     s.add_argument("--after", action="append", metavar="REF", help="wait for one existing task id or key in this scope")

@@ -108,6 +108,7 @@ class OutcomeGate(unittest.TestCase):
                                   False)
         self.assertEqual(engines.request_details("codex", {"options": {}}),
                          {"sandbox": "read-only", "full_access": False, "network_access": False,
+                          "billing_mode": "subscription", "billing_env_policy": "subscription_isolation",
                           "completion_marker_required": False, "permissions": "default minimal"})
         self.assertEqual(engines.request_details("claude", {"options": {}}),
                          {"allowed_tools": [], "completion_marker_required": False, "permissions": "default minimal"})
