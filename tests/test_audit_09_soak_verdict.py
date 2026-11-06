@@ -14,6 +14,7 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from helpers import REPO, run_cli
 
@@ -110,6 +111,20 @@ class SoakVerdict(unittest.TestCase):
     def test_consistent_run_passes(self) -> None:
         summary = self.build(total_s=10.0, elapsed_s=12.0, long_ran_s=9.8, short_outcome="succeeded", short_effects=1)
         self.assertEqual(summary["verdict"], "PASS", summary["verdicts"])
+
+    def test_finish_waits_for_capacity_queued_tasks(self) -> None:
+        self.build(total_s=10.0, elapsed_s=12.0, long_ran_s=9.8, short_outcome="succeeded", short_effects=1)
+        short = self.ledger.conn.execute("SELECT task_id FROM tasks WHERE request_key='soak-short-0000'").fetchone()[0]
+        self.ledger.conn.execute("UPDATE tasks SET state='waiting' WHERE task_id=?", (short,))
+
+        def finish_queued_task(_delay):
+            self.ledger.conn.execute("UPDATE tasks SET state='succeeded' WHERE task_id=?", (short,))
+
+        soak = load_soak()
+        with patch.object(soak.time, "sleep", side_effect=finish_queued_task) as sleep:
+            soak.Soak(self.root, 10.0 / 3600.0).finish()
+        self.assertEqual(json.loads((self.root / "summary.json").read_text())["verdict"], "PASS")
+        sleep.assert_called_once()
 
     # Each fact on its own must be able to fail the verdict.
     def test_a_short_task_that_never_executed_fails(self) -> None:

@@ -68,6 +68,7 @@ class CrashWindows(RelayTestCase):
         ev = st["attempts"][0]["evidence"]
         self.assertTrue(ev["spawn_recorded"])
         self.assertFalse(ev["cli_pid_recorded"])
+        self.assertIs(ev.get("processes_stopped"), True, "reconciliation must persist its capacity-release proof")
         time.sleep(1.0)
         self.status(sub["task_id"])
         self.assertEqual(len(side_effects(self.effects)), 0, "unknown must not trigger a re-run")

@@ -25,6 +25,31 @@ jobs:
         run: python -m unittest discover -s tests -t tests -v
       - name: Scaled-down soak smoke (about two minutes; not the 25 h soak)
         run: |
+          soak_failure_context() {
+            local code=$?
+            if [ "$code" -ne 0 ]; then
+              echo "::group::Soak failure diagnostics"
+              for file in summary.json state.json; do
+                echo "--- $file ---"
+                if [ -f "$RUNNER_TEMP/soak/$file" ]; then
+                  cat "$RUNNER_TEMP/soak/$file" || true
+                else
+                  echo "Not written: $RUNNER_TEMP/soak/$file"
+                fi
+              done
+              for file in checkpoints.jsonl soak.log; do
+                if [ -f "$RUNNER_TEMP/soak/$file" ]; then
+                  echo "--- $file (last 80 lines) ---"
+                  tail -n 80 "$RUNNER_TEMP/soak/$file" || true
+                fi
+              done
+              find "$RUNNER_TEMP/soak/ledger/runs" -type f \( -name 'keeper*.log' -o -name stderr.log \) \
+                -print -exec tail -n 40 {} \; || true
+              echo "::endgroup::"
+            fi
+            exit "$code"
+          }
+          trap soak_failure_context EXIT
           python scripts/soak.py run --dir "$RUNNER_TEMP/soak" --hours 0.03
           python scripts/soak.py status --dir "$RUNNER_TEMP/soak"
           python -c "import json,sys; s=json.load(open(sys.argv[1])); sys.exit(0 if s['verdict']=='PASS' else 1)" "$RUNNER_TEMP/soak/summary.json"

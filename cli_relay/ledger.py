@@ -992,6 +992,8 @@ class Ledger:
             att = c.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
             if att is None or att["state"] not in from_states:
                 return None
+            # Admission needs durable proof before an unknown attempt can release its slot.
+            evidence = {**evidence, "processes_stopped": processes_stopped}
             if att["cancel_requested_at"] and processes_stopped:
                 # The caller decided from an earlier snapshot; a cancel committed since then is seen
                 # here. A run that stopped without a result after a cancel is `cancelled`.

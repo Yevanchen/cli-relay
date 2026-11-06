@@ -195,6 +195,27 @@ class SharedCapacity(unittest.TestCase):
         self.finish(one, evidence={'processes_stopped': True})
         self.assertEqual(restarted.admit_waiting(three['attempt_id'], keeper_pid=123), 'ready')
 
+    def test_stopped_unknown_releases_capacity_across_restart_and_explicit_rerun(self):
+        one, two, three = [self.submit(str(i)) for i in range(3)]
+        self.assertEqual(self.claim(one), 'claimed')
+        self.assertEqual(self.claim(two), 'claimed')
+        self.assertEqual(self.claim(three), 'waiting')
+        self.ledger.mark_unknown(one['attempt_id'], from_states=('claimed',),
+                                 evidence={'process_group_alive': False}, processes_stopped=True)
+        restarted = Ledger(self.home)
+        self.addCleanup(restarted.close)
+        proof = json.loads(restarted.get_attempt(one['attempt_id'])['evidence_json'])
+        self.assertIs(proof.get('processes_stopped'), True)
+        self.assertEqual(restarted.admit_waiting(three['attempt_id'], keeper_pid=123), 'ready')
+        self.assertEqual(len(restarted.attempts(one['task_id'])), 1, 'capacity release never reruns work')
+        rerun = restarted.new_attempt(one['task_id'], expect_attempt_no=1, reason='rerun',
+                                      prompt='explicit rerun', resume_session_id=None, native_session_id=None)
+        self.assertEqual(self.claim(rerun, restarted), 'waiting', 'the two active tasks still own both slots')
+        self.finish(two)
+        self.assertEqual(restarted.admit_waiting(rerun['attempt_id'], keeper_pid=123), 'ready')
+        self.assertEqual(restarted.conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE state IN ('claimed','running')").fetchone()[0], 2)
+
     def test_stops_never_release_ok_or_partial_dependency(self):
         dep = self.submit('dep', scope='s')
         self.ledger.finish(dep['attempt_id'], from_states=('pending',), outcome='succeeded', native={'result':'status=blocked'})
