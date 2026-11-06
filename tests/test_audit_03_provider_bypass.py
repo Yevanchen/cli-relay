@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env, needs_clean_cli_config
+from helpers import RelayTestCase, base_env, needs_clean_cli_config, production_args
 
 from cli_relay import engines
 
@@ -108,7 +108,7 @@ class ProviderGuardsAtRunTime(RelayTestCase):
 
     def run_codex(self, key: str, fake: Path) -> dict:
         env = base_env({"CODEX_HOME": str(self.codex_home), "CLI_RELAY_CODEX_BIN": str(fake)})
-        sub = self.cli("submit", "--key", key, "--engine", "codex", "--cwd", str(self.work), "--prompt", "hi",
+        sub = self.cli("submit", *production_args('codex'), "--key", key, "--engine", "codex", "--cwd", str(self.work), "--prompt", "hi",
                        env=env)
         return self.cli("wait", sub["task_id"], "--timeout", "30")
 

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env, needs_clean_cli_config
+from helpers import RelayTestCase, base_env, needs_clean_cli_config, production_args
 from cli_relay import engines
 
 THREAD = "22222222-3333-4444-8555-666666666666"
@@ -106,7 +106,7 @@ class CheckpointSurvivesKeeperCrash(RelayTestCase):
             "'{\"type\":\"turn.completed\",\"usage\":{}}'\n")
         fake.chmod(0o755)
         env = base_env({"CODEX_HOME": str(codex_home), "CLI_RELAY_CODEX_BIN": str(fake)})
-        sub = self.cli("submit", "--key", "checkpoint", "--engine", "codex", "--cwd", str(self.work),
+        sub = self.cli("submit", *production_args('codex'), "--key", "checkpoint", "--engine", "codex", "--cwd", str(self.work),
                        "--prompt", "hi", env=env)
         initial = self.cli("wait", sub["task_id"], "--timeout", "30")
         self.assertEqual(initial["task"]["state"], "succeeded")

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, wait_until
+from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, wait_until, production_args
 from test_task_local_model_config import recording_cli
 from test_terminal_observations import notification
 
@@ -151,7 +151,7 @@ class UnsetEnvPreflight(unittest.TestCase):
 
 class UnsetEnvRoundTrip(RelayTestCase):
     def args(self, key, engine="fixture"):
-        return ["submit", "--key", key, "--engine", engine, "--cwd", str(self.work), "--prompt", "do it"]
+        return ["submit", *production_args(engine), "--key", key, "--engine", engine, "--cwd", str(self.work), "--prompt", "do it"]
 
     def finish(self, sub, env=None):
         return self.cli("wait", sub["task_id"], "--timeout", "30", env=env)
@@ -262,7 +262,7 @@ class UnsetEnvRoundTrip(RelayTestCase):
             fake.write_text(script)
             env = base_env(isolated_env(self.tmp, {f"CLI_RELAY_{engine.upper()}_BIN": str(fake),
                 **dict.fromkeys(NAMES, CANARY), "RELAY_ENV_KEEP": "keep", "CLAUDECODE": "nested"}))
-            sub = self.cli(*self.args("clean-" + engine, engine), "--option", "model=test-model",
+            sub = self.cli(*self.args("clean-" + engine, engine),
                            "--option", "unset_env=" + json.dumps(NAMES), env=env)
             self.assertEqual(self.finish(sub)["task"]["state"], "succeeded")
             self.cli("resume", sub["task_id"], "--prompt", "continue", env=env)

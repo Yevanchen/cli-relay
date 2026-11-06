@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config
+from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, production_args, production_options
 from notify_helpers import write_config
 from cli_relay import engines, notify
 from cli_relay.errors import UsageError
@@ -183,7 +183,7 @@ class FullAccessRoundTrip(RelayTestCase):
         self.env = base_env(isolated_env(self.tmp, {"CLI_RELAY_CODEX_BIN": str(recording_codex(self.tmp))}))
 
     def submit_codex(self, key="full-access", options=None, env=None, expect=0):
-        args = ["submit", "--key", key, "--engine", "codex", "--cwd", str(self.work), "--prompt", "hi"]
+        args = ["submit", *production_args('codex'), "--key", key, "--engine", "codex", "--cwd", str(self.work), "--prompt", "hi"]
         for key, value in (OPT_IN if options is None else options).items():
             args += ["--option", f"{key}={json.dumps(value)}"]
         return self.cli(*args, env=env or self.env, expect=expect)
@@ -209,12 +209,12 @@ class FullAccessRoundTrip(RelayTestCase):
         self.assertEqual(done["task"]["state"], "succeeded", done)
         status = self.status(sub["task_id"])
         self.assert_choice(status["task"])
-        self.assertEqual(status["task"]["options"], OPT_IN)
+        self.assertEqual(status["task"]["options"], {**production_options('codex'), **OPT_IN})
         self.assert_choice(status["events"][0]["body"])
         events = self.cli("events", "--consumer", "bot")["events"]
         self.assert_choice(events[0]["body"])
         stored = json.loads(db_rows(self.home, "SELECT payload_json FROM tasks")[0]["payload_json"])
-        self.assertEqual(stored["options"], OPT_IN)
+        self.assertEqual(stored["options"], {**production_options('codex'), **OPT_IN})
         self.assertEqual(sub["payload_sha256"], payload_hash(stored))
         duplicate = self.submit_codex()
         self.assertEqual(duplicate["status"], "duplicate")
@@ -240,7 +240,7 @@ class FullAccessRoundTrip(RelayTestCase):
         self.assert_choice(sub, "read-only", False)
         done = self.cli("wait", sub["task_id"], "--timeout", "30")
         self.assertEqual(done["task"]["state"], "succeeded")
-        self.assertEqual(done["task"]["options"], {"allow_full_access": True})
+        self.assertEqual(done["task"]["options"], {**production_options('codex'), "allow_full_access": True})
         self.assert_choice(done["task"], "read-only", False)
         self.assert_choice(done["events"][0]["body"], "read-only", False)
         conflict = self.submit_codex(options={}, expect=3)

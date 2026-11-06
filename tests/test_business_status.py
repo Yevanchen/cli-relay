@@ -28,201 +28,151 @@ class BusinessReports(unittest.TestCase):
         return business_status.evaluate(engine, {"cwd": str(self.work), "options": options or {}}, outcome,
                                         {"ok": True, "result": text, "permission_denials": denials or []})
 
-    def test_status_aliases_share_one_importable_mapping(self):
-        for word, expected in (("ok", "ok"), ("done", "ok"), ("partial", "partial"),
-                               ("stopped_for_approval", "stopped_for_approval"),
-                               ("needs_approval", "stopped_for_approval"), ("failed", "failed"),
-                               ("fail", "failed"), ("surprise", "unreported"), ("未知", "unreported")):
+    def file(self, data, text=None, **kwargs):
+        self.result.write_text(json.dumps(data))
+        return self.evaluate(text, options={"result_file":"out/result.json"}, **kwargs)
+
+    def codes(self, report):
+        return [w["code"] for w in report.get("warnings", [])]
+
+    def test_status_aliases_and_raw_stops(self):
+        for word in ("ok","done","partial","failed","fail",*business_status.STOP_ALIASES):
             with self.subTest(word=word):
-                self.assertEqual(business_status.normalize_status(word), expected)
-                report = self.evaluate(f"TASK_DONE status={word}\n\n ")
-                self.assertEqual((report["business_status"], report["business_status_source"]),
-                                 (expected, "status_line"))
-                if expected == "unreported":
-                    self.assertEqual(report["warnings"], [{"code": "business_status_unknown", "source": "status_line"}])
-                else:
-                    self.assertNotIn("warnings", report)
+                r = self.file({"status":word}, "status=ok")
+                self.assertEqual(r['business_status'], business_status.normalize_status(word))
+                self.assertEqual(r['business_stop_reason'], business_status.STOP_ALIASES.get(word))
+                self.assertEqual(r['business_reports']['result_file']['raw_status'], word)
+        self.assertEqual(self.evaluate('status=mystery')['business_status'],'unreported')
 
-    def test_only_a_status_token_on_the_last_nonempty_line_counts(self):
-        for text in (None, "", " \n ", "本次失败", "The task failed (cgWindowNotFound).", "done",
-                     "Quoted: status=failed\nThe task finished.", "status=ok\nOne more thing.\n\n",
-                     "```\nTASK_DONE status=ok\n```", "not_status=ok", "status=failed-ish", "ok=1 fail=2"):
-            with self.subTest(text=text):
-                report = self.evaluate(text)
-                self.assertEqual((report["business_status"], report["business_status_source"]),
-                                 ("unreported", "none"))
-                self.assertNotIn("business_status_counts", report)
-        report = self.evaluate("status=failed\r\nTASK_DONE status=ok\r\n \r\n")
-        self.assertEqual(report["business_status"], "ok")
+    def test_only_exact_final_markers_and_legacy_tagged_markers_count(self):
+        for text in (None,'','finished successfully','Quoted: status=ok','status=ok and done',
+                     'status=ok\nMore prose','```\nstatus=ok\n```','not_status=ok','status=failed-ish'):
+            self.assertEqual(self.evaluate(text)['business_status'],'unreported',text)
+        r = self.evaluate('old\nWHAT_IS_DIFY_DONE status=partial ok=9 fail=4 skip=04\n\n')
+        self.assertEqual(r['business_status_counts'],{'ok':9,'fail':4,'skip':4})
+        self.assertEqual(r['business_status'],'partial')
 
-    def test_optional_counters_are_integers_from_the_status_line(self):
-        report = self.evaluate("earlier ok=200\nTASK_DONE status=partial ok=9 fail=4 skip=04\n")
-        self.assertEqual(report["business_status_counts"], {"ok": 9, "fail": 4, "skip": 4})
-        self.assertEqual(self.evaluate("status=ok ok=0")["business_status_counts"], {"ok": 0})
-        self.assertNotIn("business_status_counts", self.evaluate("status=ok ok=-1 fail=no skip=1.5"))
+    def test_canonical_stop_reason_never_promotes_ok(self):
+        for reason in ('blocked','needs_user','stopped_for_approval','login_required'):
+            r = self.file({'status':'ok','stop_reason':reason},'status=ok')
+            self.assertEqual(r['business_status'],'partial')
+            self.assertEqual(r['business_stop_reason'],business_status.STOP_ALIASES[reason])
+            self.assertEqual(r['business_reports']['result_file']['raw_stop_reason'],reason)
+        canonical = self.file({'status':'partial','stop_reason':'needs_user'},'status=partial')
+        self.assertEqual(canonical['business_stop_reason'],'needs_user')
+        self.assertNotIn('warnings', canonical)
 
-    def test_result_file_maps_status_and_ignores_other_contents(self):
-        for word, expected in (("done", "ok"), ("partial", "partial"), ("fail", "failed"),
-                               ("needs_approval", "stopped_for_approval"), ("mystery", "unreported")):
-            with self.subTest(word=word):
-                self.result.write_text(json.dumps({"status": word, "ok": 9, "detail": "not exported"}))
-                report = self.evaluate(options={"result_file": "out/result.json"})
-                self.assertEqual((report["business_status"], report["business_status_source"]), (expected, "result_file"))
-                self.assertNotIn("business_status_counts", report)
-                self.assertNotIn("not exported", json.dumps(report))
-                if expected == "unreported":
-                    self.assertEqual(report["warnings"], [{"code": "business_status_unknown", "source": "result_file"}])
+    def test_precedence_conflict_unknown_and_denials(self):
+        for a,b,want in [('ok','failed','failed'),('partial','ok','partial'),('blocked','done','partial')]:
+            r=self.file({'status':a},'status='+b)
+            self.assertEqual(r['business_status'],want)
+            self.assertIn('business_status_conflict',self.codes(r))
+        self.assertEqual(self.file({'status':'ok'},'status=done')['business_status_source'],'result_file')
+        for data,text in [({'status':'mystery'},'status=ok'),({'status':'ok'},'status=mystery'),
+                          ({'status':'ok','stop_reason':'maybe'},'status=ok')]:
+            self.assertEqual(self.file(data,text)['business_status'],'unreported')
+        r=self.file({'status':'done'},'status=ok',engine='claude',denials=['Bash','Read','Bash'])
+        self.assertEqual((r['business_status'],r['business_status_source']),('partial','denials'))
+        self.assertEqual(r['denials'],{'available':True,'count':3,'tools':['Bash','Read']})
 
-    def test_result_file_is_explicit_and_a_missing_file_reports_nothing(self):
-        report = self.evaluate(options={"result_file": "out/result.json"})
-        self.assertEqual(report["business_status"], "unreported")
-        self.assertNotIn("warnings", report)
-        self.result.write_text('{"status":"failed"}')
-        self.assertEqual(self.evaluate()["business_status"], "unreported")
+    def test_non_success_process_and_stop_semantics(self):
+        self.assertEqual(self.evaluate('status=ok',outcome='failed')['business_status'],'failed')
+        for outcome,reason in [('blocked','blocked'),('needs_input','needs_user')]:
+            r=self.evaluate('status=ok',outcome=outcome)
+            self.assertEqual((r['business_status'],r['business_stop_reason']),('partial',reason))
+        r=self.evaluate('status=stopped_for_approval',outcome='failed')
+        self.assertEqual((r['business_status'],r['business_stop_reason']),('partial','stopped_for_approval'))
+        self.assertFalse(self.evaluate()['denials']['available'])
 
-    def test_malformed_result_files_add_warnings_without_claiming_status(self):
-        for data, reason in ((b"{", "invalid_json"), (b"\xff", "invalid_json"), (b"[]", "invalid_status"),
-                             (b"{}", "invalid_status"), (b'{"status":1}', "invalid_status"),
-                             (b'{"status":null}', "invalid_status")):
-            with self.subTest(data=data):
-                self.result.write_bytes(data)
-                report = self.evaluate("status=ok", options={"result_file": "out/result.json"})
-                self.assertEqual(report["business_status"], "ok")
-                self.assertEqual(report["warnings"], [{"code": "business_status_result_file_invalid", "reason": reason}])
+    def test_missing_declared_file_cannot_be_overruled_by_ok_and_path_mismatch_is_not_read(self):
+        (self.work/'result.json').write_text('{"status":"done","summary":"DO_NOT_CAPTURE"}')
+        r=self.evaluate('The file is result.json.\nstatus=ok',options={'result_file':'out/result.json'})
+        self.assertEqual(r['business_status'],'unreported')
+        self.assertIn('business_status_result_path_mismatch',self.codes(r))
+        self.assertFalse(r['result_evidence']['exists'])
+        self.assertNotIn('DO_NOT_CAPTURE',json.dumps(r))
 
-    def test_result_file_size_and_read_errors_are_bounded_warnings(self):
-        self.result.write_bytes(b" " * (business_status.MAX_RESULT_FILE_BYTES + 1))
-        with patch.object(business_status.os, "open", wraps=business_status.os.open) as opened:
-            report = self.evaluate(options={"result_file": "out/result.json"})
-        self.assertEqual(report["warnings"][0]["reason"], "too_large")
-        self.assertTrue(opened.call_args.args[1] & business_status.os.O_NONBLOCK)
-        self.result.write_text('{"status":"done"}')
-        with patch.object(business_status.os, "open", side_effect=PermissionError):
-            report = self.evaluate(options={"result_file": "out/result.json"})
-        self.assertEqual(report["warnings"], [{"code": "business_status_result_file_invalid", "reason": "unreadable"}])
+    def test_malformed_duplicate_unknown_and_oversized_files_stay_visible(self):
+        for data in (b'not JSON',b'[]',b'{"status":1}',b'{"status":"done","status":"ok"}',
+                     b'\xff',b' '*(business_status.MAX_RESULT_FILE_BYTES+1)):
+            self.result.write_bytes(data)
+            r=self.evaluate('status=ok',options={'result_file':'out/result.json'})
+            self.assertEqual(r['business_status'],'unreported')
+            self.assertTrue(self.codes(r))
+        self.result.write_text('{"status":"ok"}')
+        with patch.object(business_status.os,'open',side_effect=PermissionError):
+            r=self.evaluate('status=ok',options={'result_file':'out/result.json'})
+        self.assertEqual(r['result_evidence']['validation'],'unreadable')
 
-    def test_conflicts_choose_the_more_severe_status_and_preserve_line_counters(self):
-        words = ("ok", "partial", "stopped_for_approval", "failed")
-        for i, line in enumerate(words):
-            for j, file in enumerate(words):
-                with self.subTest(line=line, file=file):
-                    self.result.write_text(json.dumps({"status": file}))
-                    report = self.evaluate(f"status={line} ok=1", options={"result_file": "out/result.json"})
-                    self.assertEqual(report["business_status"], words[max(i, j)])
-                    self.assertEqual(report["business_status_source"], "status_line" if i >= j else "result_file")
-                    self.assertEqual(report["business_status_counts"], {"ok": 1})
-                    self.assertEqual([w["code"] for w in report.get("warnings", [])],
-                                     ["business_status_conflict"] if i != j else [])
-        self.result.write_text('{"status":"done"}')
-        self.assertNotIn("warnings", self.evaluate("status=ok", options={"result_file": "out/result.json"}))
-        report = self.evaluate("status=mystery", options={"result_file": "out/result.json"})
-        self.assertEqual(report["business_status"], "ok", "a known report wins over an unknown word")
-        self.assertIn("business_status_conflict", [w["code"] for w in report["warnings"]])
+    def test_required_and_reported_artifacts_checked_separately_from_process(self):
+        r=self.file({'status':'done','required_artifacts':['report.md'],'artifacts':[]})
+        self.assertEqual((r['business_status'],r['artifact_verification']['state']),('partial','failed'))
+        (self.work/'report.md').write_text('fixture')
+        r=self.file({'status':'ok','required_artifacts':['report.md'],'artifacts':[str(self.work/'report.md')]})
+        self.assertEqual((r['business_status'],r['artifact_verification']['state']),('ok','passed'))
+        self.assertEqual(r['artifact_verification']['method'],'local_file_existence_only')
+        r=self.evaluate('status=ok',options={'required_artifacts':['missing.md']})
+        self.assertEqual((r['business_status'],r['artifact_verification']['state']),('partial','failed'))
+        for values in ('report.md',['../outside'],[str(self.work.parent/'outside')],[None]):
+            self.assertEqual(self.file({'status':'ok','required_artifacts':values})['artifact_verification']['state'],'failed')
 
-    def test_non_success_outcomes_are_failed_except_for_an_approval_report(self):
-        for outcome in ("failed", "blocked", "needs_input", "cancelled", "unknown"):
-            for text in (None, "status=ok", "status=partial", "status=failed", "status=mystery"):
-                with self.subTest(outcome=outcome, text=text):
-                    report = self.evaluate(text, outcome=outcome, engine="claude", denials=["Read"])
-                    self.assertEqual((report["business_status"], report["business_status_source"]), ("failed", "outcome"))
-            report = self.evaluate("status=needs_approval", outcome=outcome)
-            self.assertEqual((report["business_status"], report["business_status_source"]),
-                             ("stopped_for_approval", "status_line"))
-        self.result.write_text('{"status":"stopped_for_approval"}')
-        report = self.evaluate(outcome="failed", options={"result_file": "out/result.json"})
-        self.assertEqual((report["business_status"], report["business_status_source"]), ("stopped_for_approval", "result_file"))
-
-    def test_claude_denials_count_entries_and_downgrade_ok_or_no_status(self):
-        for text in (None, "status=ok", "status=done"):
-            with self.subTest(text=text):
-                report = self.evaluate(text, engine="claude", denials=["Bash", "Read", "Bash"])
-                self.assertEqual(report["denials"], {"count": 3, "tools": ["Bash", "Read"], "available": True})
-                self.assertEqual((report["business_status"], report["business_status_source"]), ("partial", "denials"))
-        for word in ("partial", "stopped_for_approval", "failed"):
-            report = self.evaluate(f"status={word}", engine="claude", denials=["Bash"])
-            self.assertEqual((report["business_status"], report["business_status_source"]), (word, "status_line"))
-
-    def test_codex_denials_are_unavailable_and_claude_zero_is_not_a_downgrade(self):
-        for engine in ("codex", "claude"):
-            report = self.evaluate(engine=engine)
-            self.assertEqual(report["business_status"], "unreported")
-            self.assertEqual(report["denials"], {"count": 0 if engine == "claude" else None,
-                                                "tools": [], "available": engine == "claude"})
-        report = business_status.evaluate("claude", {}, "blocked", None)
-        self.assertEqual(report["denials"], {"count": None, "tools": [], "available": False})
-
-    def test_claude_and_codex_use_their_own_final_result(self):
-        stdout = self.work / "stdout.jsonl"
-        stdout.write_text(json.dumps({"type": "result", "subtype": "success", "result": "status=ok",
-                                      "permission_denials": [{"tool_name": "Read"}, {"tool_name": "Read"}]}) + "\n")
-        native = engines.parse_output("claude", stdout)["native"]
-        report = business_status.evaluate("claude", {}, "succeeded", native)
-        self.assertEqual((report["business_status"], report["denials"]["count"]), ("partial", 2))
-        stdout.write_text("\n".join(json.dumps(e) for e in (
-            {"type": "item.completed", "item": {"type": "agent_message", "text": "status=failed"}},
-            {"type": "item.completed", "item": {"type": "agent_message", "text": "status=partial ok=9 fail=4 skip=4"}},
-            {"type": "turn.completed"})))
-        native = engines.parse_output("codex", stdout)["native"]
-        report = business_status.evaluate("codex", {}, "succeeded", native)
-        self.assertEqual(report["business_status"], "partial")
-        self.assertEqual(report["denials"], {"count": None, "tools": [], "available": False})
-        stdout.write_text('{"type":"turn.completed"}\n')
-        last_message = self.work / "last_message.txt"
-        last_message.write_text("status=stopped_for_approval")
-        native = engines.parse_output("codex", stdout, last_message)["native"]
-        self.assertEqual(business_status.evaluate("codex", {}, "succeeded", native)["business_status"], "stopped_for_approval")
-
-    def test_result_file_validation_and_option_types_on_every_engine(self):
-        for engine in engines.ENGINES:
-            self.assertEqual(engines.validate_options(engine, {}, cwd=str(self.work)), {})
-            self.assertEqual(engines.validate_options(engine, {"result_file": "./out/result.json",
-                                                               "require_business_status": True}, cwd=str(self.work)),
-                             {"result_file": "out/result.json", "require_business_status": True})
-            for value in ("true", 1, 0, None, [], {}):
-                with self.subTest(engine=engine, value=value), self.assertRaises(UsageError):
-                    engines.validate_options(engine, {"require_business_status": value})
-            for value in ("../result.json", "out/../result.json", str(self.result), ".", "", "out/*", "out\n", None, 1):
-                with self.subTest(engine=engine, value=value), self.assertRaises(UsageError):
-                    engines.validate_options(engine, {"result_file": value}, cwd=str(self.work))
-        with self.assertRaises(UsageError):
-            engines.validate_options("fixture", {"result_file": "out/result.json"})
-
-    def test_result_file_symlink_is_rechecked_after_launch(self):
-        outside = self.work.parent / "outside.json"
-        outside.write_text('{"status":"failed"}')
+    def test_symlinks_and_submit_validation(self):
+        outside=self.work.parent/'outside.json'
+        outside.write_text('{"status":"ok"}')
         self.result.symlink_to(outside)
-        with self.assertRaises(UsageError):
-            engines.validate_options("codex", {"result_file": "out/result.json"}, cwd=str(self.work))
-        report = self.evaluate("status=ok", options={"result_file": "out/result.json"})
-        self.assertEqual(report["business_status"], "ok")
-        self.assertEqual(report["warnings"], [{"code": "business_status_result_file_invalid", "reason": "unsafe_path"}])
+        r=self.evaluate('status=ok',options={'result_file':'out/result.json'})
+        self.assertEqual(r['business_status'],'unreported')
+        self.assertEqual(r['result_evidence']['validation'],'unsafe_path')
+        for path in ('../result.json','out/../result.json',str(self.result),'.','out/*',''):
+            with self.assertRaises(UsageError):
+                engines.validate_options('fixture',{'result_file':path},cwd=str(self.work))
 
-    def test_reporting_options_do_not_change_engine_argv_or_permission_evidence(self):
+    def test_nonregular_result_and_artifact_symlink_escape_do_not_count_as_output(self):
+        import os
+        os.mkfifo(self.result)
+        r=self.evaluate('status=ok',options={'result_file':'out/result.json'})
+        self.assertEqual(r['business_status'], 'unreported')
+        self.result.unlink()
+        outside=self.work.parent/'outside.md'
+        outside.write_text('do not read')
+        (self.work/'report.md').symlink_to(outside)
+        r=self.file({'status':'ok','required_artifacts':['report.md']})
+        self.assertEqual((r['business_status'],r['artifact_verification']['state']),('partial','failed'))
+
+    def test_snapshot_is_allowlisted_bounded_and_hashes_the_exact_file(self):
+        import hashlib
+        r=self.file({'status':'partial','stop_reason':'blocked','summary':'SYNTHETIC_SECRET',
+                     'extra':{'token':'SYNTHETIC_SECRET'}})
+        e=r['result_evidence']
+        self.assertEqual(e['sha256'],hashlib.sha256(self.result.read_bytes()).hexdigest())
+        self.assertEqual(e['snapshot'],{'status':'partial','stop_reason':'blocked'})
+        self.assertNotIn('SYNTHETIC_SECRET',json.dumps(r))
+
+    def test_finance_investigation_fixtures_do_not_infer_missing_reports(self):
+        for count in (12,13):
+            opts={} if count==12 else {'result_file':'out/result.json'}
+            if count==13:
+                (self.work/'result.json').write_text('{"status":"done"}')
+                (self.work/'report.md').write_text('archived fixture; content quality unverified')
+            r=self.evaluate('Report: root result.json',engine='claude',denials=['Bash']*count,options=opts)
+            self.assertEqual((r['business_status'],r['business_status_source']),('partial','denials'))
+            self.assertEqual(r['denials']['count'],count)
+            if count==13:
+                self.assertFalse(r['result_evidence']['exists'])
+                self.assertTrue((self.work/'report.md').exists())
+                self.assertIn('business_status_result_path_mismatch',self.codes(r))
+
+    def test_reporting_options_do_not_change_engine_argv_or_permissions(self):
         for engine in engines.ENGINES:
-            for resume in (None, "old-session"):
+            for resume in (None,'old-session'):
                 def build(options):
-                    return engines.build(engine, payload={"cwd": str(self.work), "options": options},
-                                         attempt={"native_session_id": "sid", "resume_session_id": resume, "attempt_id": "a-test"},
-                                         run_dir=self.work, fixture_state_dir=str(self.work),
-                                         env={"CLI_RELAY_CLAUDE_BIN": "/bin/echo", "CLI_RELAY_CODEX_BIN": "/bin/echo"})
-                before = build({})
-                after = build({"result_file": "out/result.json", "require_business_status": True})
-                self.assertEqual(after.argv, before.argv)
-                self.assertEqual(after.evidence, before.evidence)
-
-    def test_notifier_summary_keeps_business_status_for_every_event_in_a_batch(self):
-        refs = [{"event_id": f"e-{i}", "task_id": f"t-{i}", "attempt_no": 1, "outcome": "succeeded",
-                 "result_excerpt": "x" * 500, "business_status": "partial", "business_status_source": "status_line",
-                 "denials": {"count": None if i == 4 else i, "tools": [], "available": i != 4}}
-                for i in range(5)]
-        payload = notify.build_payload({"source_id": "test-host"},
-                                       {"name": "test", "chat": "test", "consumer": "test", "adapter": {"job": "test"}},
-                                       "test-ledger", refs, reminder=False)
-        self.assertEqual(payload["status"], "multiple")
-        for i in range(5):
-            count = "null" if i == 4 else str(i)
-            self.assertIn(f"t-{i}#1 business_status=partial denials={count}", payload["summary"])
-        self.assertEqual(payload["cli_relay"]["events"], refs)
+                    return engines.build(engine,payload={'cwd':str(self.work),'options':options},
+                        attempt={'native_session_id':'sid','resume_session_id':resume,'attempt_id':'a-test'},
+                        run_dir=self.work,fixture_state_dir=str(self.work),
+                        env={'CLI_RELAY_CLAUDE_BIN':'/bin/echo','CLI_RELAY_CODEX_BIN':'/bin/echo'})
+                before,after=build({}),build({'result_file':'out/result.json','required_artifacts':['r.md']})
+                self.assertEqual(before.argv,after.argv)
+                self.assertEqual(before.evidence,after.evidence)
 
 
 class BusinessStatusRoundTrip(RelayTestCase):
@@ -241,7 +191,7 @@ class BusinessStatusRoundTrip(RelayTestCase):
             self.assertEqual(record["denials"], {"count": 0, "tools": [], "available": True})
             if counts is not None:
                 self.assertEqual(record["business_status_counts"], counts)
-        self.assertIn(f"business_status={status} denials=0", delivered["summary"])
+        self.assertIn(f"business_status={status} stop_reason=", delivered["summary"])
 
     def test_status_and_notification_expose_business_failure_without_changing_success(self):
         _, done = self.finish("x" * 3000 + "\nTASK_DONE status=partial ok=9 fail=4 skip=4")
@@ -265,7 +215,7 @@ class BusinessStatusRoundTrip(RelayTestCase):
             _, done = self.finish("no report", key=f"file-{invalid}", options={"result_file": "result.json"})
             self.assertEqual(done["task"]["state"], "succeeded")
             self.assert_fields(done, "unreported", "none")
-            self.assertEqual(bool(done["attempts"][0]["evidence"].get("warnings")), invalid)
+            self.assertTrue(done["attempts"][0]["evidence"].get("warnings"))
 
     def test_require_business_status_warns_without_changing_outcome(self):
         _, done = self.finish("本次失败", options={"require_business_status": True})
@@ -276,7 +226,7 @@ class BusinessStatusRoundTrip(RelayTestCase):
     def test_failed_outcome_keeps_reported_approval_stop(self):
         _, done = self.finish("TASK_DONE status=stopped_for_approval ok=0 fail=0 skip=4", options={"exit_code": 1})
         self.assertEqual(done["task"]["state"], "failed")
-        self.assert_fields(done, "stopped_for_approval", "status_line", {"ok": 0, "fail": 0, "skip": 4})
+        self.assert_fields(done, "partial", "outcome", {"ok": 0, "fail": 0, "skip": 4})
 
     def test_result_file_can_report_business_status_alongside_the_exact_completion_marker(self):
         (self.work / "result.json").write_text('{"status":"partial"}')
@@ -292,9 +242,12 @@ class BusinessStatusRoundTrip(RelayTestCase):
                           env=base_env({"CLI_RELAY_TEST_CRASH": "after_exit_before_commit"}))
         wait_until(lambda: (lambda r: r["keeper_pid"] and procs.same_process_alive(
             r["keeper_pid"], r["keeper_token"]) is False)(self.attempt_row(sub["task_id"])))
+        # A later writer must not change the exit-time report recovered after the crash.
+        (self.work / "result.json").write_text('{"status":"ok"}')
         done = self.cli("wait", sub["task_id"], "--timeout", "30")
         self.assertEqual(done["events"][0]["body"]["source"], "reconcile")
         self.assert_fields(done, "partial", "result_file")
+        self.assertEqual(done["task"]["result_evidence"]["snapshot"]["status"], "partial")
 
     def test_paths_outside_cwd_are_rejected_at_submit_before_creating_tasks(self):
         outside = self.tmp / "outside"

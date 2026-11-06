@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config
+from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, production_args, production_options
 from test_audit_03_provider_bypass import fake_claude
 
 from notify_helpers import write_config
@@ -256,7 +256,7 @@ class AllowedToolsRoundTrip(RelayTestCase):
         self.settings = Path(self.env["CLAUDE_CONFIG_DIR"]) / "settings.json"
 
     def submit_claude(self, key="research", options=None, env=None, expect=0):
-        args = ["submit", "--key", key, "--engine", "claude", "--cwd", str(self.work), "--prompt", "look it up"]
+        args = ["submit", *production_args('claude'), "--key", key, "--engine", "claude", "--cwd", str(self.work), "--prompt", "look it up"]
         for name, value in (OPT_IN if options is None else options).items():
             args += ["--option", f"{name}={json.dumps(value)}"]
         return self.cli(*args, env=env or self.env, expect=expect)
@@ -274,7 +274,7 @@ class AllowedToolsRoundTrip(RelayTestCase):
         done = self.wait(sub["task_id"])
         self.assertEqual(done["task"]["state"], "needs_input", done)
         self.assertEqual(done["attempts"][0]["native"]["permission_denials"], ["WebSearch"])
-        self.assertEqual((done["task"]["allowed_tools"], done["task"]["options"]), ([], {}))
+        self.assertEqual((done["task"]["allowed_tools"], done["task"]["options"]), ([], production_options("claude")))
         self.assertEqual(done["events"][0]["body"]["allowed_tools"], [])
         (call,) = self.calls()
         self.assertFalse(set(call) & set(engines.CLAUDE_ALLOWED_TOOLS_FLAGS))
@@ -289,12 +289,12 @@ class AllowedToolsRoundTrip(RelayTestCase):
         self.assertEqual(done["task"]["state"], "succeeded", done)
         status = self.cli("status", sub["task_id"], env=self.env)
         self.assertEqual(status["task"]["allowed_tools"], TOOLS)
-        self.assertEqual(status["task"]["options"], {"allowed_tools": TOOLS})
+        self.assertEqual(status["task"]["options"], {**production_options('claude'), "allowed_tools": TOOLS})
         self.assertEqual(status["events"][0]["body"]["allowed_tools"], TOOLS)
         events = self.cli("events", "--consumer", "bot", env=self.env)["events"]
         self.assertEqual(events[0]["body"]["allowed_tools"], TOOLS)
         stored = json.loads(db_rows(self.home, "SELECT payload_json FROM tasks")[0]["payload_json"])
-        self.assertEqual(stored["options"], {"allowed_tools": TOOLS})
+        self.assertEqual(stored["options"], {**production_options('claude'), "allowed_tools": TOOLS})
         self.assertEqual(sub["payload_sha256"], payload_hash(stored))
         reordered = self.submit_claude(options={"allowed_tools": ["WebFetch", "WebSearch"]})
         self.assertEqual((reordered["status"], reordered["task_id"]), ("duplicate", sub["task_id"]))
@@ -303,7 +303,7 @@ class AllowedToolsRoundTrip(RelayTestCase):
         (call,) = self.calls()
         self.assertEqual(call[call.index("--allowedTools") + 1], "WebFetch,WebSearch")
         self.assertEqual(call[call.index("--permission-mode") + 1], "dontAsk")
-        self.assertNotIn("--settings", call)
+        self.assertEqual(json.loads(call[call.index("--settings")+1]), {"env": {engines.CLAUDE_EFFORT_ENV: "max"}})
         self.assertEqual(self.settings.read_text(), saved, "global settings are never changed")
 
         write_config(self.home, {"source_id": "test-host", "default_route": "bot",
@@ -367,7 +367,7 @@ class AllowedToolsRoundTrip(RelayTestCase):
         self.assertEqual(done["events"][0]["body"]["allowed_tools"], TOOLS, "requested permissions, not proof of use")
         (call,) = self.calls()
         self.assertEqual(call[call.index("--allowedTools") + 1], "WebFetch,WebSearch")
-        self.assertNotIn("--settings", call)
+        self.assertEqual(json.loads(call[call.index("--settings")+1]), {"env": {engines.CLAUDE_EFFORT_ENV: "max"}})
         self.assertEqual(self.settings.read_text(), saved)
 
     def test_doctor_reports_the_policy_and_this_machines_defaults_by_name_only(self) -> None:

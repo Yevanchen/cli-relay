@@ -208,7 +208,7 @@ class Soak:
         deadline = time.time() + max(120.0, self.total * 0.05)
         while time.time() < deadline:
             states = [r[0] for r in self.rows("SELECT state FROM tasks")]
-            if all(s not in ("accepted", "running") for s in states):
+            if all(s not in ("accepted", "waiting", "running") for s in states):
                 break
             relay(self.home, "reconcile")
             time.sleep(5)

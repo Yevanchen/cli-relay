@@ -160,3 +160,18 @@ class RelayTestCase(unittest.TestCase):
 
     def attempt_row(self, task_id: str, attempt_no: int = 1) -> sqlite3.Row:
         return db_rows(self.home, "SELECT * FROM attempts WHERE task_id=? AND attempt_no=?", (task_id, attempt_no))[0]
+
+
+def production_options(engine: str) -> Dict[str, Any]:
+    """Explicit §1.7 settings for deterministic fake CLIs; never an exemption."""
+    return {"model": "gpt-6.1-sol" if engine == "codex" else "claude-opus-5-5", "effort": "max",
+            **({"sandbox": "read-only"} if engine == "codex" else {})}
+
+
+def production_args(engine: str) -> List[str]:
+    if engine == "fixture":
+        return []
+    args = ["--task-class", "complex" if engine == "codex" else "highest_quality", "--resource-class", "standard"]
+    for key, value in production_options(engine).items():
+        args += ["--option", key + "=" + json.dumps(value)]
+    return args

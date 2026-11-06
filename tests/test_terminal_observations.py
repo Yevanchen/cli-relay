@@ -6,7 +6,7 @@ import json
 import subprocess
 import sys
 
-from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, wait_until
+from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, wait_until, production_args
 
 from cli_relay import git_state, notify, procs
 from cli_relay.ledger import payload_hash
@@ -163,7 +163,7 @@ class DenialObservations(RelayTestCase):
             extra["CLI_RELAY_TEST_CRASH"] = "after_exit_before_commit"
         env = base_env(isolated_env(self.tmp, extra))
         options = ["--option", "require_completion_marker=true"] if marker is not None else []
-        sub = self.cli("submit", "--key", f"denied-{ok}-{marker}-{crash}", "--engine", "claude",
+        sub = self.cli("submit", *production_args('claude'), "--key", f"denied-{ok}-{marker}-{crash}", "--engine", "claude",
                        "--cwd", str(self.work), "--prompt", "do it", *options, env=env)
         return self.cli("wait", sub["task_id"], "--timeout", "30", env=env)
 
@@ -180,7 +180,7 @@ class DenialObservations(RelayTestCase):
         for record in (done["task"], done["attempts"][0], done["attempts"][0]["evidence"],
                        done["events"][0]["body"], payload["cli_relay"]["events"][0]):
             self.assertEqual(record["denials"], {"count": 2, "tools": ["Monitor"], "available": True})
-            self.assertEqual(record["business_status"], "partial" if outcome == "succeeded" else "failed")
+            self.assertEqual(record["business_status"], "partial" if outcome in ("succeeded", "needs_input", "blocked") else "failed")
             self.assertEqual(record["business_status_source"], "denials" if outcome == "succeeded" else "outcome")
         self.assertIn("denials=2", payload["summary"])
         self.assertNotIn("not exported", json.dumps(done))

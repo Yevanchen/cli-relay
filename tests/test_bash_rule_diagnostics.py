@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, wait_until
+from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, wait_until, production_args, production_options
 from test_terminal_observations import notification
 
 from cli_relay import engines, procs
@@ -107,7 +107,7 @@ class BashDiagnosticsRoundTrip(RelayTestCase):
         if crash:
             extra["CLI_RELAY_TEST_CRASH"] = "after_exit_before_commit"
         env = base_env(isolated_env(self.tmp, extra))
-        sub = self.cli("submit", "--key", f"bash-{ok}-{crash}", "--engine", "claude", "--cwd", str(self.work),
+        sub = self.cli("submit", *production_args('claude'), "--key", f"bash-{ok}-{crash}", "--engine", "claude", "--cwd", str(self.work),
                        "--prompt", "work", "--option", "allowed_bash_commands=" + json.dumps(commands), env=env)
         return sub, env
 
@@ -127,7 +127,7 @@ class BashDiagnosticsRoundTrip(RelayTestCase):
         self.assertEqual(done["task"]["state"], "succeeded")
         self.assertNotIn("warnings", done["events"][0]["body"])
         expected = {"engine": "claude", "cwd": str(self.work.resolve()), "prompt": "work",
-                    "options": {"allowed_bash_commands": sorted(commands)}}
+                    "options": {**production_options('claude'), "allowed_bash_commands": sorted(commands)}, "task_class": "highest_quality", "resource_class": "standard"}
         stored = json.loads(db_rows(self.home, "SELECT payload_json FROM tasks")[0]["payload_json"])
         self.assertEqual(stored, expected)
         self.assertEqual(sub["payload_sha256"], payload_hash(expected))
@@ -140,7 +140,8 @@ class BashDiagnosticsRoundTrip(RelayTestCase):
         sub, env = self.submit_claude(commands)
         self.assertNotIn("warnings", sub)
         self.assertEqual(sub["payload_sha256"], payload_hash({"engine": "claude", "cwd": str(self.work.resolve()),
-                         "prompt": "work", "options": {"allowed_bash_commands": commands}}))
+                         "prompt": "work", "task_class":"highest_quality", "resource_class":"standard",
+                         "options": {**production_options("claude"), "allowed_bash_commands": commands}}))
         self.assertEqual(self.finish(sub, env)["task"]["state"], "succeeded")
 
     def assert_diagnostics(self, done, outcome):

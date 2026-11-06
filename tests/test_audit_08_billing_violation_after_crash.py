@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from helpers import RelayTestCase, base_env, needs_clean_cli_config, wait_until
+from helpers import RelayTestCase, base_env, needs_clean_cli_config, wait_until, production_args
 from test_audit_03_provider_bypass import fake_codex
 
 from cli_relay import procs
@@ -46,7 +46,7 @@ class BillingViolationSurvivesKeeperCrash(RelayTestCase):
         fake = fake_codex(self.tmp, self.tmp / "spawned", rollout_provider="team")
         env = base_env({"CODEX_HOME": str(codex_home), "CLI_RELAY_CODEX_BIN": str(fake),
                         "CLI_RELAY_TEST_CRASH": "after_exit_before_commit"})
-        sub = self.cli("submit", "--key", "k-a08-codex", "--engine", "codex", "--cwd", str(self.work),
+        sub = self.cli("submit", *production_args('codex'), "--key", "k-a08-codex", "--engine", "codex", "--cwd", str(self.work),
                        "--prompt", "hi", env=env)
         wait_until(lambda: self.keeper_dead(sub["task_id"]))
         done = self.finished(sub["task_id"])

@@ -84,7 +84,9 @@ class BriefAndAck(DirectRouteCase):
             self.assertIn(key, ev)
         self.assertEqual((ev["task_last8"], ev["event_last8"]), (a[0]["task_id"][-8:], a[1][-8:]))
         self.assertEqual(ev["origin"], origin)
-        self.assertEqual(ev["result_file"], {"path": str(result.resolve()), "exists": True})
+        self.assertEqual(ev["result_file"]["path"], str(result.resolve()))
+        self.assertTrue(ev["result_file"]["exists"])
+        self.assertEqual(len(ev["result_file"]["sha256"]), 64)
         self.assertIn("部分完成", ev["message"])
         self.assertIn(str(result.resolve()), ev["message"])
         self.assertEqual(len(ev["message"].splitlines()), 1)
@@ -120,13 +122,13 @@ class BriefAndAck(DirectRouteCase):
         self.assertEqual(len(self.command("brief", "--consumer", "a", "--task", a[0]["task_id"])["events"]), 1)
         self.assertEqual(self.command("brief", "--consumer", "unrelated")["events"], [])
 
-    def test_brief_preserves_existing_delivery_count_and_refreshes_file_existence(self):
+    def test_brief_preserves_existing_delivery_count_and_terminal_file_evidence(self):
         task, event = self.finish(options={"result_file": "later.json"})
         before = self.command("events", "--consumer", "reader", "--no-reconcile")["events"][0]["delivery_count"]
         brief = self.command("brief", "--consumer", "reader")
         self.assertFalse(brief["events"][0]["result_file"]["exists"])
         (self.work / "later.json").write_text('{"status":"ok"}')
-        self.assertTrue(self.command("brief", "--consumer", "reader")["events"][0]["result_file"]["exists"])
+        self.assertFalse(self.command("brief", "--consumer", "reader")["events"][0]["result_file"]["exists"])
         self.assertEqual(self.ledger.conn.execute("SELECT count FROM deliveries").fetchone()[0], before)
         self.assertEqual(self.ledger.conn.execute("SELECT COUNT(*) FROM acks").fetchone()[0], 0)
 
@@ -140,11 +142,31 @@ class BriefAndAck(DirectRouteCase):
             task, event = self.finish(str(exists), route="bot", options={"result_file": path.name})
             expected = {"path": str(path.resolve()), "exists": exists}
             body = json.loads(self.ledger.events_of_task(task["task_id"])[0]["body_json"])
-            self.assertEqual(body["result_file"], expected)
+            self.assertEqual({k: body["result_file"][k] for k in expected}, expected)
             with FakeHTTPReceiver() as receiver:
                 self.command("notify", "flush")
-            self.assertEqual(receiver.requests[0]["cli_relay"]["events"][0]["result_file"], expected)
-            self.assertIn(str(path.resolve()), receiver.requests[0]["summary"])
+            received = receiver.requests[0]["cli_relay"]["events"][0]["result_file"]
+            self.assertEqual({k: received[k] for k in expected}, expected)
+
+    def test_reused_result_path_cannot_rewrite_attempt_snapshot_or_brief(self):
+        path = self.work / "result.json"
+        path.write_text('{"status":"partial","stop_reason":"needs_user"}')
+        task, event = self.finish("snapshots", options={"result_file":"result.json"})
+        first = self.command("brief", "--consumer", "reader")["events"][0]
+        frozen = first["result_evidence"]
+        path.write_text('{"status":"ok"}')
+        new = self.ledger.new_attempt(task["task_id"], expect_attempt_no=1, reason="fixture",
+                                      prompt="fixture", resume_session_id=None, native_session_id=None)
+        self.ledger.finish(new["attempt_id"], from_states=("pending",), outcome="succeeded", native={"result":"status=ok"})
+        briefs = self.command("brief", "--consumer", "reader")["events"]
+        old = next(e for e in briefs if e["event_id"] == event)
+        second = next(e for e in briefs if e["event_id"] != event)
+        self.assertEqual(old["result_evidence"], frozen)
+        self.assertEqual(old["business_stop_reason"], "needs_user")
+        self.assertNotEqual(second["result_evidence"]["sha256"], frozen["sha256"])
+        self.assertEqual(second["business_status"], "ok")
+        path.unlink()
+        self.assertEqual(self.command("brief", "--consumer", "reader")["events"], briefs)
 
     def test_without_result_file_payload_hash_and_terminal_shape_stay_compatible(self):
         task, event = self.finish()

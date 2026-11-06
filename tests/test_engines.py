@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env, isolated_env, needs_clean_cli_config, side_effects
+from helpers import RelayTestCase, base_env, isolated_env, needs_clean_cli_config, side_effects, production_args
 
 from cli_relay import engines
 from cli_relay.errors import UsageError
@@ -182,7 +182,7 @@ class ProcessGuards(RelayTestCase):
         marker = self.tmp / "spawned"
         fake = _fake_cli(self.tmp, "claude", '{"loggedIn": true, "authMethod": "claude.ai"}', marker)
         env = base_env({"CLI_RELAY_CLAUDE_BIN": str(fake), "ANTHROPIC_API_KEY": "sk-never-print-me"})
-        sub = self.cli("submit", "--key", "k-billing", "--engine", "claude", "--cwd", str(self.work),
+        sub = self.cli("submit", *production_args('claude'), "--key", "k-billing", "--engine", "claude", "--cwd", str(self.work),
                        "--prompt", "hello", env=env)
         done = self.cli("wait", sub["task_id"], "--timeout", "30")
         self.assertEqual(done["task"]["state"], "blocked")

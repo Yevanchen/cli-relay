@@ -35,6 +35,7 @@ import json
 import os
 import re
 import socket
+import ssl
 import subprocess
 import threading
 import time
@@ -45,7 +46,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from . import business_status, engines, procs
+from . import business_status, engines, procs, transport
 from .errors import Refused, UsageError
 from .keeper import _hook
 from .ledger import Ledger, canonical_json, iso_age_seconds, now_iso
@@ -281,7 +282,7 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
                                           "reason_code", "details", "summary", "unset_env", "unset_env_present", "preflight",
                                           "billing_mode", "billing_env_policy", "billing_env_present",
                                           "billing_env_removed", "billing_env_preserved",
-                                          "result_file",
+                                          "result_file", "effective_settings",
                                           *business_status.FIELDS)
                if key in body},
             "result_excerpt": _clean(body.get("result_excerpt"), EXCERPT_MAX)}
@@ -326,6 +327,7 @@ def build_payload(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, re
     # Business status, like permissions, must survive excerpt/header truncation for every run.
     business = " | ".join(
         f"{r['task_id']}#{r['attempt_no']} business_status={r['business_status']} "
+        f"stop_reason={r.get('business_stop_reason')} artifacts={r.get('artifact_verification', {}).get('state', 'unverified')} "
         f"denials={json.dumps(r.get('denials', {}).get('count'))}"
         for r in refs if "business_status" in r)
     reasons = " | ".join(f"{r['task_id']}#{r['attempt_no']} {_clean(r['summary'], 300)}"
@@ -384,6 +386,12 @@ def send_command(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str
 
 
 def send_http(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str, str]) -> Dict[str, Any]:
+    return transport.run_http(adapter, payload, env)
+
+
+def _http_exchange(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str, str],
+                   phase) -> Dict[str, Any]:
+    phase("credentials")
     url, token = _secret(adapter, "url", env), _secret(adapter, "token", env)
     if not url or not token:
         return {"outcome": "permanent", "why": "credentials_unavailable"}
@@ -403,16 +411,48 @@ def send_http(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str, s
     path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
     try:
         try:
+            phase("dns")
+            addresses = socket.getaddrinfo(parts.hostname, port or (443 if parts.scheme == "https" else 80),
+                                           0, socket.SOCK_STREAM)
+
+            def connect_resolved(address, timeout, source_address=None):
+                last_error = None
+                for family, kind, proto, _, sockaddr in addresses:
+                    sock = socket.socket(family, kind, proto)
+                    try:
+                        phase("tcp")
+                        sock.settimeout(timeout)
+                        if source_address:
+                            sock.bind(source_address)
+                        sock.connect(sockaddr)
+                        if parts.scheme == "https":
+                            phase("tls")
+                        return sock
+                    except OSError as exc:
+                        last_error = exc
+                        sock.close()
+                if last_error is not None:
+                    raise last_error
+                raise OSError("no_addresses")
+
+            conn._create_connection = connect_resolved
             conn.connect()
         except (OSError, http.client.HTTPException) as exc:
-            return {"outcome": "retry", "why": "connect_failed", "error": type(exc).__name__}  # never sent
+            error_phase = "dns" if isinstance(exc, socket.gaierror) else "tls" if isinstance(exc, ssl.SSLError) else None
+            if error_phase:
+                phase(error_phase)
+            return {"outcome": "retry", "why": "connect_failed", "error": type(exc).__name__}
         try:
+            phase("request")
             conn.request("POST", path, body=body, headers={"Content-Type": "application/json",
                                                            "Authorization": f"Bearer {token}"})
+            phase("response_headers")
             resp = conn.getresponse()
             status = resp.status
             retry_after = resp.getheader("Retry-After")
+            phase("response_body")
             response_body = resp.read(65536)
+            phase("complete")
         except (OSError, http.client.HTTPException) as exc:
             # The request may have reached the receiver (which may already have started a run).
             return {"outcome": "ambiguous", "why": "response_lost", "error": type(exc).__name__}
@@ -485,13 +525,17 @@ def _retry_after(value: Optional[str]) -> Optional[float]:
 
 
 def send(adapter: Dict[str, Any], payload: Dict[str, Any], env: Dict[str, str]) -> Dict[str, Any]:
+    start_wall, start_mono = time.time(), time.monotonic()
     try:
         if adapter["type"] == "command":
-            return send_command(adapter, payload, env)
-        return send_http(adapter, payload, env)
+            result = {**send_command(adapter, payload, env), "phase": "command"}
+        else:
+            result = send_http(adapter, payload, env)
     except Exception as exc:
         # Third-party exception text can contain the URL or Authorization header.
-        return {"outcome": "ambiguous", "why": "adapter_error", "error": type(exc).__name__}
+        result = {"outcome": "ambiguous", "why": "adapter_error", "error": type(exc).__name__, "phase": "adapter"}
+    result.setdefault("timing", transport.timing(start_wall, start_mono, adapter["timeout_s"]))
+    return result
 
 
 # ------------------------------------------------------------------------------- the pass
@@ -716,7 +760,7 @@ def _claim_fallbacks(ledger: Ledger, cfg: Dict[str, Any], original: str,
                 "t.notify_consumer AS original_consumer, t.notify_chat AS original_chat "
                 "FROM notifications n JOIN events e ON e.event_id=n.event_id JOIN tasks t ON t.task_id=e.task_id "
                 "LEFT JOIN notification_fallbacks f ON f.event_id=n.event_id AND f.original_route=n.route "
-                "WHERE n.route=? AND t.notify_bound=1 AND t.notify_consumer IS NOT NULL "
+                "WHERE n.route=? AND e.kind='terminal' AND t.notify_bound=1 AND t.notify_consumer IS NOT NULL "
                 "AND n.state NOT IN ('acked','skipped','claimed','sending') "
                 "AND (n.state='failed' OR (n.first_sent_at IS NOT NULL AND n.first_sent_at <= ?)) "
                 "AND (f.event_id IS NULL OR f.state='pending') "

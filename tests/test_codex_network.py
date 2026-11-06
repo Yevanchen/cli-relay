@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config
+from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, production_args, production_options
 from test_ind_02_codex_permissions import fake_codex as fixed_turn_codex
 
 from notify_helpers import write_config
@@ -275,7 +275,7 @@ class NetworkRoundTrip(RelayTestCase):
         self.env = base_env(isolated_env(self.tmp, {"CLI_RELAY_CODEX_BIN": str(network_codex(self.tmp))}))
 
     def submit_codex(self, key="tests", options=None, env=None, expect=0):
-        args = ["submit", "--key", key, "--engine", "codex", "--cwd", str(self.work), "--prompt",
+        args = ["submit", *production_args('codex'), "--key", key, "--engine", "codex", "--cwd", str(self.work), "--prompt",
                 "Run the full test suite and report the result."]
         for name, value in (OPT_IN if options is None else options).items():
             args += ["--option", f"{name}={json.dumps(value)}"]
@@ -306,12 +306,12 @@ class NetworkRoundTrip(RelayTestCase):
         self.assertEqual(done["task"]["state"], "succeeded", done)
         status = self.cli("status", sub["task_id"], env=self.env)
         self.assertEqual((status["task"]["sandbox"], status["task"]["network_access"]), (WW, True))
-        self.assertEqual(status["task"]["options"], OPT_IN)
+        self.assertEqual(status["task"]["options"], {**production_options('codex'), **OPT_IN})
         self.assertIs(status["events"][0]["body"]["network_access"], True)
         events = self.cli("events", "--consumer", "bot", env=self.env)["events"]
         self.assertIs(events[0]["body"]["network_access"], True)
         stored = json.loads(db_rows(self.home, "SELECT payload_json FROM tasks")[0]["payload_json"])
-        self.assertEqual(stored["options"], OPT_IN)
+        self.assertEqual(stored["options"], {**production_options('codex'), **OPT_IN})
         self.assertEqual(sub["payload_sha256"], payload_hash(stored))
         duplicate = self.submit_codex()
         self.assertEqual((duplicate["status"], duplicate["task_id"]), ("duplicate", sub["task_id"]))
@@ -385,7 +385,7 @@ class NetworkRoundTrip(RelayTestCase):
         new, again = self.calls()
         self.assertEqual(network_settings(new), [ON])
         self.assertEqual(again[:4], ["exec", "--sandbox", WW, "resume"])
-        self.assertEqual(config_overrides(again), [f'sandbox_mode="{WW}"', ON])
+        self.assertEqual(config_overrides(again), [f'sandbox_mode="{WW}"', ON, 'model_reasoning_effort="max"'])
         self.assertEqual(again[-2:], [thread, "-"])
 
     def test_a_recorded_turn_with_network_but_no_opt_in_is_blocked(self) -> None:

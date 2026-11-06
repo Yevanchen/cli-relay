@@ -245,3 +245,16 @@ remains a deployment check, as does a real task that ends with the completion ma
   transport notification is implemented, but actual chat delivery still requires the deployment checks above.
 - Behaviour across real machine sleep, power loss, reboot or a full disk.
 - That every possible CLI configuration is recognised by the subscription check.
+
+## 2026-11-06 source change regression coverage
+
+The new suites `test_production_policy.py` and `test_delivery_deadline.py` use temporary ledgers,
+mock provider/transport calls and fake clocks. Business/brief/fallback regressions cover legacy
+stop aliases, malformed/missing files, declared artifacts, Finance path-mismatch evidence,
+per-attempt snapshots, response-loss ambiguity, and terminal-only fallback ownership.
+Fake-provider integration tests now submit explicit production tiers; they make no paid calls.
+See [migration boundaries](migration-20261106.md). This section records test scope, not deployed
+acceptance. Existing PASS rows above describe their original acceptance evidence. Real provider
+model availability, receiver routines, real chat/ACK latency, live Mac capacity and cross-machine
+coordination need Friday's separate rollout review. No production smoke or Finance/egolite rerun
+is part of this source change.

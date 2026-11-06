@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config
+from helpers import RelayTestCase, base_env, db_rows, isolated_env, needs_clean_cli_config, production_args, production_options
 from test_task_local_model_config import recording_cli
 from test_terminal_observations import notification
 
@@ -206,7 +206,7 @@ class CodexBillingRoundTrip(RelayTestCase):
             **dict.fromkeys(NAMES, CANARY), "RELAY_ENV_KEEP": "keep", "CLAUDECODE": "nested"}))
 
     def submit_codex(self, key, env, *flags):
-        return self.cli("submit", "--key", key, "--engine", "codex", "--cwd", str(self.work),
+        return self.cli("submit", *production_args('codex'), "--key", key, "--engine", "codex", "--cwd", str(self.work),
                         "--prompt", "synthetic task", *flags, env=env)
 
     def finish(self, sub):
@@ -229,17 +229,17 @@ class CodexBillingRoundTrip(RelayTestCase):
     def observations(self):
         return [json.loads(line) for line in (self.tmp / "observed.jsonl").read_text().splitlines()]
 
-    def test_legacy_default_hash_is_preserved_and_first_resume_fresh_are_isolated(self):
+    def test_explicit_tier_billing_hash_and_first_resume_fresh_are_isolated(self):
         env = self.fake_env()
         env["OPENAI_API_KEY"] = ""  # presence, including empty values, is observable
         original = dict(env)
         sub = self.submit_codex("default", env)
-        expected = {"engine": "codex", "cwd": str(self.work.resolve()), "prompt": "synthetic task", "options": {}}
+        expected = {"engine": "codex", "cwd": str(self.work.resolve()), "prompt": "synthetic task", "options": production_options('codex'), "task_class": "complex", "resource_class": "standard"}
         self.assertEqual(sub["payload_sha256"], payload_hash(expected))
         self.assertEqual(sub["billing_mode"], "subscription")
         done = self.finish(sub)
         self.assertEqual(done["task"]["state"], "succeeded")
-        self.assertEqual(done["task"]["options"], {})
+        self.assertEqual(done["task"]["options"], production_options('codex'))
         self.assert_snapshot(done, "subscription", NAMES, NAMES, [])
         resumed = self.cli("resume", sub["task_id"], "--prompt", "continue", env=env)
         self.assertEqual(resumed["billing_mode"], "subscription")
@@ -260,7 +260,7 @@ class CodexBillingRoundTrip(RelayTestCase):
         env = self.fake_env(api_auth=True)
         sub = self.submit_codex("api", env, "--billing-mode", "api", "--unset-env", "OPENAI_BASE_URL")
         stored = json.loads(db_rows(self.home, "SELECT payload_json FROM tasks WHERE task_id=?", (sub["task_id"],))[0][0])
-        self.assertEqual(stored["options"], {"billing_mode": "api", "unset_env": ["OPENAI_BASE_URL"]})
+        self.assertEqual(stored["options"], {**production_options('codex'), "billing_mode": "api", "unset_env": ["OPENAI_BASE_URL"]})
         self.assertEqual(sub["payload_sha256"], payload_hash(stored))
         preserved = sorted(set(NAMES) - {"OPENAI_BASE_URL"})
         done = self.finish(sub)
@@ -276,14 +276,14 @@ class CodexBillingRoundTrip(RelayTestCase):
         duplicate = self.submit_codex("api", env, "--option", "billing_mode=api",
                                       "--option", 'unset_env=["OPENAI_BASE_URL"]')
         self.assertEqual((duplicate["status"], duplicate["payload_sha256"]), ("duplicate", sub["payload_sha256"]))
-        self.cli("submit", "--key", "api", "--engine", "codex", "--cwd", str(self.work),
+        self.cli("submit", *production_args('codex'), "--key", "api", "--engine", "codex", "--cwd", str(self.work),
                  "--prompt", "synthetic task", env=env, expect=3)
 
     def test_invalid_or_conflicting_selection_is_refused_before_creating_a_task(self):
-        args = ["submit", "--key", "invalid", "--engine", "codex", "--cwd", str(self.work), "--prompt", "work"]
+        args = ["submit", *production_args('codex'), "--key", "invalid", "--engine", "codex", "--cwd", str(self.work), "--prompt", "work"]
         self.cli(*args, "--billing-mode", "api", "--option", "billing_mode=subscription", expect=2)
         for engine in ("claude", "fixture"):
-            self.cli("submit", "--key", "invalid", "--engine", engine, "--cwd", str(self.work),
+            self.cli("submit", *production_args(engine), "--key", "invalid", "--engine", engine, "--cwd", str(self.work),
                      "--prompt", "work", "--billing-mode", "api", expect=2)
         self.assertEqual(db_rows(self.home, "SELECT task_id FROM tasks"), [])
 

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from . import business_status, git_state
+from . import business_status, git_state, policy
 from .errors import UsageError
 
 ENGINES = ("claude", "codex", "fixture")
@@ -61,7 +61,7 @@ _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
                 "descendant_s": (int, float), "descendant_pid_file": (str,), "require_completion_marker": (bool,)},
 }
 for _spec in _OPTION_TYPES.values():
-    _spec.update({"result_file": (str,), "require_business_status": (bool,)})
+    _spec.update({"result_file": (str,), "require_business_status": (bool,), "required_artifacts": (list,)})
 
 CODEX_SANDBOXES = ("read-only", "workspace-write")
 CODEX_FULL_ACCESS = "danger-full-access"
@@ -252,6 +252,10 @@ def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str]
             raise UsageError(f"{key} must be an absolute path")
     if "result_file" in clean:
         clean["result_file"] = business_status.validate_result_file(clean["result_file"], cwd)
+    if "required_artifacts" in clean:
+        if cwd is None:
+            raise UsageError("required_artifacts requires a task cwd")
+        business_status.artifact_paths(clean["required_artifacts"], cwd)
     return clean
 
 
@@ -760,7 +764,10 @@ def request_details(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     needs the completion marker."""
     details = permission_details(engine, payload)
     options = payload.get("options") or {}
+    settings_warnings = policy.warnings(engine, payload)
     return {**details, "permissions": permission_summary(details),
+            **policy.settings(engine, payload),
+            **({"settings_warnings": settings_warnings} if settings_warnings else {}),
             "completion_marker_required": completion_marker_required(payload),
             **billing_policy(engine, options),
             **({"unset_env": options["unset_env"]} if "unset_env" in options else {})}

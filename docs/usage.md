@@ -11,11 +11,11 @@ pip install .            # or run in place: PYTHONPATH=. python3 -m cli_relay ..
 cli-relay init           # ledger in $CLI_RELAY_HOME or ~/.cli-relay
 
 # submit under an idempotency key; the CLI runs detached from this shell
-cli-relay submit --key fix-tests-42 --engine claude --cwd ~/code/app \
+cli-relay submit --key fix-tests-42 --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
   --prompt "Run the unit tests and summarise failures."
 # {"accepted": true, "status": "created", "task_id": "t-…", "native_session_id": "…", "state": "accepted", …}
 
-cli-relay submit --key fix-tests-42 --engine claude --cwd ~/code/app \
+cli-relay submit --key fix-tests-42 --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
   --prompt "Run the unit tests and summarise failures."     # same key + payload: same task
 # {"status": "duplicate", "task_id": "t-…", "submit_count": 2, …}
 
@@ -29,7 +29,7 @@ cli-relay cancel t-…
 
 # v0.2: wake a consumer when tasks end (configuration in <home>/notifier.json, see docs/notifier.md)
 cli-relay migrate                  # once per existing v0.1 ledger: backup, then add the notifier tables
-cli-relay submit --key k --engine claude --cwd ~/code/app --prompt "…" --notify-route bot
+cli-relay submit --key k --engine claude --cwd ~/code/app --prompt "…" --notify-route bot --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"'
 cli-relay notify run --interval 60 # periodic pass (retries, reminders, catch-up after a restart)
 cli-relay notify status            # per event: transport state and consumer ACK
 ```
@@ -60,7 +60,7 @@ an existing key's payload is still a conflict, so cycles cannot be introduced.
 | Value | Release condition once the dependency is terminal |
 |---|---|
 | `ok` (default) | outcome `succeeded` **and** business status `ok` |
-| `ok_or_partial` | outcome `succeeded` **and** business status `ok` or `partial` |
+| `ok_or_partial` | outcome `succeeded` **and** business status `ok` or `partial`, with no business stop reason |
 | `any_terminal` | any terminal outcome, including `failed`, `cancelled`, `blocked`, `needs_input` and `unknown` |
 
 The check uses the dependency's current attempt at admission, and reads the business-status
@@ -83,9 +83,9 @@ For example, submit the English task immediately after the Chinese task, without
 poller. The Chinese task must explicitly report business completion:
 
 ```sh
-cli-relay submit --scope friday --key what-is-dify-zh-10 --engine claude --cwd ~/code/dify \
-  --prompt 'Write the Chinese article. End with status=ok only if fully complete; otherwise report status=partial or status=stopped_for_approval.'
-cli-relay submit --scope friday --key what-is-dify-en-04 --engine claude --cwd ~/code/dify \
+cli-relay submit --scope friday --key what-is-dify-zh-10 --engine claude --cwd ~/code/dify --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
+  --prompt 'Write the Chinese article. End with status=ok only if fully complete; otherwise report status=partial with a separate stop_reason where needed.'
+cli-relay submit --scope friday --key what-is-dify-en-04 --engine claude --cwd ~/code/dify --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
   --after what-is-dify-zh-10 --queue articles \
   --prompt 'Write the English article from the completed Chinese article.'
 # A succeeded Chinese run reporting status=partial blocks the English task by default.
@@ -96,7 +96,8 @@ cli-relay submit --scope friday --key what-is-dify-en-04 --engine claude --cwd ~
 and scope. At most one task in a queue is admitted to preflight/execution at a time. Other
 tasks wait FIFO by their original submission time; ties use ledger insertion order. Pending
 keepers also hold their place. A queue head waiting for a dependency holds up later tasks.
-Different queues/scopes can run concurrently; tasks without `--queue` are unrestricted.
+All engines/scopes share a home-wide two-job cap and a computer-use singleton, including tasks
+without `--queue`. One canonical relay home must serve each Mac. See [capacity and rollout](migration-20261106.md#shared-local-admission).
 Combine `--after` and `--queue` to require both gates. Failed/blocked/cancelled queue tasks
 release their place; an `unknown` holder retains it because its engine may still be alive and
 needs the existing explicit recovery decision. Resume/fresh reruns retain both gates and the
@@ -105,7 +106,7 @@ task's original queue order, and cannot preempt an already admitted task.
 | Task state | Meaning |
 |---|---|
 | `accepted` | committed; keeper has not claimed it yet |
-| `waiting` | keeper owns the attempt; a dependency and/or earlier queue task prevents execution |
+| `waiting` | keeper owns the attempt; a dependency, earlier queue task or shared capacity prevents execution |
 | `running` | admitted to preflight or engine execution |
 | `succeeded`, `failed`, `blocked`, `needs_input`, `cancelled`, `unknown` | existing outcomes; `unknown` still requires a human recovery decision |
 
@@ -152,7 +153,7 @@ cli-relay --home /path/to/ledger route confirm github --verification-id v-… --
 cli-relay --home /path/to/ledger route set-default github  # optional, proven only
 cli-relay --home /path/to/ledger route set-fallback github friday # optional; friday must already be proven
 
-cli-relay --home /path/to/ledger submit --key issue-4 --engine claude --cwd ~/code/app \
+cli-relay --home /path/to/ledger submit --key issue-4 --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
   --prompt 'Implement the agreed change.' --notify-route github \
   --origin '{"bot":"github-bot","chat":"github-original-chat"}'
 
@@ -230,7 +231,7 @@ or changes credentials, configuration files, launchd or shell profiles. Claude d
 For a deliberately API-billed Codex task, select it explicitly at submission:
 
 ```sh
-cli-relay submit --key intentional-api-1 --engine codex --cwd ~/code/app --prompt "Run the tests." \
+cli-relay submit --key intentional-api-1 --engine codex --cwd ~/code/app --prompt "Run the tests." --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"' \
   --billing-mode api
 # Equivalent: --option billing_mode=api
 ```
@@ -273,7 +274,7 @@ snapshot, so resume may report different presence while keeping the same policy.
 Repeat the flag for more names:
 
 ```sh
-cli-relay submit --key clean-env-1 --engine codex --cwd ~/code/app --prompt "Run the tests." \
+cli-relay submit --key clean-env-1 --engine codex --cwd ~/code/app --prompt "Run the tests." --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"' \
   --unset-env OPENAI_BASE_URL --unset-env OPENAI_API_KEY
 ```
 
@@ -324,7 +325,7 @@ notification event entries carry the same fields. No ledger migration is needed.
 | Engine | Runs | Resume |
 |---|---|---|
 | `claude` | `claude -p --output-format stream-json --verbose --session-id <uuid> --permission-mode dontAsk --permission-prompts none` (prompt on stdin) | `--resume <exact uuid>` (same permission mode) |
-| `codex` | `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, where `<s>` defaults to `read-only`; `workspace-write` or explicitly opted-in `danger-full-access` may be requested. `workspace-write` also gets `-c sandbox_workspace_write.network_access=<n>`: `false` unless the task opts in with `allow_network=true` | `codex exec --sandbox <s> resume -c sandbox_mode="<s>" [-c sandbox_workspace_write.network_access=<n>] --json -o <file> <exact id> -` (same `<s>` and `<n>`) |
+| `codex` | `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, where new production requests must explicitly select `<s>` (legacy requests default to `read-only`); `workspace-write` or explicitly opted-in `danger-full-access` may be requested. `workspace-write` also gets `-c sandbox_workspace_write.network_access=<n>`: `false` unless the task opts in with `allow_network=true` | `codex exec --sandbox <s> resume -c sandbox_mode="<s>" [-c sandbox_workspace_write.network_access=<n>] --json -o <file> <exact id> -` (same `<s>` and `<n>`) |
 | `fixture` | a deterministic local stand-in used by tests and the soak run | same, against its own state |
 
 Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--yolo`, `--full-auto`,
@@ -402,12 +403,8 @@ inside a Git work tree whose directory Codex does not trust; the warning does no
 attempt's outcome or automatically retry it.
 
 Codex **full access is off by default**. Requesting `sandbox="danger-full-access"` alone is a
-usage error. To opt in for one task, supply both options:
-
-```sh
-cli-relay submit --key full-access-1 --engine codex --cwd ~/code/app --prompt "Run the maintenance task" \
-  --option 'sandbox="danger-full-access"' --option allow_full_access=true
-```
+usage error. Full access needs a separately authorized, explicit per-task opt-in; computer use
+never selects it automatically. Prefer the minimum explicit sandbox for the task.
 
 `allow_full_access` is a typed boolean: use `true`, not the JSON string `"true"` or the number
 `1`. It is harmless without `sandbox="danger-full-access"`: the requested sandbox stays in
@@ -431,7 +428,7 @@ works in `workspace-write` with `sandbox_workspace_write.network_access=true`. T
 task, without full access:
 
 ```sh
-cli-relay submit --key tests-1 --engine codex --cwd ~/code/app --prompt "Run the full test suite" \
+cli-relay submit --key tests-1 --engine codex --cwd ~/code/app --prompt "Run the full test suite" --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' \
   --option 'sandbox="workspace-write"' --option allow_network=true
 ```
 
@@ -521,7 +518,7 @@ requested by the user as described above. `Monitor` is not added to the allowlis
 `WebSearch` or `WebFetch` for one task, name them:
 
 ```sh
-cli-relay submit --key research-1 --engine claude --cwd ~/code/app --prompt "Compare the current options for X" \
+cli-relay submit --key research-1 --engine claude --cwd ~/code/app --prompt "Compare the current options for X" --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
   --option 'allowed_tools=["WebSearch","WebFetch"]'
 ```
 
@@ -563,110 +560,37 @@ part of the request.
   `managed_rules_only` is true, the option has no effect on this machine. If `complete` is
   false, a checked layer could not be read, so a rule may be missing from the lists.
 
-Model and effort can be pinned per task, without changing either CLI's global configuration:
+### Production tiers and effective settings
 
-```sh
-cli-relay submit --key review-claude-1 --engine claude --cwd ~/code/app --prompt "Review the change" \
-  --option 'model="claude-opus-5-5"' --option 'effort="max"'
-cli-relay submit --key review-codex-1 --engine codex --cwd ~/code/app --prompt "Review the change" \
-  --option 'model="gpt-6-astra"' --option 'effort="max"'
-```
+New production submits require an explicit task/resource class, engine/model/effort and Codex
+sandbox. See the [routing table and migration rules](migration-20261106.md#new-production-requests).
+Use `simple` + Codex Terra/high, `complex` + Codex Sol/max (including computer use), or
+`highest_quality` + Claude Opus 5.5/max. Unknown/deprecated models and mismatches are usage errors.
+Only `engine=fixture` has a test-only exemption. No defaults or global settings are changed.
 
-`effort` accepts `low`, `medium`, `high`, `xhigh`, or `max`; the chosen model and installed CLI
-must support it. Omit it to retain the CLI's default. Exact resume reuses the task's model and
-effort. Claude gets `--effort` plus a generated one-key `--settings` environment override, since
-`CLAUDE_CODE_EFFORT_LEVEL` takes precedence over `--effort`; Codex gets the allowlisted
-`model_reasoning_effort` config override. No arbitrary settings or flags are accepted. Managed
-effort constraints remain in force: a conflicting managed environment value or a lower
-`maxEffortLevel` in any checked settings layer blocks before spawn;
-server-delivered caps and the actual served model still require real-CLI acceptance evidence.
-These options record requested configuration, not proof of the provider's effective effort.
+`effective_settings` appears in submit/status/events/brief/notification records. It records
+adapter invocation settings with `verification=invocation_only`, not a provider-side observation.
+Legacy duplicates and resumes retain their payload and hash; new requests use the new contract.
 
 ### Business status
 
-`outcome` describes the CLI process, and its values and meaning are unchanged. New terminal and
-unknown event bodies and attempt evidence also carry:
+Process outcome, business completion and artifact existence are separate fields. Canonical
+producer JSON uses `status=ok|partial|failed` and a separate
+`stop_reason=null|blocked|needs_user|stopped_for_approval`. The final stdout line must be
+`status=<same value>`. Legacy stop aliases map to partial with a separate stop, never ok.
+Unknown/missing/malformed reports remain visible/unreported. No status is inferred from prose.
 
-| Field | Values |
-|---|---|
-| `business_status` | `ok`, `partial`, `stopped_for_approval`, `failed`, `unreported` |
-| `business_status_source` | `status_line`, `result_file`, `outcome`, `denials`, `none` |
-| `denials` | `{"count": 2, "tools": ["Read"], "available": true}`; count entries, keep unique sorted tool names |
-| `business_status_counts` | Optional integer counters from the status line, e.g. `{"ok": 9, "fail": 4, "skip": 4}`; only present counters are included |
+All engines support `--option 'result_file="out/result.json"'`,
+`--option 'required_artifacts=["report.md"]'` and `--option require_business_status=true`.
+The result must be a bounded JSON object in the task cwd. Declared artifacts are checked for
+local existence; this does not validate their content. Invalid/missing results cannot be replaced
+by a success marker or an alternate root result.json. Permission denials do not invalidate every
+output, but prevent an assumed complete result.
 
-`status` and `wait` expose these fields on each attempt and on the task for its current attempt,
-as well as in evidence and event bodies. Notifier event entries and summary text carry the
-business status and denials too, including when the status line falls beyond `result_excerpt`.
-Historical evidence/events without these fields remain readable and are not backfilled. An
-active attempt has no business status until it closes; starting a new attempt does not reuse the
-previous attempt's business status.
-
-All engines accept these optional task `options` (JSON payload or `--option`):
-
-- `result_file`: a literal relative file path inside the task cwd, for example
-  `--option result_file=out/result.json`. Absolute paths, `..` components, rule/glob syntax,
-  directories and symlink escapes are rejected at submit, and the path is checked again before
-  launch and at closing. It need not exist when submitted. At closing the relay reads only a
-  regular UTF-8 JSON file, at most 1 MiB (plus one byte to detect growth). It must be an object
-  with a string `status`; other contents are ignored. A missing file reports nothing. Invalid,
-  oversized or unreadable files add `business_status_result_file_invalid` with a fixed reason;
-  they never fail the task. Each attempt reads the configured file anew, so the task should
-  replace an earlier attempt's result when reporting new work.
-- `require_business_status`: a JSON boolean, e.g. `--option require_business_status=true`.
-  If the final business status is `unreported`, add warning `business_status_missing` without
-  changing `outcome`.
-
-Both options are absent by default; omitting them preserves existing payloads and hashes. When
-supplied, they participate in the payload/hash and are reused for exact resume and fresh reruns.
-They grant no filesystem or tool permissions.
-
-With `result_file`, each new terminal/unknown event and notifier `cli_relay.events[]` entry also
-contains `result_file: {"path": "/absolute/task/cwd/out/result.json", "exists": true}`. This is
-path/existence metadata at terminal time, including when the file is absent; its contents are
-not exported. The summary includes the path when it fits. `brief` refreshes the existence flag
-without reading contents. Without the option the event/payload field is omitted and the request
-payload/hash stays unchanged.
-
-The rules are applied in this order:
-
-1. Inspect only the last non-empty line of Claude's final `result` or Codex's last message.
-   A whitespace-separated `status=<word>` token reports status. `done` and `ok` map to `ok`;
-   `partial` stays `partial`; `failed` and `fail` map to `failed`; `stopped_for_approval` and
-   `needs_approval` map to `stopped_for_approval`. Words are case-sensitive. An unknown word
-   maps to `unreported` with warning `business_status_unknown` identifying the source.
-   Earlier lines, quoted examples earlier in the answer, and prose such as `本次失败` do not
-   set business status. Optional whitespace-separated `ok=`, `fail=` and `skip=` tokens on
-   that same line are non-negative integers, kept in `business_status_counts`.
-2. Read the optional `result_file` and map its string `status` with the same aliases. If both
-   sources disagree after mapping, add `business_status_conflict` and take the more severe:
-   `failed > stopped_for_approval > partial > ok`. A known status wins over an unknown word;
-   equal statuses prefer `status_line`. Line counters remain line counters even if the file wins.
-3. For any outcome other than `succeeded` (`failed`, `blocked`, `needs_input`, `cancelled`, or
-   `unknown`), set business status to `failed` with source `outcome`, unless the selected report
-   is `stopped_for_approval`, which is kept with its reporting source.
-4. On `succeeded`, if Claude reported permission denials and the selected status is `ok` or
-   unreported, set business status to `partial` with source `denials`: the work cannot be
-   assumed complete. Count structured denial entries, including repeated names; the tool list
-   is unique. Claude final results (and fixture results using that format) have `available: true`
-   and count zero when no entries exist. Codex has no structured denial signal, so its denials
-   are always `{"count": null, "tools": [], "available": false}`. Without a final structured
-   result, denials are unavailable for Claude too.
-5. On `succeeded`, no report and no denials means `unreported` with source `none`.
-
-For example, ask the task to end its final message with:
-
-```text
-WHAT_IS_DIFY_DONE status=partial ok=9 fail=4 skip=4
-```
-
-A normal CLI exit then remains `outcome: "succeeded"`, with `business_status: "partial"`,
-`business_status_source: "status_line"`, and `business_status_counts: {"ok": 9, "fail": 4,
-"skip": 4}`. These are structured self-reports, not independent verification that work succeeded.
-The alias mapping is available as `cli_relay.business_status.normalize_status` for dispatchers.
-
-The existing completion-marker gate still applies independently. When using
-`require_completion_marker=true` too, keep its exact marker as the last line and report business
-status through `result_file`; the two distinct last-line conventions cannot share that line.
+Per-attempt snapshots/hash and terminal-time artifact checks survive reused paths and keeper
+crashes after exit.json. Brief never refreshes historical file existence. Historical rows are
+readable without rewriting them. Full alias/precedence, diagnostics, snapshot limits and recovery
+rules are in the [result contract](migration-20261106.md#result-contract).
 
 ### When "the CLI finished" is not "the task is done": the completion marker
 
@@ -676,7 +600,7 @@ the CLI writes that into its result and finishes normally. A dispatcher that nee
 the CLI's own completion report for a task, on any engine:
 
 ```sh
-cli-relay submit --key tests-2 --engine codex --cwd ~/code/app \
+cli-relay submit --key tests-2 --engine codex --cwd ~/code/app --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' \
   --option 'sandbox="workspace-write"' --option allow_network=true --option require_completion_marker=true \
   --prompt "Run the full test suite and fix what fails. End your final message with the line
 CLI-RELAY-STATUS: complete if everything asked is done and verified, otherwise with the line
@@ -733,7 +657,7 @@ a phone or a person ever sees the result is outside what the relay can know.
 One message line per event is computed by the tool, for example:
 
 ```text
-CLI_RELAY mac-a 12345678/90abcdef article：部分完成 | /absolute/task/cwd/out/result.json
+CLI_RELAY mac-a 12345678/90abcdef article：部分完成 | process=succeeded business=partial stop_reason=None artifacts=not_declared | /absolute/task/cwd/out/result.json
 ```
 
 The conclusion uses outcome and business status; an unreported status makes no completion claim.

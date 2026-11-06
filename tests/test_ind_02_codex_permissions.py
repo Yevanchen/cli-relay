@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import RelayTestCase, base_env, isolated_env, needs_clean_cli_config
+from helpers import RelayTestCase, base_env, isolated_env, needs_clean_cli_config, production_args
 
 from cli_relay import engines
 
@@ -85,7 +85,7 @@ class EffectivePermissionsAreVerifiedAfterTheRun(RelayTestCase):
         codex_home.mkdir()
         env = base_env({"CODEX_HOME": str(codex_home),
                         "CLI_RELAY_CODEX_BIN": str(fake_codex(self.tmp, self.tmp / f"m-{key}", **fake))})
-        sub = self.cli("submit", "--key", key, "--engine", "codex", "--cwd", str(self.work), "--prompt", "hi", env=env)
+        sub = self.cli("submit", *production_args('codex'), "--key", key, "--engine", "codex", "--cwd", str(self.work), "--prompt", "hi", env=env)
         return self.cli("wait", sub["task_id"], "--timeout", "30")
 
     def test_requested_sandbox_and_no_named_profile_succeeds(self) -> None:

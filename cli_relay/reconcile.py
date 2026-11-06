@@ -141,6 +141,8 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
 
     if exit_info is not None:
         decided.update({"git": exit_info["git"]} if "git" in exit_info else {})
+        if "terminal_business" in exit_info:
+            decided["terminal_business"] = exit_info["terminal_business"]
     elif not maybe_running:
         # No exit snapshot survived: observe only after the attempt's processes have stopped.
         decided.update(git_state.completion(payload["cwd"], _evidence(att).get("git_before")))
