@@ -652,16 +652,21 @@ schema change: the attempt already has `resume_session_id`.
 **Locks.** Inside the relay, one attempt per (engine, session) per home: a FIFO admission gate like
 `--queue`, across scopes, holding while another task's current attempt is claimed, running or
 `unknown` without proof that its processes stopped. Submit and resume refuse with `session_busy`
-instead of queueing silently; `--after <holder>` is the explicit way to queue. Outside the relay,
-the CLIs' own records: a live pid in Claude's session registry, and a non-blocking probe of the
-Codex writer lock (released at once, so it can only collide with a writer that is starting at that
-instant, which the relay's own resume would collide with anyway). A lock that cannot be checked
-counts as held.
+instead of queueing silently, checked again inside their write transaction; `--after <holder>` is
+the explicit way to queue. Outside the relay, the CLIs' own records: a live pid in Claude's session
+registry (gone, zombie or reused pids ignored), and a non-blocking shared probe of the Codex writer
+lock (released at once, so it can only collide with a writer that is starting at that instant,
+which the relay's own resume would collide with anyway; Linux behaviour not verified). A lock that
+cannot be checked counts as held.
 
 **Provider and permissions.** A foreign Codex thread is checked before any turn is sent: its
 rollout must name the built-in `openai` provider. After the run, only the turns after the attempt's
 pre-run checkpoint are checked for sandbox, network and named profiles, because earlier turns were
-not run by the task; relay resumes of ordinary tasks still check every turn, as before.
+not run by the task. Relay resumes of ordinary tasks still check every turn, as before, so a send
+may not widen an ordinary relay task's own thread: submit refuses a sandbox or network wider than
+that task's (`session_permissions_wider`), which would otherwise block its later resumes for good.
+An independent review of the branch found that interaction; the refusal keeps the existing
+fail-closed check unchanged instead of relaxing it.
 
 **Not done.** Live injection into a running turn: both CLIs read the prompt once, so the closest is a
 follow-up queued with `--after <task> --after-require any_terminal`. `--fresh` for a send is refused.

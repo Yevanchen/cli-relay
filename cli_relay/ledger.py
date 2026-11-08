@@ -654,6 +654,8 @@ class Ledger:
                     if dependency is None:
                         raise Refused("dependency_not_found", "dependency task must already exist in the same scope",
                                       scope=scope, ref=payload["after"])
+                if target:
+                    self._refuse_busy_session(c, payload["engine"], target, after=payload.get("after"))
                 if notify_route is not None or notify_bound:
                     self.require_notifier()
                 status = "created"
@@ -768,11 +770,35 @@ class Ledger:
         return row["state"] in ("claimed", "running") or (
             row["state"] == "unknown" and not json.loads(row["evidence_json"] or "{}").get("processes_stopped"))
 
+    def _session_users(self, c: sqlite3.Connection, engine: str, session_id: str,
+                       exclude_task: str) -> List[Dict[str, Any]]:
+        return [{"task_id": r["task_id"], "attempt_no": r["attempt_no"], "state": r["state"]}
+                for r in self._session_rows(c, engine, session_id, exclude_task)
+                if r["state"] != "unknown" or self._holds_session(r)]
+
     def session_users(self, engine: str, session_id: str, *, exclude_task: Optional[str] = None) -> List[Dict[str, Any]]:
         """Other tasks that hold this session or wait for it (submit and resume refuse while any exist)."""
-        return [{"task_id": r["task_id"], "attempt_no": r["attempt_no"], "state": r["state"]}
-                for r in self._session_rows(self.conn, engine, session_id, exclude_task or "")
-                if r["state"] != "unknown" or self._holds_session(r)]
+        return self._session_users(self.conn, engine, session_id, exclude_task or "")
+
+    def _refuse_busy_session(self, c: sqlite3.Connection, engine: str, session_id: str, *, exclude_task: str = "",
+                             after: Optional[str] = None) -> None:
+        """Inside the writing transaction, so two submits or resumes cannot both pass the check. A send
+        queued with --after behind the only task using the session is the explicit way to wait."""
+        users = self._session_users(c, engine, session_id, exclude_task)
+        if users and {user["task_id"] for user in users} != {after}:
+            problem = {"session_id": session_id, "holder": "relay_task",
+                       "holder_task_ids": [user["task_id"] for user in users], "holders": users}
+            raise Refused("session_busy", engines.session_problem_message({"reason": "session_busy", **problem}),
+                          **problem)
+
+    def session_owners(self, engine: str, session_id: str) -> List[Dict[str, Any]]:
+        """Ordinary tasks (not messages sent with --session) whose own runs created or resumed this session."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT t.task_id, t.payload_json FROM attempts a JOIN tasks t ON t.task_id=a.task_id "
+            "WHERE t.engine=? AND (a.native_session_id=? OR a.resume_session_id=?) ORDER BY t.task_id",
+            (engine, session_id, session_id)).fetchall()
+        owners = [{"task_id": r["task_id"], "payload": json.loads(r["payload_json"])} for r in rows]
+        return [owner for owner in owners if "target_session_id" not in owner["payload"]]
 
     def _session_gate(self, c: sqlite3.Connection, task: sqlite3.Row) -> Optional[Dict[str, Any]]:
         """At most one relay attempt per native session in this home: an attempt that resumes a session
@@ -1088,6 +1114,8 @@ class Ledger:
                             (task_id, expect_attempt_no)).fetchone()
             if att["state"] in ACTIVE_STATES:
                 raise Refused("attempt_active", "the current attempt has not finished", state=att["state"])
+            if resume_session_id:
+                self._refuse_busy_session(c, task["engine"], resume_session_id, exclude_task=task_id)
             next_no = expect_attempt_no + 1
             attempt_id = new_id("a")
             c.execute(

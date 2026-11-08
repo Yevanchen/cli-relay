@@ -180,6 +180,7 @@ attempt evidence, the terminal event body and the notification summary:
 | `session_not_found` | no Claude transcript, Codex rollout or fixture state for the id; `searched` names the pattern |
 | `session_busy` | another task in this relay home holds the session or waits for it (`holder: "relay_task"`, `holder_task_ids`); a live Claude Code process has it open (`holder: "claude_process"`, `pid`, `kind`, `entrypoint`, `status`); or the Codex thread-writer lock is held or cannot be checked (`holder: "codex_thread_writer_lock"`, `lock`) |
 | `provider_not_subscription`, `provider_unverified` | the Codex thread's own record does not name the built-in `openai` provider, or has no such record |
+| `session_permissions_wider` (submit only) | the Codex thread belongs to an ordinary relay task whose sandbox or network is narrower than this message's: that task's resumes check every turn of its thread, so a wider turn would block them for good |
 | the existing preflight reasons | billing variables, configuration layers and login, as for every task (`billing_env_present`, `config_not_subscription`, `auth_not_subscription`, …) |
 
 After the run the existing checks apply: Claude's init event must show `dontAsk` and no API-key
@@ -190,7 +191,16 @@ blocks a `read-only` follow-up nor counts as permission for it. A Codex resume t
 another writer exits without a turn record: it ends `blocked` (`permissions_unverified`) with a
 `session_busy` warning. A receipt warning `session_cwd_differs` notes a session created in another
 directory: the turn runs in `--cwd`, where its tools and the relay's git, result-file and artifact
-checks apply (both CLIs resumed from another directory in local checks).
+checks apply. In local checks a turn resumed from another directory recorded that directory, in the
+Claude transcript and in Codex's `turn_context.cwd`.
+
+`resume` of such a task makes the same session checks as `submit --session`. Scopes are not a
+security boundary here: any caller of a relay home can send to any session of the machine's user,
+and the reply carries that session's context into the caller's own events. Treat a session id like
+access to the session. A keeper that a later `status`, `wait` or `events` restarts inherits that
+command's environment, so poll with the same `HOME`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME` as the
+submit. Before rolling back to a release without `--session`, let waiting and pending messages end
+or cancel them: an older keeper would resume the session without these checks.
 
 **Records.** The payload gains `target_session_id`. It is part of the hash: the same key with
 another session is a conflict, and without `--session` the field is omitted, so existing hashes are
@@ -213,10 +223,16 @@ session would lose the context the message was meant for.
   process had the session open; the open process did not see the appended turn, its next turn forked
   the transcript, and a later `--resume` continued that fork, so the appended turn was lost. The
   relay therefore refuses while `<config>/sessions/<pid>.json` names the session with a live pid.
-  Claude Code registers interactive (`entrypoint: "cli"`) and `-p` (`"sdk-cli"`) sessions there.
+  Claude Code registers interactive (`entrypoint: "cli"`) and `-p` (`"sdk-cli"`) sessions there. An
+  entry whose pid is gone, a zombie, or a process that started more than a minute after the
+  registered `startedAt` (a pid reused after a crash) is ignored; a refusal names the entry's file.
 - Codex holds `<CODEX_HOME>/thread-writer-locks/<id>.lock` while a turn writes the thread, and a
-  second writer fails with `thread … already has an active writer`. The relay probes that lock
-  without waiting and releases it at once.
+  second writer fails with `thread … already has an active writer`. The relay probes that lock with
+  a non-blocking shared lock, released at once, so it only conflicts with a writer. This was
+  observed on macOS; on Linux, where `flock` and `fcntl` locks are independent, the probe is
+  **not verified** against Codex, and a missed writer is still caught by Codex's own refusal.
+- Submit and resume repeat the relay check inside their write transaction, so concurrent submits
+  of two messages for one session cannot both be accepted.
 - A message cannot be injected into a turn that is already running: `claude -p` and `codex exec`
   read their prompt once at start. Queue it with `--after` as above.
 - Not detected: a session used from another machine, user or configuration directory, or by a

@@ -174,8 +174,13 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         return 0
     if "target_session_id" in payload and att["resume_session_id"]:
         # A message for an existing session (issue #18): checked again right before the turn is sent.
-        problem = engines.session_preflight(engine, env, att["resume_session_id"],
-                                            fixture_state_dir=str(Path(home) / "fixture-sessions"))
+        try:
+            problem = engines.session_preflight(engine, env, att["resume_session_id"],
+                                                fixture_state_dir=str(Path(home) / "fixture-sessions"))
+        except Exception as exc:  # like preflight: end the attempt, never crash-loop the keeper
+            log(f"session preflight failed: {exc!r}")
+            close("blocked", {"preflight": {"reason": "preflight_error", "error": type(exc).__name__}})
+            return 0
         if problem is not None:
             log(f"session preflight blocked: {problem['reason']}")
             close("blocked", {"preflight": problem, "reason_code": problem["reason"],

@@ -310,8 +310,15 @@ def _check_session_free(ledger: Ledger, home: Path, engine: str, payload: Dict[s
     if users and not queued_behind:
         _refuse_session({"reason": "session_busy", "session_id": sid, "holder": "relay_task",
                          "holder_task_ids": [user["task_id"] for user in users], "holders": users})
+    if engine == "codex":
+        for owner in ledger.session_owners(engine, sid):
+            wider = engines.codex_widens(owner["payload"], payload)
+            if wider is not None:
+                _refuse_session({"reason": "session_permissions_wider", "session_id": sid,
+                                 "owner_task_id": owner["task_id"], **wider})
     # Behind its holder, that task's own CLI owns the session until it ends; native holders are
-    # checked again by the keeper right before the turn is sent.
+    # checked again by the keeper right before the turn is sent. Ledger.submit repeats the relay
+    # check inside its transaction.
     problem = engines.session_preflight(engine, dict(os.environ), sid, fixture_state_dir=str(home / "fixture-sessions"),
                                         check_holder=not queued_behind)
     if problem is not None:
@@ -319,11 +326,15 @@ def _check_session_free(ledger: Ledger, home: Path, engine: str, payload: Dict[s
 
 
 def _session_warnings(home: Path, engine: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Receipt metadata after the commit: best effort, so a malformed record never fails the receipt."""
     sid = payload.get("target_session_id")
-    record = engines.session_record(engine, dict(os.environ), sid, fixture_state_dir=str(home / "fixture-sessions")) \
-        if sid else None
-    created_in = engines.session_cwd(engine, record) if record else None
-    if created_in is None or os.path.realpath(created_in) == payload["cwd"]:
+    try:
+        record = engines.session_record(engine, dict(os.environ), sid,
+                                        fixture_state_dir=str(home / "fixture-sessions")) if sid else None
+        created_in = engines.session_cwd(engine, record) if record else None
+        if created_in is None or os.path.realpath(created_in) == payload["cwd"]:
+            return []
+    except (OSError, ValueError, TypeError, AttributeError):
         return []
     return [{"code": "session_cwd_differs", "session_cwd": created_in, "cwd": payload["cwd"],
              "hint": "the session was created in another directory; this turn runs in --cwd, where its tools and "
@@ -641,9 +652,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
             raise Refused("no_native_session", "the previous attempt has no recorded native session id; "
                           "exact resume is impossible (use --fresh --confirm-rerun to start over)")
         users = ledger.session_users(task["engine"], resume_sid, exclude_task=task_id)
-        if users:
+        if users:  # repeated inside new_attempt's transaction
             _refuse_session({"reason": "session_busy", "session_id": resume_sid, "holder": "relay_task",
                              "holder_task_ids": [user["task_id"] for user in users], "holders": users})
+        if "target_session_id" in json.loads(task["payload_json"]):
+            # The same checks as submit --session: the keeper repeats them before the turn is sent.
+            problem = engines.session_preflight(task["engine"], dict(os.environ), resume_sid,
+                                                fixture_state_dir=str(args.home / "fixture-sessions"))
+            if problem is not None:
+                _refuse_session(problem)
         native_sid = resume_sid
         reason = "resume"
     new = ledger.new_attempt(task_id, expect_attempt_no=att["attempt_no"], reason=reason, prompt=prompt,

@@ -248,11 +248,16 @@ The relay side is covered by `test_session_send.py` (fixture engine and fake Cla
 model calls): the next turn runs in the target session with its context, events and ACK carry
 `target_session_id`, hash/duplicate/conflict rules, missing and malformed ids, a busy session refused
 unless queued with `--after` and then run strictly after its holder, `resume` refused while another
-task holds the session, the FIFO admission gate across scopes, a session that disappears before the
-keeper runs (`blocked`, CLI never started), Claude's live-process registry, the Codex writer lock
-(held and free), the Codex provider record, the own-turns permission check, and a Codex resume that
-loses the writer race. A relay task sending to a real Claude or Codex session, the Claude Code TUI
-and the Codex App are **NOT RUN**.
+task holds the session, the same check inside the submit and resume transactions, the FIFO
+admission gate across scopes (also for a send created behind the CLI's back), a session that
+disappears or is opened by a live Claude process before the keeper runs (`blocked`, CLI never
+started), stale and malformed registry entries, the Codex writer lock (held, free, shared), the Codex
+provider record, the own-turns permission check, a send that would widen an ordinary task's thread
+(refused, while an equal one leaves the owner's resume passing), and a Codex resume that loses the
+writer race. A separate run through the relay with the real CLIs on the MBP sent a follow-up into a
+real Codex thread and a real Claude session (both answered from the session's context), and was
+refused with `session_busy` while a real Codex turn held the writer lock and while a real Claude
+process had the session open. The Claude Code TUI and the Codex App are **NOT RUN**.
 
 ## 3. Real 25-hour soak
 

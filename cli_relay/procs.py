@@ -113,6 +113,25 @@ def start_token(pid: int) -> Optional[str]:
     return info[1]
 
 
+def start_epoch(pid: int) -> Optional[float]:
+    """Wall-clock start time of pid in seconds since the epoch, from the kernel; None if unknown."""
+    info = _proc_info(pid)
+    if info is None:
+        return None
+    source, _, rest = info[1].partition(":")
+    try:
+        if source == "darwin":
+            return float(rest)
+        if source == "linux":
+            ticks = int(rest.rpartition(":")[2])
+            with open("/proc/stat", "r", encoding="ascii") as f:
+                boot = next(int(line.split()[1]) for line in f if line.startswith("btime "))
+            return boot + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, StopIteration):
+        return None
+    return None
+
+
 def pid_exists(pid: Optional[int]) -> Optional[bool]:
     if not pid or pid <= 0:
         return None

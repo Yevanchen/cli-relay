@@ -671,11 +671,40 @@ def session_cwd(engine: str, record: Path) -> Optional[str]:
     for n, ev in enumerate(iter_json_lines(record)):
         if n >= 50:
             return None
-        cwd = (ev.get("payload") or {}).get("cwd") if engine == "codex" and ev.get("type") == "session_meta" \
-            else ev.get("cwd") if engine == "claude" else None
+        payload = ev.get("payload") if engine == "codex" and ev.get("type") == "session_meta" else None
+        cwd = payload.get("cwd") if isinstance(payload, dict) else ev.get("cwd") if engine == "claude" else None
         if isinstance(cwd, str) and cwd:
             return cwd
     return None
+
+
+def _claude_registration_live(pid: Any, started_ms: Any) -> bool:
+    """A registry entry counts while its pid may be the registering process: gone, zombie or a pid
+    reused by a process that started after the session (a crash leaves the file behind) do not."""
+    if type(pid) is not int or not 0 < pid < 2 ** 31:
+        return False
+    if procs.same_process_alive(pid, None) is False:
+        return False
+    started = procs.start_epoch(pid)
+    return not (started is not None and isinstance(started_ms, (int, float)) and not isinstance(started_ms, bool)
+                and started > started_ms / 1000 + 60)
+
+
+def codex_widens(owner: Dict[str, Any], send: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Codex only: would a sent turn fall outside what the thread's owner accepts? An ordinary task's
+    resumes check every turn of its thread (``permission_violation``), so a wider turn sent into it
+    would block them for good."""
+    allowed = {"read-only"} if requested_sandbox("codex", owner) in (None, "read-only") \
+        else {"read-only", CODEX_WORKSPACE_WRITE}
+    if full_access_enabled("codex", owner):
+        allowed.add(CODEX_FULL_ACCESS)
+    owner_network = network_enabled("codex", owner) or full_access_enabled("codex", owner)
+    sandbox = requested_sandbox("codex", send)
+    network = network_enabled("codex", send) or full_access_enabled("codex", send)
+    if sandbox in allowed and (owner_network or not network):
+        return None
+    return {"owner_sandbox": requested_sandbox("codex", owner), "owner_network_access": owner_network,
+            "sandbox": sandbox, "network_access": network}
 
 
 def session_holder(engine: str, env: Dict[str, str], session_id: str) -> Optional[Dict[str, Any]]:
@@ -694,22 +723,22 @@ def session_holder(engine: str, env: Dict[str, str], session_id: str) -> Optiona
                 continue
             if not isinstance(data, dict) or data.get("sessionId") != session_id:
                 continue
-            pid = data.get("pid")
-            if type(pid) is int and pid > 0 and procs.pid_exists(pid) is not False:
-                return {"holder": "claude_process", "pid": pid, "record": path,
+            if _claude_registration_live(data.get("pid"), data.get("startedAt")):
+                return {"holder": "claude_process", "pid": data["pid"], "record": path,
                         **{k: data[k] for k in ("kind", "entrypoint", "status") if isinstance(data.get(k), str)}}
         return None
     if engine == "codex":
         lock = codex_home(env) / "thread-writer-locks" / f"{session_id}.lock"
         try:
-            fd = os.open(lock, os.O_RDONLY)
+            fd = os.open(lock, os.O_RDONLY | os.O_NONBLOCK)  # never waits, not even on a non-file
         except FileNotFoundError:
             return None
         except OSError:
             return {"holder": "codex_thread_writer_lock", "record": str(lock), "lock": "unverifiable"}
         try:
-            # Non-blocking probe, released at once: never waits for or keeps another writer's lock.
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Non-blocking shared probe, released at once: it conflicts only with a writer's exclusive
+            # lock, works on a read-only descriptor, and never waits for or keeps another lock.
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             fcntl.flock(fd, fcntl.LOCK_UN)
             return None
         except BlockingIOError:
@@ -752,7 +781,14 @@ def session_problem_message(problem: Dict[str, Any]) -> str:
                 "wait until that session is idle")
     if reason == "session_busy":
         return (f"session {sid} is in use by relay task(s) {', '.join(problem.get('holder_task_ids', []))}; wait "
-                "for them to end, or queue this message behind one with --after <task id>")
+                "for them to end, or queue this message behind the one holding it with --after <task id> "
+                "--after-require any_terminal")
+    if reason == "session_permissions_wider":
+        return (f"Codex thread {sid} belongs to relay task {problem.get('owner_task_id')} (sandbox="
+                f"{problem.get('owner_sandbox')}, network_access={str(problem.get('owner_network_access')).lower()}); "
+                f"a turn with sandbox={problem.get('sandbox')}, network_access="
+                f"{str(problem.get('network_access')).lower()} would make that task's later resumes fail their "
+                "permission check. Send with the same or narrower permissions, or submit a new task")
     return (f"Codex thread {sid} is not shown to have been created by the built-in openai provider "
             f"({reason}); refusing to continue it")
 

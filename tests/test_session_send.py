@@ -19,7 +19,7 @@ from helpers import (RelayTestCase, base_env, db_rows, isolated_env, needs_clean
 from test_task_local_model_config import recording_cli
 from test_terminal_observations import notification
 
-from cli_relay import engines
+from cli_relay import engines, procs
 from cli_relay.errors import UsageError
 from cli_relay.ledger import Ledger, init_ledger, payload_hash
 
@@ -107,6 +107,41 @@ class SessionHelpers(unittest.TestCase):
         self.assertIn("open in a live Claude Code process", engines.session_problem_message(problem))
         self.assertIsNone(self.preflight("claude", check_holder=False))
 
+    def test_stale_claude_registrations_do_not_hold_the_session(self):
+        write_claude_session(self.claude, self.sid, "/srv/app")
+        sessions = self.claude / "sessions"
+        sessions.mkdir()
+        record = sessions / "1.json"
+        started = procs.start_epoch(os.getpid())
+        self.assertIsNotNone(started)
+        self.assertLessEqual(started, time.time())
+        for started_ms, holds in ((started * 1000, True), (time.time() * 1000, True), (None, True),
+                                  ((started - 3600) * 1000, False), (True, True), (2 ** 64, True)):
+            with self.subTest(started_ms=started_ms):
+                # A pid that started long after the session registered is a reused pid, not Claude.
+                record.write_text(json.dumps({"pid": os.getpid(), "sessionId": self.sid, "startedAt": started_ms}))
+                self.assertEqual(self.preflight("claude") is not None, holds)
+        for pid in (2 ** 32, 2 ** 31, -1, 1.5):  # malformed pids never raise and never hold
+            with self.subTest(pid=pid):
+                record.write_text(json.dumps({"pid": pid, "sessionId": self.sid}))
+                self.assertIsNone(self.preflight("claude"))
+
+    def test_a_shared_lock_is_a_reader_not_a_writer(self):
+        write_rollout(self.codex, thread=self.sid)
+        (self.codex / "thread-writer-locks").mkdir()
+        lock = self.codex / "thread-writer-locks" / f"{self.sid}.lock"
+        lock.write_text("")
+        with open(lock) as reader:
+            fcntl.flock(reader, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            self.assertIsNone(self.preflight("codex"))
+
+    def test_malformed_session_records_never_raise(self):
+        path = rollout_path(self.codex, self.sid)
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"type": "session_meta", "payload": ["not", "a", "dict"]}) + "\n")
+        self.assertIsNone(engines.session_cwd("codex", path))
+        self.assertEqual(self.preflight("codex")["reason"], "provider_not_subscription")
+
     def test_a_held_codex_writer_lock_is_busy_and_a_free_one_is_released(self):
         write_rollout(self.codex, thread=self.sid)
         locks = self.codex / "thread-writer-locks"
@@ -176,9 +211,9 @@ class SessionGate(unittest.TestCase):
         self.addCleanup(self.ledger.close)
         self.sid = str(uuid.uuid4())
 
-    def task(self, key, *, target=None, scope="default", engine="fixture"):
+    def task(self, key, *, target=None, scope="default", engine="fixture", after=None):
         payload = {"engine": engine, "cwd": str(self.tmp), "prompt": key, "options": {},
-                   **({"target_session_id": target} if target else {})}
+                   **({"target_session_id": target} if target else {}), **({"after": after} if after else {})}
         _, task, _ = self.ledger.submit(scope=scope, key=key, payload=payload, prompt=key,
                                         native_session_id=str(uuid.uuid4()))
         return task["task_id"]
@@ -192,8 +227,9 @@ class SessionGate(unittest.TestCase):
 
     def test_holders_and_earlier_waiters_gate_a_send_fifo(self):
         holder = self.task("holder")
+        first = self.task("first", target=self.sid, scope="a")
+        second = self.task("second", target=self.sid, scope="a", after=first)  # the only way to queue at submit
         self.ledger.conn.execute("UPDATE attempts SET native_session_id=? WHERE task_id=?", (self.sid, holder))
-        first, second = self.task("first", target=self.sid, scope="a"), self.task("second", target=self.sid, scope="b")
         self.assertIsNone(self.gate(holder))  # not a send: a first run is never gated by a session
         self.assertEqual(self.gate(first), {"session_id": self.sid, "holder_task_ids": [], "ahead_task_ids": [holder]})
         self.assertEqual(self.gate(second)["ahead_task_ids"], [holder, first])
@@ -215,6 +251,25 @@ class SessionGate(unittest.TestCase):
                          [{"task_id": second, "attempt_no": 1, "state": "pending"}])
         self.assertEqual(self.ledger.session_users("fixture", self.sid, exclude_task=second), [])
         self.assertEqual(self.ledger.session_users("claude", self.sid), [])  # ids are per engine
+
+    def test_submit_and_resume_repeat_the_check_inside_their_transaction(self):
+        from cli_relay.errors import Refused
+
+        first = self.task("first", target=self.sid)
+        with self.assertRaises(Refused) as caught:
+            self.task("second", target=self.sid, scope="other")
+        self.assertEqual((caught.exception.code, caught.exception.detail["holder_task_ids"]), ("session_busy", [first]))
+        queued = self.ledger.submit(scope="default", key="queued", payload={
+            "engine": "fixture", "cwd": str(self.tmp), "prompt": "q", "options": {}, "target_session_id": self.sid,
+            "after": first}, prompt="q", native_session_id=None)[1]["task_id"]
+        owner = self.task("owner")
+        self.ledger.conn.execute("UPDATE attempts SET state='finished', native_session_id=? WHERE task_id=?",
+                                 (self.sid, owner))
+        with self.assertRaises(Refused) as caught:
+            self.ledger.new_attempt(owner, expect_attempt_no=1, reason="resume", prompt="x",
+                                    resume_session_id=self.sid, native_session_id=self.sid)
+        self.assertEqual(caught.exception.detail["holder_task_ids"], [first, queued])
+        self.assertEqual(self.ledger.get_task(owner)["current_attempt"], 1)  # rolled back, nothing created
 
     def test_send_attempt_records_and_hash_only_change_with_the_target(self):
         plain = self.task("plain")
@@ -285,11 +340,12 @@ class SessionSendRoundTrip(RelayTestCase):
     def test_a_busy_session_is_refused_unless_queued_behind_its_holder(self):
         first, sid = self.first_session()
         self.cli("wait", first["task_id"], "--timeout", "30")
-        holder = self.send("holder", sid, "--option", "duration_s=4")
+        # A long holder, ended by a cancel, so a slow runner cannot finish it before the checks below.
+        holder = self.send("holder", sid, "--option", "duration_s=60")
         wait_until(lambda: self.status(holder["task_id"])["task"]["state"] == "running")
         busy = self.send("busy", sid, expect=6)
         self.assertEqual((busy["error"], busy["detail"]["holder_task_ids"]), ("session_busy", [holder["task_id"]]))
-        self.assertIn("--after", busy["message"])
+        self.assertIn("--after <task id> --after-require any_terminal", busy["message"])
         resumed = self.cli("resume", first["task_id"], "--prompt", "x", expect=6)
         self.assertEqual((resumed["error"], resumed["detail"]["holder_task_ids"]), ("session_busy", [holder["task_id"]]))
         queued = self.send("queued", sid, "--after", holder["task_id"], "--after-require", "any_terminal")
@@ -298,12 +354,42 @@ class SessionSendRoundTrip(RelayTestCase):
         self.assertEqual(gate, {"session_id": sid, "holder_task_ids": [holder["task_id"]], "ahead_task_ids": []})
         # A second message must queue behind the first queued one, not behind the holder.
         self.assertEqual(self.send("second", sid, "--after", holder["task_id"], expect=6)["error"], "session_busy")
+        self.cli("cancel", holder["task_id"])
         done = self.cli("wait", queued["task_id"], "--timeout", "60")
-        held = self.status(holder["task_id"])["attempts"][0]
-        self.assertEqual(done["task"]["state"], "succeeded")
-        self.assertEqual(done["attempts"][0]["native"]["result"], "resumed turn 3; previous prompt: message holder")
-        self.assertLess(held["ended_at"], done["attempts"][0]["started_at"])
+        held = self.status(holder["task_id"])
+        self.assertEqual((held["task"]["state"], done["task"]["state"]), ("cancelled", "succeeded"))
+        self.assertTrue(done["attempts"][0]["native"]["result"].startswith("resumed turn "))
+        self.assertLess(held["attempts"][0]["ended_at"], done["attempts"][0]["started_at"])
         self.assertEqual(len(done["events"]), 2)  # one waiting snapshot, one terminal event
+
+    def test_the_gate_alone_keeps_two_attempts_off_one_session(self):
+        # A send created behind the CLI's back (as a lost race would) waits for the session, not
+        # for a dependency: only the admission gate orders it.
+        first, sid = self.first_session()
+        self.cli("wait", first["task_id"], "--timeout", "30")
+        holder = self.send("holder", sid, "--option", "duration_s=60")
+        wait_until(lambda: self.status(holder["task_id"])["task"]["state"] == "running")
+        ledger = Ledger(self.home)
+        try:
+            payload = {"engine": "fixture", "cwd": str(self.work.resolve()), "prompt": "raced", "options": {},
+                       "target_session_id": sid}
+            ledger.conn.execute("UPDATE attempts SET state='finished' WHERE task_id=?", (holder["task_id"],))
+            _, raced, _ = ledger.submit(scope="other", key="raced", payload=payload, prompt="raced",
+                                        native_session_id=None)  # the check passes: no holder in this instant
+            ledger.conn.execute("UPDATE attempts SET state='running' WHERE task_id=?", (holder["task_id"],))
+        finally:
+            ledger.close()
+        from cli_relay.spawn import spawn_keeper
+        spawn_keeper(self.home, raced["task_id"], db_rows(self.home, "SELECT attempt_id FROM attempts WHERE task_id=?",
+                                                          (raced["task_id"],))[0]["attempt_id"])
+        wait_until(lambda: self.status(raced["task_id"])["task"]["state"] == "waiting")
+        gate = self.status(raced["task_id"])["task"]["waiting_on"]
+        self.assertEqual(set(gate), {"session"})
+        self.assertEqual(gate["session"]["holder_task_ids"], [holder["task_id"]])
+        self.cli("cancel", holder["task_id"])
+        done = self.cli("wait", raced["task_id"], "--timeout", "60")
+        self.assertEqual(done["task"]["state"], "succeeded")
+        self.assertLess(self.status(holder["task_id"])["attempts"][0]["ended_at"], done["attempts"][0]["started_at"])
 
     def test_session_gone_before_the_keeper_runs_is_blocked_with_a_reason(self):
         first, sid = self.first_session()
@@ -385,6 +471,41 @@ class SessionSendRealAdapters(RelayTestCase):
         evidence = done["attempts"][0]["evidence"]
         self.assertGreater(evidence["codex_permission_checkpoint"]["offset"], 0)
         self.assertEqual(done["events"][-1]["body"]["target_session_id"], THREAD)
+
+    def test_keeper_rechecks_a_live_claude_process_before_the_turn(self):
+        env = self.fake_env("claude", CLI_RELAY_TEST_PAUSE="after_claim:2")
+        config = Path(env["CLAUDE_CONFIG_DIR"])
+        sid = str(uuid.uuid4())
+        write_claude_session(config, sid, str(self.work.resolve()))
+        sub = self.send("claude", "late-open", sid, env)
+        (config / "sessions").mkdir()
+        (config / "sessions" / f"{os.getpid()}.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": sid}))
+        done = self.cli("wait", sub["task_id"], "--timeout", "30", env=env)
+        self.assertEqual(done["task"]["state"], "blocked")
+        body = done["events"][-1]["body"]
+        self.assertEqual((body["preflight"]["reason"], body["preflight"]["holder"], body["reason_code"]),
+                         ("session_busy", "claude_process", "session_busy"))
+        self.assertFalse((self.tmp / "calls.jsonl").exists())  # the CLI never started
+        # resume of that send refuses the open session up front, with the same reason.
+        refused = self.cli("resume", sub["task_id"], "--prompt", "again", env=env, expect=6)
+        self.assertEqual((refused["error"], refused["detail"]["holder"]), ("session_busy", "claude_process"))
+
+    def test_codex_send_cannot_widen_a_relay_tasks_own_thread(self):
+        env = self.fake_env("codex")
+        owner = self.cli("submit", *production_args("codex"), "--key", "owner", "--engine", "codex",
+                         "--cwd", str(self.work), "--prompt", "start", env=env)
+        self.assertEqual(self.cli("wait", owner["task_id"], "--timeout", "30", env=env)["task"]["state"], "succeeded")
+        wider = self.send("codex", "wider", THREAD, env, "--option", 'sandbox="workspace-write"', expect=6)
+        self.assertEqual((wider["error"], wider["detail"]["owner_task_id"], wider["detail"]["sandbox"]),
+                         ("session_permissions_wider", owner["task_id"], "workspace-write"))
+        self.assertIn("would make that task's later resumes fail", wider["message"])
+        same = self.send("codex", "same", THREAD, env)  # read-only, like the owner
+        self.assertEqual(self.cli("wait", same["task_id"], "--timeout", "30", env=env)["task"]["state"], "succeeded")
+        self.cli("resume", owner["task_id"], "--prompt", "continue", env=env)  # the owner's thread is still clean
+        self.assertEqual(self.cli("wait", owner["task_id"], "--timeout", "30", env=env)["task"]["state"], "succeeded")
+        for key, extra in (("full", ['sandbox="danger-full-access"', "allow_full_access=true"]),):
+            refused = self.send("codex", key, THREAD, env, *[a for opt in extra for a in ("--option", opt)], expect=6)
+            self.assertEqual(refused["error"], "session_permissions_wider")
 
     def test_codex_refusing_a_second_writer_is_reported_as_session_busy(self):
         fake = self.tmp / "codex"
