@@ -20,6 +20,7 @@ It is not a model proxy, an agent framework, a networked relay, an orchestrator,
 | **Wake on finish** | Optional notifier (script or webhook) can wake a consumer such as a Grok Bot routine when a task ends. A wake is not an ACK. |
 | **Results to the submitting bot** | A verified per-bot route wakes that bot directly. `brief` prints complete identities, Chinese message lines and one batch ACK command; `acks.message_id` records the visible delivery. |
 | **Dependencies and queues** | `submit --after <task id or key>` requires business `ok` by default; `--queue NAME` runs tasks one at a time in FIFO order within a home and scope. [Waiting, cancellation and release rules](docs/usage.md#dependencies-and-queues). |
+| **Messages to existing sessions** | `submit --session <id>` runs the prompt as the next turn of an existing Claude Code session or Codex thread, through the same ledger, events and ACK. It is refused while the session is missing, used by another task or a live CLI process, or not the subscription's; one relay attempt per session at a time. [Engines, session ids and concurrency](docs/usage.md#sending-a-message-to-an-existing-session). |
 
 ## Quick start
 

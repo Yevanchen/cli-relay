@@ -239,6 +239,21 @@ commands, and `.env` files are not special. Submit warnings for both cases are c
 (no model calls). Raw run records are kept locally and not committed. Other Claude Code versions
 and the interactive TUI are **NOT RUN**.
 
+### 2.8 Issue #18: messages to existing sessions
+
+The session behaviour the design rests on was checked on the MBP with the real CLIs, outside the
+relay (Claude Code 2.1.312 with `claude-haiku-5-5`; codex-cli 0.162.1 with `gpt-6.1-terra`, low
+effort, `read-only`); see [D17](decisions.md#d17-issue-18-a-message-as-the-next-turn-of-an-existing-session).
+The relay side is covered by `test_session_send.py` (fixture engine and fake Claude/Codex CLIs, no
+model calls): the next turn runs in the target session with its context, events and ACK carry
+`target_session_id`, hash/duplicate/conflict rules, missing and malformed ids, a busy session refused
+unless queued with `--after` and then run strictly after its holder, `resume` refused while another
+task holds the session, the FIFO admission gate across scopes, a session that disappears before the
+keeper runs (`blocked`, CLI never started), Claude's live-process registry, the Codex writer lock
+(held and free), the Codex provider record, the own-turns permission check, and a Codex resume that
+loses the writer race. A relay task sending to a real Claude or Codex session, the Claude Code TUI
+and the Codex App are **NOT RUN**.
+
 ## 3. Real 25-hour soak
 
 | Run | Code | Status |

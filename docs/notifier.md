@@ -409,6 +409,14 @@ snapshot. Only names are recorded. Billing-blocked events also carry `preflight`
 unchanged reason/names and copyable `--unset-env` / `env -u` fixes. These fields are absent
 from historical events and do not change routing or delivery.
 
+A task submitted with `--session <id>` (a message for an existing session) carries
+`target_session_id` in event bodies and `cli_relay.events[]` entries. If the keeper refuses that
+session (`session_not_found`, `session_busy`, `provider_not_subscription`, `provider_unverified`),
+the event also carries `preflight`, `reason_code` and a one-line `summary`, which the summary line
+appends like a dependency block. A Codex resume refused because another process writes the thread
+adds the warning `{"code": "session_busy", "hint": "…"}`. See
+[messages to existing sessions](usage.md#sending-a-message-to-an-existing-session).
+
 Because the command adapter receives only the five fields, the summary of a billing-blocked event
 also appends `<task_id>#<attempt_no> billing_env_present fix: submit with a new key and
 --unset-env NAME …, or prefix the command with env -u NAME …`, for every such event in a batch.

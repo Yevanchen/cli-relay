@@ -25,6 +25,8 @@ cli-relay ack --consumer grok --task t-… --attempt 1 --event e-…
 cli-relay brief --consumer grok --text # read-only message lines and one batch ACK command
 cli-relay status t-…               # full record: attempts, identities, exit status, native result
 cli-relay resume t-… --prompt "Continue with the next failing test."   # exact native session
+cli-relay submit --key follow-up-1 --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
+  --session 5b2f0c1e-… --prompt "Also update the changelog."   # next turn of an existing session
 cli-relay cancel t-…
 
 # v0.2: wake a consumer when tasks end (configuration in <home>/notifier.json, see docs/notifier.md)
@@ -129,6 +131,98 @@ The optional top-level payload fields are `after` (resolved id), `after_require`
 explicitly supplied) and `queue`. Supplied fields participate in idempotency: changing them
 under the same key conflicts. Omitting all three preserves the previous payload and hash.
 No ledger schema change or migration is required; existing databases and events remain readable.
+
+## Sending a message to an existing session
+
+`submit --session SESSION_ID` delivers the prompt as the next turn of an existing Claude Code
+session or Codex thread, instead of starting a new one (issue #18). It is a submit mode: key,
+scope, cwd, engine, task/resource class, options, routes, origin, `--after` and `--queue` work as
+for any task, and the result goes through the same ledger, events, notifications, `brief` and ACK.
+
+```sh
+cli-relay submit --key follow-up-1 --engine codex --cwd ~/code/app --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"' \
+  --session 01a1bb19-1c70-70b0-af39-97a899ae2e77 --prompt "Also handle the empty-list case."
+```
+
+| Engine | The turn runs as | `--session` |
+|---|---|---|
+| `claude` | `claude -p … --resume <id> --permission-mode dontAsk --permission-prompts none` | the Claude session UUID |
+| `codex` | `codex exec --sandbox <s> resume -c sandbox_mode="<s>" … <id> -` | the Codex thread UUID |
+| `fixture` | the fixture's own `--resume <id>` | a fixture session (tests) |
+
+The argv is the existing exact-resume argv, built from this task's own options: permission mode,
+sandbox, network pin, `--allowedTools`, model and effort. Nothing is taken from the settings the
+session ran with before.
+
+Where session ids come from (checked locally with Claude Code 2.1.312 and codex-cli 0.162.1
+unless noted):
+
+- cli-relay: `native_session_id` in a Claude submit receipt (the relay chooses it), and in
+  `status`/`wait` attempts and terminal events once a Codex run has started (`thread.started`).
+- Claude Code: `session_id` in the output of `claude -p --output-format json` or `stream-json`, and
+  the transcript name `~/.claude/projects/<project>/<session-id>.jsonl` (under `CLAUDE_CONFIG_DIR` if
+  set). The interactive `/status` view was not checked.
+- Codex: `thread_id` of the `thread.started` event of `codex exec --json`, and the rollout name
+  `~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<thread-id>.jsonl` (under `CODEX_HOME` if set). The
+  Codex App and the `codex resume` picker were not checked.
+
+Only an exact UUID is accepted, normalised to lower case; names, `--last` and patterns are usage
+errors. The session must exist on this machine, for the user and configuration directories the
+keeper inherits from `submit`.
+
+**Checks and failure reasons.** For a new key, `submit` refuses with exit 6 and creates nothing.
+The keeper checks again right before the turn is sent; a failure then closes the attempt as
+`blocked` without starting the CLI, with `preflight`, `reason_code` and a one-line `summary` in
+attempt evidence, the terminal event body and the notification summary:
+
+| Reason | When |
+|---|---|
+| `session_not_found` | no Claude transcript, Codex rollout or fixture state for the id; `searched` names the pattern |
+| `session_busy` | another task in this relay home holds the session or waits for it (`holder: "relay_task"`, `holder_task_ids`); a live Claude Code process has it open (`holder: "claude_process"`, `pid`, `kind`, `entrypoint`, `status`); or the Codex thread-writer lock is held or cannot be checked (`holder: "codex_thread_writer_lock"`, `lock`) |
+| `provider_not_subscription`, `provider_unverified` | the Codex thread's own record does not name the built-in `openai` provider, or has no such record |
+| the existing preflight reasons | billing variables, configuration layers and login, as for every task (`billing_env_present`, `config_not_subscription`, `auth_not_subscription`, …) |
+
+After the run the existing checks apply: Claude's init event must show `dontAsk` and no API-key
+source; the Codex thread must name `openai`, and the turn must show the requested sandbox and
+network. For a message to an existing thread only the turns after the attempt's pre-run checkpoint
+are checked: earlier turns were not run by this task, so a user's `workspace-write` history neither
+blocks a `read-only` follow-up nor counts as permission for it. A Codex resume that loses a race to
+another writer exits without a turn record: it ends `blocked` (`permissions_unverified`) with a
+`session_busy` warning. A receipt warning `session_cwd_differs` notes a session created in another
+directory: the turn runs in `--cwd`, where its tools and the relay's git, result-file and artifact
+checks apply (both CLIs resumed from another directory in local checks).
+
+**Records.** The payload gains `target_session_id`. It is part of the hash: the same key with
+another session is a conflict, and without `--session` the field is omitted, so existing hashes are
+unchanged. The first attempt has `reason: "send"` and `resume_session_id = native_session_id = <id>`.
+Receipts, `status`/`wait` task records, terminal and unknown event bodies, notification entries and
+`brief` JSON carry `target_session_id`. No ledger migration is needed. `resume` continues the same
+session with another message; `resume --fresh` is refused (`fresh_not_supported`), because a new
+session would lose the context the message was meant for.
+
+**Concurrency.**
+
+- In one relay home at most one attempt runs a session at a time, across scopes. While another
+  task holds the session or waits for it, `submit --session` and `resume` refuse with
+  `session_busy`. To queue a message behind a running task, submit it with
+  `--after <that task> --after-require any_terminal`: it waits (`waiting_on.dependency` and
+  `waiting_on.session`) and runs right after, in the same session. At admission the keeper also
+  waits, first come first served, for any other holder, so two relay attempts never overlap on one
+  session. An `unknown` holder keeps the session until its processes are proven stopped.
+- Claude Code takes no lock of its own. With 2.1.312, `claude -p --resume <id>` ran while another
+  process had the session open; the open process did not see the appended turn, its next turn forked
+  the transcript, and a later `--resume` continued that fork, so the appended turn was lost. The
+  relay therefore refuses while `<config>/sessions/<pid>.json` names the session with a live pid.
+  Claude Code registers interactive (`entrypoint: "cli"`) and `-p` (`"sdk-cli"`) sessions there.
+- Codex holds `<CODEX_HOME>/thread-writer-locks/<id>.lock` while a turn writes the thread, and a
+  second writer fails with `thread … already has an active writer`. The relay probes that lock
+  without waiting and releases it at once.
+- A message cannot be injected into a turn that is already running: `claude -p` and `codex exec`
+  read their prompt once at start. Queue it with `--after` as above.
+- Not detected: a session used from another machine, user or configuration directory, or by a
+  process that does not register as above. Whether the Codex App holds the writer lock while a
+  thread is open but idle, and how an open Claude Code TUI or Codex App window displays a turn added
+  by another process, were **not verified**.
 
 ## Per-task routes and origin (issue #4)
 
