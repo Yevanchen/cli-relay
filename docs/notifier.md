@@ -409,6 +409,12 @@ snapshot. Only names are recorded. Billing-blocked events also carry `preflight`
 unchanged reason/names and copyable `--unset-env` / `env -u` fixes. These fields are absent
 from historical events and do not change routing or delivery.
 
+Because the command adapter receives only the five fields, the summary of a billing-blocked event
+also appends `<task_id>#<attempt_no> billing_env_present fix: submit with a new key and
+--unset-env NAME …, or prefix the command with env -u NAME …`, for every such event in a batch.
+Like permissions, this fix is outside header/excerpt truncation; it contains variable names from
+the fixed billing list only, never values. Other events keep their previous summary.
+
 ### Earlier v0.2 candidate ledgers
 
 Run `migrate` when upgrading an earlier candidate as well as v0.1. The core schema stays 1;

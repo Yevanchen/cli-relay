@@ -310,7 +310,9 @@ details also contain `fix.submit_flags` (for example `--unset-env ANTHROPIC_API_
 before `cli-relay`; flags go on `submit`. The `env -u` prefix applies only to that invocation;
 use `--unset-env` to retain cleanup for future resumes. `doctor --engine claude` shows
 the same hint when billing variables block it. Blocked terminal events
-include these billing preflight details too.
+include these billing preflight details too. The notification summary, which is all a command
+adapter receives, ends with the same copyable fix (`billing_env_present fix: submit with a new key
+and --unset-env NAME …`), and `brief` JSON events carry the `preflight` object.
 
 Submit/resume receipts, task records and terminal events include `unset_env` only when requested.
 Once the keeper observes the attempt's environment, attempt evidence and terminal events also
@@ -663,7 +665,8 @@ CLI_RELAY mac-a 12345678/90abcdef article：部分完成 | process=succeeded bus
 The conclusion uses outcome and business status; an unreported status makes no completion claim.
 JSON has `events[]` with full `event_id`, `task_id`, `attempt_no`, `ledger_id`, `source_id`,
 `task_last8`, `event_last8`, `key`, `origin`, `outcome`, `business_status`,
-`business_status_source`, `warnings`, `result_file` (object above or null) and `message`.
+`business_status_source`, `warnings`, `result_file` (object above or null) and `message`;
+billing-blocked events also carry `preflight` (names and the copyable fix, never values).
 `ack_command` is shell-quoted for the selected home and all listed event identities. No
 text-mode ids need to be copied by hand: each `CLI_RELAY` line is preceded by its full metadata
 as `field=value` pairs, and the final line is the batch command. Send only the `CLI_RELAY` lines.

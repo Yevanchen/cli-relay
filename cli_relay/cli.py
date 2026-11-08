@@ -437,6 +437,8 @@ def cmd_brief(args: argparse.Namespace) -> int:
                            "business_status": status, "business_status_source": body.get("business_status_source", "none"),
                            **{key: body[key] for key in business_status.FIELDS if key in body},
                            **({"effective_settings": body["effective_settings"]} if "effective_settings" in body else {}),
+                           # billing blocks only: names and the copy-pasteable fix, never values
+                           **({"preflight": body["preflight"]} if "preflight" in body else {}),
                            "warnings": body.get("warnings", []), "result_file": result_file, "message": message})
             refs.append({**identity, **source, "consumer": consumer})
         command = None

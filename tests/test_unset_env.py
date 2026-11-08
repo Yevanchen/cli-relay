@@ -239,6 +239,28 @@ class UnsetEnvRoundTrip(RelayTestCase):
             self.assertNotIn(CANARY, json.dumps(done))
             self.assertNotIn(CANARY, json.dumps(doctor))
 
+    def test_billing_fix_reaches_notification_summary_and_brief_without_values(self):
+        # Command adapters only receive the summary line, so the copy-pasteable fix must be in it.
+        names = list(engines.BILLING_ENV["claude"])
+        flags = " ".join("--unset-env " + name for name in names)
+        prefix = "env " + " ".join("-u " + name for name in names)
+        env = base_env(dict.fromkeys(names, CANARY))
+        done = self.finish(self.cli(*self.args("summary-fix", "claude"), env=env))
+        self.assertEqual(done["task"]["state"], "blocked")
+        summary = notification(done)["summary"]
+        self.assertIn(f"#1 billing_env_present fix: submit with a new key and {flags}, "
+                      f"or prefix the command with {prefix}", summary)
+        brief = self.cli("brief", "--consumer", "bot")
+        event, = brief["events"]
+        self.assertEqual((event["preflight"]["reason"], event["preflight"]["fix"]["submit_flags"]),
+                         ("billing_env_present", flags))
+        self.assertNotIn(CANARY, summary + json.dumps(brief))
+        # Other blocks keep their old summary shape.
+        ok = self.finish(self.cli(*self.args("summary-ok")))
+        self.assertNotIn("billing_env_present fix", notification(ok)["summary"])
+        self.assertNotIn("preflight", self.cli("brief", "--consumer", "bot", "--task", ok["task"]["task_id"])
+                         ["events"][0])
+
     def test_cleanup_evidence_survives_keeper_crash_and_reconciliation(self):
         env = base_env({"OPENAI_BASE_URL": CANARY, "CLI_RELAY_TEST_CRASH": "after_exit_before_commit"})
         sub = self.cli(*self.args("crash"), "--unset-env", "OPENAI_BASE_URL", env=env)
