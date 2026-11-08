@@ -85,8 +85,14 @@ CLAUDE_EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
 # wildcard or another tool. Both need permission, so dontAsk denies them unless a rule allows them.
 CLAUDE_ALLOWABLE_TOOLS = ("WebFetch", "WebSearch")
 CLAUDE_ALLOWED_TOOLS_FLAGS = ("--allowedTools", "--allowed-tools")
-# Observed with Claude Code 2.1.312: prefix rules for these commands with flags are denied.
-CLAUDE_BASH_FLAG_RULE_COMMANDS = {"cp"}
+# Observed with Claude Code 2.1.312 under dontAsk, user settings excluded (issue #22): these commands,
+# called by their bare name with any flag, are denied under every scoped rule (Bash(cp -n a b:*), the
+# exact Bash(cp -n a b), Bash(cp:*), Bash(cp *)); only an unrestricted Bash rule allows them.
+CLAUDE_BASH_FLAG_RULE_COMMANDS = {"cp", "mv"}
+# Observed likewise: these commands, called by their bare name, are denied whenever a path argument
+# resolves outside the working directory, even under a matching rule (interpreters such as python3
+# are not checked this way).
+CLAUDE_BASH_PATH_CHECKED_COMMANDS = {"cat", "cp", "ls", "mkdir", "mv", "rm", "touch"}
 
 # Configuration layers outside the user's own files that the CLIs also read.
 CODEX_SYSTEM_CONFIG = (Path("/etc/codex/config.toml"),)
@@ -719,18 +725,40 @@ def requested_tools(engine: str, payload: Dict[str, Any]) -> List[str]:
     return sorted(rules)
 
 
+def _outside(arg: str, cwd: str) -> bool:
+    """Whether a path argument resolves (symlinks and .. included) outside the task directory."""
+    root = os.path.realpath(cwd)
+    path = os.path.realpath(arg if os.path.isabs(arg) else os.path.join(root, arg))
+    return path != root and not path.startswith(root.rstrip(os.sep) + os.sep)
+
+
 def bash_rule_warnings(engine: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Submit diagnostics only; never alter a request or its permission rules."""
-    warnings = []
-    if engine == "claude":
-        for command in (payload.get("options") or {}).get("allowed_bash_commands", []):
-            words = command.split()
-            if words[0] in CLAUDE_BASH_FLAG_RULE_COMMANDS and any(word.startswith("-") for word in words[1:]):
-                warnings.append({"code": "bash_rule_not_honoured", "command": command,
-                                 "hint": "Claude Code (observed 2.1.312) denies cp with flags even when its prefix "
-                                         "rule is listed; use cp <src> <dst> without flags (drop -n only when "
-                                         "overwriting the destination is acceptable), or check existence "
-                                         "with test -e first."})
+    warnings: List[Dict[str, Any]] = []
+    if engine != "claude":
+        return warnings
+    for command in (payload.get("options") or {}).get("allowed_bash_commands", []):
+        name, *args = command.split()
+        if name in CLAUDE_BASH_FLAG_RULE_COMMANDS and any(word.startswith("-") for word in args):
+            warnings.append({"code": "bash_rule_not_honoured", "command": command,
+                             "hint": f"Claude Code (observed 2.1.312) denies {name} with flags even when a matching "
+                                     f"prefix rule is listed, also under Bash({name}:*), Bash({name} *) or an exact "
+                                     "rule; only an unrestricted Bash rule, which cli-relay does not offer, allows "
+                                     f"it. Use {name} <src> <dst> without flags (drop -n only when overwriting the "
+                                     "destination is acceptable), or check existence with test -e first: run "
+                                     f"`test -e <dst> || {name} <src> <dst>` and allow both the `test -e <dst>` and "
+                                     f"`{name} <src> <dst>` prefixes."})
+        cwd = payload.get("cwd")
+        if not cwd or name not in CLAUDE_BASH_PATH_CHECKED_COMMANDS:
+            continue
+        outside = sorted({arg for arg in args if not arg.startswith("-") and _outside(arg, cwd)})
+        if outside:
+            checked = ", ".join(sorted(CLAUDE_BASH_PATH_CHECKED_COMMANDS))
+            warnings.append({"code": "bash_rule_path_outside_cwd", "command": command, "paths": outside,
+                             "hint": f"Claude Code (observed 2.1.312) denies {checked} when a path argument is "
+                                     "outside the task directory, even when the prefix rule matches; use paths "
+                                     "inside --cwd, or submit with a --cwd that contains every path the command "
+                                     "needs."})
     return warnings
 
 
