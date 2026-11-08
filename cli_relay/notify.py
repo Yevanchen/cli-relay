@@ -282,7 +282,7 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
                                           "reason_code", "details", "summary", "unset_env", "unset_env_present", "preflight",
                                           "billing_mode", "billing_env_policy", "billing_env_present",
                                           "billing_env_removed", "billing_env_preserved",
-                                          "result_file", "effective_settings",
+                                          "result_file", "effective_settings", "target_session_id",
                                           *business_status.FIELDS)
                if key in body},
             "result_excerpt": _clean(body.get("result_excerpt"), EXCERPT_MAX)}

@@ -101,7 +101,8 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
                               allow_network=engines.network_enabled(engine, payload),
                               require_completion_marker=engines.completion_marker_required(payload),
                               permission_checkpoint=_evidence(att).get("codex_permission_checkpoint"),
-                              resume_session_id=att["resume_session_id"])
+                              resume_session_id=att["resume_session_id"],
+                              own_turns_only="target_session_id" in payload)
 
     if exit_info is None and state == "claimed" and not att["spawn_started_at"]:
         # No spawning record proves the CLI never started, even if the old group is unverifiable.
