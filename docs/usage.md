@@ -470,28 +470,56 @@ Codex also accepts `--network-access` or the `network_access` JSON alias. See th
 ### allowed_bash_commands
 
 `--allow-bash 'cp -n a b'` and `--option 'allowed_bash_commands=["cp -n a b"]'` request the same
-`Bash(cp -n a b:*)` prefix rule. Claude Code itself decides whether a command matches. In the
-2026-11-04 reproduction with Claude Code 2.1.312, `dontAsk` and a clean non-Git cwd, these
-commands were each listed in the same `--allowedTools` argument:
+`Bash(cp -n a b:*)` prefix rule. All rules go into one `--allowedTools` argv element, comma
+separated, without a shell. Claude Code itself decides whether a command matches.
 
-| Observed result | Commands |
+**Isolated reproduction (2026-11-08, issue #22).** Claude Code 2.1.312, `dontAsk`, one fresh
+non-Git directory per case, a minimal environment without billing or session variables, and
+the argv from `cli_relay.engines.build` wherever cli-relay can express the rule. The user's
+`~/.claude/settings.json` (its allow list, `bypassPermissions` default, hooks and plugins) was
+excluded with `--setting-sources project,local`; an empty `HOME` cannot be used on macOS because it
+loses the keychain login. Each case asked the model to run one exact command once; 60 real runs.
+Nine cases repeated with the user's settings loaded gave the same results, so that configuration
+is not a factor.
+
+| Result | Commands |
 |---|---|
-| Denied | `cp -n a.example a.txt`, `cp -p a.example f.txt`, `cp -n a.example g.txt` |
-| Denied for dotfiles and scoped output too | `cp -n .env.example .env`, `cp -n .env.example env.txt`, `cp -n x.example .env2`, `cp -n a.example out/c.txt` (with `allowed_write_dirs=["out"]`) |
-| Allowed | `cp a.example b.txt`, `cp a.example out/m.txt` |
-| Allowed, including other commands with flags | `cat a.example`, `touch d.txt`, `mkdir e`, `ls -la a.example`, `mkdir -p k/l` |
+| Denied under every scoped rule: `Bash(<cmd>:*)` as cli-relay builds it, the exact `Bash(<cmd>)`, `Bash(cp:*)`, `Bash(cp -n:*)`, `Bash(cp *)`, `Bash(cp -n *)`, and with `Edit(./**)`/`Write(./**)` added | `cp -n a.example a.txt`, `cp -p …`, `cp -f …`, `cp -r adir bdir`, `cp -n .env.example .env`, `cp -n a.example out/c.txt` (with `allowed_write_dirs=["out"]`), `mv -n x.example y.txt` |
+| Allowed by an unrestricted `Bash` rule only | the same `cp -n a.example a.txt` |
+| Allowed by its `Bash(<cmd>:*)` rule | `cp a.example b.txt`, `cp .env.example .env`, `mv x.example y.txt`, `rm -f x.example`, `rm x.example`, `mkdir -p k/l`, `ln -s …`, `ln -sf …`, `sed -i.bak s/x/y/ x.example`, `chmod -R u+w adir`, `./tool.sh hello`, `cp <task cwd>/a.example <task cwd>/o2.txt`, and `test -e a.txt \|\| cp a.example a.txt` with rules for both parts |
+| Denied under its exact rule: a path outside the task directory | `cp <outside>/a.example <outside>/o1.txt`, `cp ../outside/a.example o6.txt`, `ls -la <outside>/a.example`, `cat <outside>/a.example`, `mkdir <outside>/m`, `touch <outside>/t.txt`, `mv <outside>/a.example <outside>/b.txt`, `rm <outside>/a.example` |
+| Allowed although outside | `python3 <outside>/s.py`; the outside `cp` when the directory is added with `claude --add-dir` (cli-relay never passes it) |
+| Without any rule | `ls -la a.example` allowed (read-only); `cp a.example b.txt`, `cp -n …`, `mkdir -p k/l`, `touch d.txt` and `./tool.sh hello` denied |
+| Write tool under `Edit(./cfg/**)`/`Write(./cfg/**)` | `cfg/.env`, `cfg/.env.local` and `cfg/notes.txt` all allowed |
 
-This is an observed Claude matching limitation for `cp` with flags, including `-n` and `-p`.
-The relay keeps the rule construction, settings and permission mode unchanged. Use
-`cp <src> <dst>` without flags (remove `-n` only when overwriting the destination is acceptable),
-or check existence with `test -e` first (request a prefix for that check too). An existence
-check followed by a copy is not atomic.
+So the relay's rule construction is not at fault: multi-word rules match, and for `cp`/`mv` with a
+flag no scoped spelling helps. Claude Code does not protect `.env`-like files specially either: the
+flag decides. Two Claude Code checks explain every denial: `cp`/`mv` called by bare name with any
+flag, and file commands called by bare name with a path outside the working directories. Both
+apply even when a rule matches.
+
+The relay keeps the rule construction, settings and permission mode unchanged, and offers no
+unrestricted Bash grant. Workarounds: use `cp <src> <dst>` without flags (remove `-n` only when
+overwriting the destination is acceptable), or run `test -e <dst> || cp <src> <dst>` and allow the
+two prefixes `test -e <dst>` and `cp <src> <dst>` (an existence check followed by a copy is not
+atomic). For paths outside the task directory, submit with a `--cwd` that contains them.
+
+Caution: the same commands called by absolute path were allowed under their rules
+(`/bin/cp -n a.example a.txt`, `/bin/mv -n x.example y.txt`, and even `/bin/cp ../outside/a.example
+o8.txt`), because Claude Code applies those two checks to the bare names only. cli-relay does not
+recommend this: a prefix such as `/bin/cp …` then reaches outside the task directory with nothing
+but the prefix rule in the way.
 
 - Submit receipts include one `{"code": "bash_rule_not_honoured", "command": "cp -n a b", "hint": "…"}`
-  per affected entry: its first word is `cp` and a later token starts with `-`. Only `cp` is on
-  the observed command list; this does not predict a problem with `mv`, `rm` or other commands.
-  The hint names the observed Claude version and workarounds. Submission still succeeds;
-  the warning is receipt metadata and does not change the stored payload or its hash.
+  per affected entry: its first word is `cp` or `mv` and a later token starts with `-`. Other
+  commands with flags (`rm -f`, `mkdir -p`, `ln -s`, `sed -i`) were allowed and do not warn.
+- Submit receipts include one `{"code": "bash_rule_path_outside_cwd", "command": "…", "paths": […],
+  "hint": "…"}` per entry whose first word is `cat`, `cp`, `ls`, `mkdir`, `mv`, `rm` or `touch` and
+  that has a path argument resolving outside the task cwd, `..` and symlinks included. `paths`
+  lists those arguments. Interpreters such as `python3` and absolute binary paths are not checked.
+- The hints name the observed Claude version and workarounds; the observations may change with
+  another Claude Code version. Submission still succeeds; the warnings are receipt metadata and do
+  not change the stored payload or its hash.
 - After a Claude run, structured Bash denials whose stripped `tool_input.command` equals a
   requested prefix or starts with that prefix plus a space add one
   `{"code": "allowed_rule_denied", "commands": ["cp -n a b"]}` warning. This applies to any

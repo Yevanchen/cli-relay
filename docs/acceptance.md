@@ -221,6 +221,24 @@ This shows the Codex setting and its effect. It is not a `codex exec` run of the
 which needs a model call: a real Codex test task with `allow_network=true` is **NOT RUN** and
 remains a deployment check, as does a real task that ends with the completion marker.
 
+### 2.7 Issue #22: Claude Bash rules (real Claude Code, settings isolated)
+
+On 2026-11-08 the MBP ran Claude Code 2.1.312 (`claude-haiku-5-5`, `dontAsk`, `apiKeySource:
+none`) 60 times, one exact command per run, in fresh non-Git directories. The argv came from
+`engines.build` where the relay can express the rule; `--setting-sources project,local` excluded
+`~/.claude/settings.json`, and its debug log listed only the missing managed and project files.
+An empty `HOME` was tried first and is unusable on macOS: `claude auth status` then reports
+`loggedIn: false` because the keychain login is not found. Nine cases rerun with the user's settings
+loaded matched exactly. The table and conclusions are in
+[`usage.md`](usage.md#allowed_bash_commands): the relay's rules match, `cp`/`mv` with any flag are
+denied under every scoped spelling, paths outside the task directory are denied for bare file
+commands, and `.env` files are not special. Submit warnings for both cases are covered by
+`test_only_cp_and_mv_with_a_later_flag_warn`,
+`test_paths_outside_the_task_directory_warn_for_checked_commands_only`,
+`test_env_files_are_not_special` and `test_outside_path_warning_is_receipt_metadata_only`
+(no model calls). Raw run records are kept locally and not committed. Other Claude Code versions
+and the interactive TUI are **NOT RUN**.
+
 ## 3. Real 25-hour soak
 
 | Run | Code | Status |
