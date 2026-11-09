@@ -284,7 +284,9 @@ class BusinessStatusRoundTrip(RelayTestCase):
         status = self.cli("status", sub["task_id"], "--no-reconcile")
         events = self.cli("events", "--consumer", "old", "--no-reconcile")["events"]
         self.assertEqual(status["task"]["state"], "succeeded")
-        self.assertEqual(events[0]["body"], body)
+        self.assertEqual(events[0]["body"], {**body, "completion_report": {"state": "没说做完没"}})
+        self.assertNotIn("completion_report", json.loads(db_rows(self.home, "SELECT body_json FROM events")[0][0]))
+        self.assertEqual(status["task"]["completion_report"], {"state": "没说做完没"})
         self.assertNotIn("business_status", status["task"])
         self.assertNotIn("business_status", notification(status)["cli_relay"]["events"][0])
 

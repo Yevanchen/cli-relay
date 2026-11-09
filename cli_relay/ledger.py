@@ -903,6 +903,7 @@ class Ledger:
         business = (dict(frozen_business) if kind == "terminal" and isinstance(frozen_business, dict) else
                     business_status.evaluate(task["engine"], payload, outcome or "unknown", native))
         warnings.extend(business.pop("warnings", []))
+        business.setdefault("completion_report", business_status.completion_report((native or {}).get("result")))
         observations.update(business)
         if native and native.get("permission_denials"):
             warnings.append({"code": "permission_denials", "tools": sorted(set(native["permission_denials"]))})
