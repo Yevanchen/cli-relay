@@ -5,9 +5,22 @@ from typing import Any, Dict
 
 from .errors import UsageError
 
-TIERS = {"simple": ("codex", "gpt-6.1-terra", "high"),
-         "complex": ("codex", "gpt-6.1-sol", "max"),
-         "highest_quality": ("claude", "claude-opus-5-5", "max")}
+# Each class maps to one or more exact (engine, model, effort) combinations.
+TIERS = {
+    "simple": (("codex", "gpt-6.1-terra", "high"),),
+    "complex": (("codex", "gpt-6.1-sol", "max"),),
+    "highest_quality": (
+        ("claude", "claude-opus-5-5", "max"),
+        ("claude", "claude-fable-5-2", "xhigh"),
+    ),
+}
+
+
+def tier(task_class: str, index: int = 0) -> tuple:
+    """Return one allowed (engine, model, effort) combination for a task class."""
+    return TIERS[task_class][index]
+
+
 RESOURCE_CLASSES = ("standard", "computer_use")
 LOCAL_MAX_ACTIVE = 2
 LOCAL_MAX_COMPUTER_USE = 1
@@ -37,13 +50,14 @@ def validate_new(payload: Dict[str, Any]) -> None:
         raise UsageError("new production submits require --task-class simple|complex|highest_quality", tiers=TIERS)
     if "resource_class" not in payload:
         raise UsageError("new production submits require --resource-class standard|computer_use")
-    expected = TIERS[task_class]
+    allowed = TIERS[task_class]
     options = payload.get("options") or {}
     actual = (engine, options.get("model"), options.get("effort"))
-    if actual != expected:
+    if actual not in allowed:
         raise UsageError("engine/model/effort must match the explicit task class; no defaults or deprecated models "
-                         "(including gpt-6-astra). Use the listed tier exactly",
-                         expected=dict(zip(("engine", "model", "effort"), expected)), task_class=task_class)
+                         "(including gpt-6-astra). Use a listed combination for the tier exactly",
+                         expected=[{"engine": e, "model": m, "effort": f} for e, m, f in allowed],
+                         task_class=task_class)
     if payload["resource_class"] == "computer_use" and task_class != "complex":
         raise UsageError("computer_use requires task_class=complex, codex gpt-6.1-sol/max")
     if engine == "codex" and "sandbox" not in options:
