@@ -629,7 +629,10 @@ class Ledger:
                notify_bound: bool = False) -> Tuple[str, Dict[str, Any], str]:
         """Returns (status, task, payload_sha256) with status in created|duplicate|conflict.
         The caller may only report "accepted" after this returns (i.e. after COMMIT).
-        Notification ownership is metadata, not payload: a duplicate keeps the first binding."""
+        Notification ownership is metadata, not payload: a duplicate keeps the first binding.
+        A task with ``target_session_id`` (issue #18) starts with a 'send' attempt resuming that
+        session; the relay-wide session gate is checked again at admission (see ``_session_gate``)."""
+        target = payload.get("target_session_id")
         sha = payload_hash(payload)
         with self.tx() as c:
             now = now_iso()  # submission order follows the serialized ledger transaction
@@ -651,6 +654,8 @@ class Ledger:
                     if dependency is None:
                         raise Refused("dependency_not_found", "dependency task must already exist in the same scope",
                                       scope=scope, ref=payload["after"])
+                if target:
+                    self._refuse_busy_session(c, payload["engine"], target, after=payload.get("after"))
                 if notify_route is not None or notify_bound:
                     self.require_notifier()
                 status = "created"
@@ -664,9 +669,10 @@ class Ledger:
                     c.execute("UPDATE tasks SET notify_route=?, notify_consumer=?, notify_chat=?, notify_bound=? "
                               "WHERE task_id=?", (notify_route, notify_consumer, notify_chat, int(notify_bound), task_id))
                 c.execute(
-                    "INSERT INTO attempts (attempt_id, task_id, attempt_no, reason, state, prompt, native_session_id, "
-                    "cwd, created_at, updated_at) VALUES (?,?,1,'initial','pending',?,?,?,?,?)",
-                    (attempt_id, task_id, prompt, native_session_id, payload["cwd"], now, now))
+                    "INSERT INTO attempts (attempt_id, task_id, attempt_no, reason, state, prompt, resume_session_id, "
+                    "native_session_id, cwd, created_at, updated_at) VALUES (?,?,1,?,'pending',?,?,?,?,?,?)",
+                    (attempt_id, task_id, "send" if target else "initial", prompt, target,
+                     target or native_session_id, payload["cwd"], now, now))
                 c.execute("INSERT INTO submissions (task_id, scope, request_key, payload_sha256, result, at) "
                           "VALUES (?,?,?,?,?,?)", (task_id, scope, key, sha, status, now))
         task = self.get_task(task_id)
@@ -741,7 +747,73 @@ class Ledger:
                         ahead.append(row["task_id"])
             if ahead:
                 waiting["queue"] = {"name": payload["queue"], "position": len(ahead) + 1, "ahead_task_ids": ahead}
+        session = self._session_gate(c, task)
+        if session is not None:
+            waiting["session"] = session
         return waiting, rejected
+
+    # ------------------------------------------------------------------ per-session lock (issue #18)
+    @staticmethod
+    def _session_rows(c: sqlite3.Connection, engine: str, session_id: str, exclude_task: str) -> List[sqlite3.Row]:
+        """Other tasks whose current attempt holds, runs or awaits this native session, in any scope.
+        Superseded attempts are excluded: a resume first proves that its old run stopped."""
+        return c.execute(
+            "SELECT t.task_id, a.attempt_no, a.state, a.evidence_json, a.created_at, a.rowid AS attempt_order "
+            "FROM attempts a JOIN tasks t ON t.task_id=a.task_id AND a.attempt_no=t.current_attempt "
+            "WHERE t.task_id!=? AND t.engine=? AND (a.native_session_id=? OR a.resume_session_id=?) "
+            "AND a.state IN ('pending','waiting','claimed','running','unknown') ORDER BY a.created_at, a.rowid",
+            (exclude_task, engine, session_id, session_id)).fetchall()
+
+    @staticmethod
+    def _holds_session(row: sqlite3.Row) -> bool:
+        # An unknown attempt keeps the session until its processes are proven stopped, as for capacity.
+        return row["state"] in ("claimed", "running") or (
+            row["state"] == "unknown" and not json.loads(row["evidence_json"] or "{}").get("processes_stopped"))
+
+    def _session_users(self, c: sqlite3.Connection, engine: str, session_id: str,
+                       exclude_task: str) -> List[Dict[str, Any]]:
+        return [{"task_id": r["task_id"], "attempt_no": r["attempt_no"], "state": r["state"]}
+                for r in self._session_rows(c, engine, session_id, exclude_task)
+                if r["state"] != "unknown" or self._holds_session(r)]
+
+    def session_users(self, engine: str, session_id: str, *, exclude_task: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Other tasks that hold this session or wait for it (submit and resume refuse while any exist)."""
+        return self._session_users(self.conn, engine, session_id, exclude_task or "")
+
+    def _refuse_busy_session(self, c: sqlite3.Connection, engine: str, session_id: str, *, exclude_task: str = "",
+                             after: Optional[str] = None) -> None:
+        """Inside the writing transaction, so two submits or resumes cannot both pass the check. A send
+        queued with --after behind the only task using the session is the explicit way to wait."""
+        users = self._session_users(c, engine, session_id, exclude_task)
+        if users and {user["task_id"] for user in users} != {after}:
+            problem = {"session_id": session_id, "holder": "relay_task",
+                       "holder_task_ids": [user["task_id"] for user in users], "holders": users}
+            raise Refused("session_busy", engines.session_problem_message({"reason": "session_busy", **problem}),
+                          **problem)
+
+    def session_owners(self, engine: str, session_id: str) -> List[Dict[str, Any]]:
+        """Ordinary tasks (not messages sent with --session) whose own runs created or resumed this session."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT t.task_id, t.payload_json FROM attempts a JOIN tasks t ON t.task_id=a.task_id "
+            "WHERE t.engine=? AND (a.native_session_id=? OR a.resume_session_id=?) ORDER BY t.task_id",
+            (engine, session_id, session_id)).fetchall()
+        owners = [{"task_id": r["task_id"], "payload": json.loads(r["payload_json"])} for r in rows]
+        return [owner for owner in owners if "target_session_id" not in owner["payload"]]
+
+    def _session_gate(self, c: sqlite3.Connection, task: sqlite3.Row) -> Optional[Dict[str, Any]]:
+        """At most one relay attempt per native session in this home: an attempt that resumes a session
+        waits while another task holds it, and behind earlier attempts waiting for it (FIFO)."""
+        att = c.execute("SELECT resume_session_id, created_at, rowid FROM attempts WHERE task_id=? AND attempt_no=?",
+                        (task["task_id"], task["current_attempt"])).fetchone()
+        if att is None or not att["resume_session_id"]:
+            return None
+        rows = self._session_rows(c, task["engine"], att["resume_session_id"], task["task_id"])
+        holders = [r["task_id"] for r in rows if self._holds_session(r)]
+        ahead = [r["task_id"] for r in rows if r["state"] in ("pending", "waiting")
+                 and (r["created_at"], r["attempt_order"]) < (att["created_at"], att["rowid"])]
+        if not holders and not ahead:
+            return None
+        return {"session_id": att["resume_session_id"], "holder_task_ids": holders, "ahead_task_ids": ahead}
 
     def _waiting_on(self, c: sqlite3.Connection, task: sqlite3.Row) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
         waiting, rejected = self._gates(c, task)
@@ -909,10 +981,11 @@ class Ledger:
         if observations.get("git", {}).get("dirty") is True:
             warnings.append({"code": "uncommitted_changes"})
         if task["engine"] == "codex" and outcome in ("failed", "blocked"):
-            warning = engines.codex_git_repo_check_warning(
-                self.run_dir(att["task_id"], att["attempt_no"]) / "stderr.log")
-            if warning is not None:
-                warnings.append(warning)
+            stderr_log = self.run_dir(att["task_id"], att["attempt_no"]) / "stderr.log"
+            for warning in (engines.codex_git_repo_check_warning(stderr_log),
+                            engines.codex_session_busy_warning(stderr_log)):
+                if warning is not None:
+                    warnings.append(warning)
         for warning in observations.get("warnings", []):
             if warning not in warnings:
                 warnings.append(warning)
@@ -952,7 +1025,8 @@ class Ledger:
                                                           "billing_env_removed", "billing_env_preserved",
                                                           *business_status.FIELDS)
                         if key in observations})
-        if observations.get("preflight", {}).get("reason") == "billing_env_present":
+        if observations.get("preflight", {}).get("reason") in ("billing_env_present",
+                                                               *engines.SESSION_PREFLIGHT_REASONS):
             details["preflight"] = observations["preflight"]
         body = {
             "task_id": att["task_id"],
@@ -1040,6 +1114,8 @@ class Ledger:
                             (task_id, expect_attempt_no)).fetchone()
             if att["state"] in ACTIVE_STATES:
                 raise Refused("attempt_active", "the current attempt has not finished", state=att["state"])
+            if resume_session_id:
+                self._refuse_busy_session(c, task["engine"], resume_session_id, exclude_task=task_id)
             next_no = expect_attempt_no + 1
             attempt_id = new_id("a")
             c.execute(

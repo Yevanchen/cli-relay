@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -16,21 +17,65 @@ from cli_relay.ledger import payload_hash
 
 
 class BashRuleWarnings(unittest.TestCase):
-    def test_only_cp_with_a_later_flag_warns(self):
-        for command, warns in (("cp -n a b", True), ("cp -p a b", True), ("cp a -n b", True),
-                               ("cp a b", False), ("ls -la x", False), ("mkdir -p k/l", False),
-                               ("mv -n a b", False), ("rm -f a", False), ("/bin/cp -n a b", False)):
+    # Expectations follow the isolated 2026-11-08 reproduction with Claude Code 2.1.312 (issue #22):
+    # cp/mv with any flag are denied under every scoped rule; rm -f, mkdir -p, ln -s, sed -i, ls -la
+    # and /bin/cp -n are allowed by their rules.
+    def test_only_cp_and_mv_with_a_later_flag_warn(self):
+        for command, warns in (("cp -n a b", True), ("cp -p a b", True), ("cp -f a b", True), ("cp -r a b", True),
+                               ("cp a -n b", True), ("mv -n a b", True), ("cp a b", False), ("mv a b", False),
+                               ("ls -la x", False), ("mkdir -p k/l", False), ("rm -f a", False), ("ln -s a b", False),
+                               ("sed -i.bak s/x/y/ a", False), ("/bin/cp -n a b", False), ("/bin/mv -n a b", False)):
             with self.subTest(command=command):
                 payload = {"options": {"allowed_bash_commands": [command]}}
                 warnings = engines.bash_rule_warnings("claude", payload)
                 self.assertEqual(len(warnings), int(warns))
                 if warns:
+                    name = command.split()[0]
                     self.assertEqual(warnings[0]["code"], "bash_rule_not_honoured")
                     self.assertEqual(warnings[0]["command"], command)
-                    for text in ("Claude Code", "2.1.312", "prefix rule is listed", "cp <src> <dst>",
-                                 "drop -n only when overwriting the destination is acceptable", "test -e"):
+                    for text in ("Claude Code", "2.1.312", "prefix rule is listed", f"{name} <src> <dst>",
+                                 f"Bash({name}:*)", f"Bash({name} *)", "only an unrestricted Bash rule",
+                                 "drop -n only when overwriting the destination is acceptable",
+                                 f"`test -e <dst> || {name} <src> <dst>`"):
                         self.assertIn(text, warnings[0]["hint"])
-        self.assertEqual(engines.bash_rule_warnings("fixture", payload), [])
+        for engine in ("fixture", "codex"):
+            self.assertEqual(engines.bash_rule_warnings(engine, {"cwd": "/", "options": {
+                "allowed_bash_commands": ["cp -n /a /b"]}}), [])
+
+    def test_paths_outside_the_task_directory_warn_for_checked_commands_only(self):
+        with tempfile.TemporaryDirectory(prefix="relay-bash-paths-") as tmp:
+            alias = Path(tmp) / "task"  # on macOS /var/folders/... is an alias of /private/var/folders/...
+            alias.mkdir()
+            cwd = os.path.realpath(alias)
+            (alias / "escape").symlink_to(tmp)
+            cases = {"cp ../outside/a b": ["../outside/a"], "ls -la /etc/hosts": ["/etc/hosts"],
+                     "cat /etc/hosts": ["/etc/hosts"], f"cp /elsewhere/a {cwd}/b": ["/elsewhere/a"],
+                     "mkdir /tmp/new-dir": ["/tmp/new-dir"], "touch ../t.txt": ["../t.txt"],
+                     "rm ../a": ["../a"], "mv ../a ../b": ["../a", "../b"], "cp a escape/b": ["escape/b"],
+                     f"cp {alias}/a {cwd}/b": [], "cp a out/b": [], "rm out/../a": [], "mkdir -p k/l": [],
+                     "ls -la": [], "python3 /opt/tools/check.py": [], "/bin/cp ../a b": [],
+                     "./tool.sh ../a": []}
+            for command, outside in cases.items():
+                with self.subTest(command=command):
+                    warnings = [w for w in engines.bash_rule_warnings(
+                        "claude", {"cwd": cwd, "options": {"allowed_bash_commands": [command]}})
+                        if w["code"] == "bash_rule_path_outside_cwd"]
+                    self.assertEqual([w["paths"] for w in warnings], [outside] if outside else [])
+                    if outside:
+                        self.assertEqual(warnings[0]["command"], command)
+                        for text in ("2.1.312", "cat, cp, ls, mkdir, mv, rm, touch", "outside the task directory",
+                                     "even when the prefix rule matches", "--cwd"):
+                            self.assertIn(text, warnings[0]["hint"])
+
+    def test_env_files_are_not_special(self):
+        # Claude Code allowed `cp .env.example .env` and Write to cfg/.env under their rules; only the
+        # flag of `cp -n` matters.
+        for command, codes in (("cp .env.example .env", []), ("cp -n .env.example .env", ["bash_rule_not_honoured"]),
+                               ("cp -n .env.example cfg/.env.local", ["bash_rule_not_honoured"])):
+            with self.subTest(command=command):
+                warnings = engines.bash_rule_warnings("claude", {"cwd": "/srv/app", "options": {
+                    "allowed_bash_commands": [command]}})
+                self.assertEqual([w["code"] for w in warnings], codes)
 
 
 class BashDenialParsing(unittest.TestCase):
@@ -134,6 +179,18 @@ class BashDiagnosticsRoundTrip(RelayTestCase):
         again, _ = self.submit_claude(list(reversed(commands)))
         self.assertEqual((again["status"], again["task_id"], again["payload_sha256"], again["warnings"]),
                          ("duplicate", sub["task_id"], sub["payload_sha256"], sub["warnings"]))
+
+    def test_outside_path_warning_is_receipt_metadata_only(self):
+        commands = ["cp ../shared/.env.example .env", "mv -n a b"]
+        sub, env = self.submit_claude(commands)
+        self.assertTrue(sub["accepted"])
+        self.assertEqual([(w["code"], w["command"], w.get("paths")) for w in sub["warnings"]],
+                         [("bash_rule_path_outside_cwd", "cp ../shared/.env.example .env", ["../shared/.env.example"]),
+                          ("bash_rule_not_honoured", "mv -n a b", None)])
+        self.assertEqual(sub["payload_sha256"], payload_hash({"engine": "claude", "cwd": str(self.work.resolve()),
+                         "prompt": "work", "task_class": "highest_quality", "resource_class": "standard",
+                         "options": {**production_options("claude"), "allowed_bash_commands": commands}}))
+        self.assertEqual(self.finish(sub, env)["task"]["state"], "succeeded")
 
     def test_unaffected_submit_keeps_old_output_shape_and_hash(self):
         commands = ["cp a b", "ls -la x", "mkdir -p k/l"]

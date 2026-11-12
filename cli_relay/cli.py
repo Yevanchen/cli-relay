@@ -211,6 +211,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
             raw_options[field] = value
     options = engines.validate_options(engine, raw_options, cwd=cwd)
     payload = {"engine": engine, "cwd": cwd, "prompt": prompt, "options": options, **_parse_origin(args.origin)}
+    if args.session is not None:
+        payload["target_session_id"] = engines.validate_session_id(args.session)
     for field in ("task_class", "resource_class", "test_only_reason"):
         value = getattr(args, field, None)
         if value is not None:
@@ -237,6 +239,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         if not os.path.isdir(cwd):
             raise UsageError("--cwd must be an existing directory")
         ledger.check_disk()
+        if "target_session_id" in payload:
+            _check_session_free(ledger, args.home, engine, payload)
     route = consumer = chat = None
     bound = False
     if existing is None:
@@ -274,7 +278,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
             keeper = "kicked"
         task = ledger.get_task(task["task_id"])
         att = ledger.current_attempt(task["task_id"])
-    warnings = engines.bash_rule_warnings(engine, payload) + policy.warnings(engine, payload)
+    warnings = (engines.bash_rule_warnings(engine, payload) + policy.warnings(engine, payload)
+                + _session_warnings(args.home, engine, payload))
     emit({"ok": True, "accepted": True, "status": status, "task_id": task["task_id"], "state": task["state"],
           "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
           "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper,
@@ -288,6 +293,52 @@ def cmd_submit(args: argparse.Namespace) -> int:
           ("bound" if task.get("notify_bound") == 1 else "unbound"),
           "ledger_id": ledger.ledger_id})
     return 0
+
+
+def _refuse_session(problem: Dict[str, Any]) -> None:
+    raise Refused(problem["reason"], engines.session_problem_message(problem),
+                  **{key: value for key, value in problem.items() if key != "reason"})
+
+
+def _check_session_free(ledger: Ledger, home: Path, engine: str, payload: Dict[str, Any]) -> None:
+    """A new message for an existing session: refuse a session that is missing, used by another relay
+    task, open in a live CLI process, or (Codex) not created by the subscription provider. A send
+    queued with --after behind the only task using the session is accepted; the keeper checks again."""
+    sid = payload["target_session_id"]
+    users = ledger.session_users(engine, sid)
+    queued_behind = bool(users) and {user["task_id"] for user in users} == {payload.get("after")}
+    if users and not queued_behind:
+        _refuse_session({"reason": "session_busy", "session_id": sid, "holder": "relay_task",
+                         "holder_task_ids": [user["task_id"] for user in users], "holders": users})
+    if engine == "codex":
+        for owner in ledger.session_owners(engine, sid):
+            wider = engines.codex_widens(owner["payload"], payload)
+            if wider is not None:
+                _refuse_session({"reason": "session_permissions_wider", "session_id": sid,
+                                 "owner_task_id": owner["task_id"], **wider})
+    # Behind its holder, that task's own CLI owns the session until it ends; native holders are
+    # checked again by the keeper right before the turn is sent. Ledger.submit repeats the relay
+    # check inside its transaction.
+    problem = engines.session_preflight(engine, dict(os.environ), sid, fixture_state_dir=str(home / "fixture-sessions"),
+                                        check_holder=not queued_behind)
+    if problem is not None:
+        _refuse_session(problem)
+
+
+def _session_warnings(home: Path, engine: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Receipt metadata after the commit: best effort, so a malformed record never fails the receipt."""
+    sid = payload.get("target_session_id")
+    try:
+        record = engines.session_record(engine, dict(os.environ), sid,
+                                        fixture_state_dir=str(home / "fixture-sessions")) if sid else None
+        created_in = engines.session_cwd(engine, record) if record else None
+        if created_in is None or os.path.realpath(created_in) == payload["cwd"]:
+            return []
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+    return [{"code": "session_cwd_differs", "session_cwd": created_in, "cwd": payload["cwd"],
+             "hint": "the session was created in another directory; this turn runs in --cwd, where its tools and "
+                     "the relay's git, result_file and artifact checks apply"}]
 
 
 def _check_route(route: str, cfg: Optional[Dict[str, Any]] = None) -> str:
@@ -437,6 +488,9 @@ def cmd_brief(args: argparse.Namespace) -> int:
                            "business_status": status, "business_status_source": body.get("business_status_source", "none"),
                            **{key: body[key] for key in business_status.FIELDS if key in body},
                            **({"effective_settings": body["effective_settings"]} if "effective_settings" in body else {}),
+                           # billing and session blocks only: names, ids and the fix, never values
+                           **({"preflight": body["preflight"]} if "preflight" in body else {}),
+                           **({"target_session_id": body["target_session_id"]} if "target_session_id" in body else {}),
                            "warnings": body.get("warnings", []), "result_file": result_file, "message": message})
             refs.append({**identity, **source, "consumer": consumer})
         command = None
@@ -578,11 +632,15 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if not proof["stopped"]:
         raise Refused("old_run_may_be_alive", "cannot prove the previous run stopped; refusing to resume", **proof)
     if args.fresh:
+        payload = json.loads(task["payload_json"])
+        if "target_session_id" in payload:
+            raise Refused("fresh_not_supported", "this task sent a message to an existing session; a fresh rerun "
+                          "would replay it in a new, empty session. Resume it, or submit a new message",
+                          target_session_id=payload["target_session_id"])
         if not args.confirm_rerun:
             raise Refused("rerun_not_confirmed",
                           "--fresh starts a new native session from the original prompt and may repeat side "
                           "effects; add --confirm-rerun to proceed")
-        payload = json.loads(task["payload_json"])
         prompt = payload["prompt"]
         resume_sid = None
         native_sid = str(uuid.uuid4()) if task["engine"] in ("claude", "fixture") else None
@@ -593,6 +651,16 @@ def cmd_resume(args: argparse.Namespace) -> int:
         if not resume_sid:
             raise Refused("no_native_session", "the previous attempt has no recorded native session id; "
                           "exact resume is impossible (use --fresh --confirm-rerun to start over)")
+        users = ledger.session_users(task["engine"], resume_sid, exclude_task=task_id)
+        if users:  # repeated inside new_attempt's transaction
+            _refuse_session({"reason": "session_busy", "session_id": resume_sid, "holder": "relay_task",
+                             "holder_task_ids": [user["task_id"] for user in users], "holders": users})
+        if "target_session_id" in json.loads(task["payload_json"]):
+            # The same checks as submit --session: the keeper repeats them before the turn is sent.
+            problem = engines.session_preflight(task["engine"], dict(os.environ), resume_sid,
+                                                fixture_state_dir=str(args.home / "fixture-sessions"))
+            if problem is not None:
+                _refuse_session(problem)
         native_sid = resume_sid
         reason = "resume"
     new = ledger.new_attempt(task_id, expect_attempt_no=att["attempt_no"], reason=reason, prompt=prompt,
@@ -822,6 +890,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--billing-mode", choices=engines.CODEX_BILLING_MODES,
                    help="Codex: subscription (default) isolates billing env; api explicitly permits API billing "
                         "and preserves billing env except --unset-env; persisted for resume")
+    s.add_argument("--session", metavar="SESSION_ID",
+                   help="deliver the prompt as the next turn of this existing Claude session or Codex thread "
+                        "(exact UUID); refused while it is missing, busy or not the subscription's")
     s.add_argument("--notify-route", help="route in notifier.json that is woken when the task ends")
     s.add_argument("--origin", metavar='JSON', help='optional origin metadata: {"bot":"NAME","chat":"ID"}')
     s.add_argument("--after", action="append", metavar="REF", help="wait for one existing task id or key in this scope")

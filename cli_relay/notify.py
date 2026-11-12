@@ -282,7 +282,7 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
                                           "reason_code", "details", "summary", "unset_env", "unset_env_present", "preflight",
                                           "billing_mode", "billing_env_policy", "billing_env_present",
                                           "billing_env_removed", "billing_env_preserved",
-                                          "result_file", "effective_settings",
+                                          "result_file", "effective_settings", "target_session_id",
                                           *business_status.FIELDS)
                if key in body},
             "result_excerpt": _clean(body.get("result_excerpt"), EXCERPT_MAX)}
@@ -332,12 +332,20 @@ def build_payload(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, re
         for r in refs if "business_status" in r)
     reasons = " | ".join(f"{r['task_id']}#{r['attempt_no']} {_clean(r['summary'], 300)}"
                          for r in refs if r.get("summary"))
+    # The copy-pasteable billing fix is the only actionable part of that block; command adapters
+    # receive no structured record, so it is never truncated (names come from BILLING_ENV only).
+    fixes = " | ".join(
+        f"{r['task_id']}#{r['attempt_no']} billing_env_present fix: submit with a new key and "
+        f"{_clean(r['preflight']['fix'].get('submit_flags'), 1000)}, or prefix the command with "
+        f"{_clean(r['preflight']['fix'].get('env_prefix'), 1000)}"
+        for r in refs if isinstance(r.get("preflight"), dict) and r["preflight"].get("reason") == "billing_env_present"
+        and isinstance(r["preflight"].get("fix"), dict))
     record = {"schema": PAYLOAD_SCHEMA, "source_id": cfg["source_id"], "ledger_id": ledger_id,
               "route": route["name"], "chat": route["chat"], "consumer": route["consumer"],
               "reminder": reminder, "count": len(refs), "events": refs}
     return {"job": route["adapter"]["job"], "stage": f"{cfg['source_id']}/{route['name']}", "status": status,
             "summary": _clean(summary, SUMMARY_MAX) + (" | " + business if business else "")
-                       + (" | " + reasons if reasons else "") + " | " + permissions,
+                       + (" | " + reasons if reasons else "") + (" | " + fixes if fixes else "") + " | " + permissions,
             "artifact": f"cli-relay:{cfg['source_id']}:{ledger_id}",
             "cli_relay": record}
 

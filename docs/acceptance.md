@@ -221,6 +221,44 @@ This shows the Codex setting and its effect. It is not a `codex exec` run of the
 which needs a model call: a real Codex test task with `allow_network=true` is **NOT RUN** and
 remains a deployment check, as does a real task that ends with the completion marker.
 
+### 2.7 Issue #22: Claude Bash rules (real Claude Code, settings isolated)
+
+On 2026-11-08 the MBP ran Claude Code 2.1.312 (`claude-haiku-5-5`, `dontAsk`, `apiKeySource:
+none`) 60 times, one exact command per run, in fresh non-Git directories. The argv came from
+`engines.build` where the relay can express the rule; `--setting-sources project,local` excluded
+`~/.claude/settings.json`, and its debug log listed only the missing managed and project files.
+An empty `HOME` was tried first and is unusable on macOS: `claude auth status` then reports
+`loggedIn: false` because the keychain login is not found. Nine cases rerun with the user's settings
+loaded matched exactly. The table and conclusions are in
+[`usage.md`](usage.md#allowed_bash_commands): the relay's rules match, `cp`/`mv` with any flag are
+denied under every scoped spelling, paths outside the task directory are denied for bare file
+commands, and `.env` files are not special. Submit warnings for both cases are covered by
+`test_only_cp_and_mv_with_a_later_flag_warn`,
+`test_paths_outside_the_task_directory_warn_for_checked_commands_only`,
+`test_env_files_are_not_special` and `test_outside_path_warning_is_receipt_metadata_only`
+(no model calls). Raw run records are kept locally and not committed. Other Claude Code versions
+and the interactive TUI are **NOT RUN**.
+
+### 2.8 Issue #18: messages to existing sessions
+
+The session behaviour the design rests on was checked on the MBP with the real CLIs, outside the
+relay (Claude Code 2.1.312 with `claude-haiku-5-5`; codex-cli 0.162.1 with `gpt-6.1-terra`, low
+effort, `read-only`); see [D17](decisions.md#d17-issue-18-a-message-as-the-next-turn-of-an-existing-session).
+The relay side is covered by `test_session_send.py` (fixture engine and fake Claude/Codex CLIs, no
+model calls): the next turn runs in the target session with its context, events and ACK carry
+`target_session_id`, hash/duplicate/conflict rules, missing and malformed ids, a busy session refused
+unless queued with `--after` and then run strictly after its holder, `resume` refused while another
+task holds the session, the same check inside the submit and resume transactions, the FIFO
+admission gate across scopes (also for a send created behind the CLI's back), a session that
+disappears or is opened by a live Claude process before the keeper runs (`blocked`, CLI never
+started), stale and malformed registry entries, the Codex writer lock (held, free, shared), the Codex
+provider record, the own-turns permission check, a send that would widen an ordinary task's thread
+(refused, while an equal one leaves the owner's resume passing), and a Codex resume that loses the
+writer race. A separate run through the relay with the real CLIs on the MBP sent a follow-up into a
+real Codex thread and a real Claude session (both answered from the session's context), and was
+refused with `session_busy` while a real Codex turn held the writer lock and while a real Claude
+process had the session open. The Claude Code TUI and the Codex App are **NOT RUN**.
+
 ## 3. Real 25-hour soak
 
 | Run | Code | Status |
