@@ -132,6 +132,28 @@ explicitly supplied) and `queue`. Supplied fields participate in idempotency: ch
 under the same key conflicts. Omitting all three preserves the previous payload and hash.
 No ledger schema change or migration is required; existing databases and events remain readable.
 
+### Business-status dependency diagnostics (issue #32)
+
+For `--after` with the default `ok` or explicit `ok_or_partial`, submit receipts warn with
+`dependency_business_status_not_declared` when the active upstream task declares neither
+`result_file` nor `require_business_status=true`. A terminal upstream whose business status is
+`unreported` instead produces `dependency_business_status_unreported`, even if it declared a
+result file. A terminal upstream with a reported status, `any_terminal`, and tasks without
+`--after` do not produce these warnings. Warnings describe the upstream's current attempt and may
+change when a duplicate submit reads a later state; they never change the payload hash or gate.
+
+The hint gives the result options and canonical values: `status` is `ok|partial|failed`, and JSON
+`stop_reason` is `null|blocked|needs_user|stopped_for_approval`. Ask the upstream producer for those
+values, or a plain final `status=...` line. Merely adding the options does not make a model report
+correctly. An already finished upstream needs an explicit resume or a corrected task with a new key;
+the relay does not rewrite its prompt, retry it, or treat an unreported result as success.
+
+When an unreported result blocks the downstream, `details.dependency_business_reports` contains
+the frozen upstream `result_file`/`status_line` raw status and stop reason (strings bounded to 128
+characters, or null). The one-line block summary includes `raw_reports`, with control characters
+escaped; terminal events and notification entries carry the same details. No result file is reread,
+no prose or arbitrary JSON fields are copied, and historical events are unchanged.
+
 ## Sending a message to an existing session
 
 `submit --session SESSION_ID` delivers the prompt as the next turn of an existing Claude Code

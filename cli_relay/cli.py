@@ -289,7 +289,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         task = ledger.get_task(task["task_id"])
         att = ledger.current_attempt(task["task_id"])
     warnings = (engines.bash_rule_warnings(engine, payload) + policy.warnings(engine, payload)
-                + _session_warnings(args.home, engine, payload))
+                + _session_warnings(args.home, engine, payload) + _dependency_warnings(ledger, payload))
     emit({"ok": True, "accepted": True, "status": status, "task_id": task["task_id"], "state": task["state"],
           "attempt_no": att["attempt_no"], "attempt_id": att["attempt_id"], "submit_count": task["submit_count"],
           "payload_sha256": sha, "native_session_id": att["native_session_id"], "keeper": keeper,
@@ -303,6 +303,37 @@ def cmd_submit(args: argparse.Namespace) -> int:
           ("bound" if task.get("notify_bound") == 1 else "unbound"),
           "ledger_id": ledger.ledger_id})
     return 0
+
+
+def _dependency_warnings(ledger: Ledger, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Receipt diagnostics only: never change the upstream prompt or the dependency gate."""
+    require = payload.get("after_require", "ok")
+    if "after" not in payload or require == "any_terminal":
+        return []
+    dependency = ledger.get_task(payload["after"])
+    options = json.loads(dependency["payload_json"]).get("options", {})
+    attempt = ledger.current_attempt(dependency["task_id"])
+    evidence = _loads(attempt["evidence_json"]) or {}
+    status = evidence.get("business_status", "unreported")
+    terminal = attempt["state"] in ("finished", "unknown")
+    if terminal:
+        if status != "unreported":
+            return []
+        code = "dependency_business_status_unreported"
+    else:
+        if options.get("result_file") or options.get("require_business_status") is True:
+            return []
+        code = "dependency_business_status_not_declared"
+    reports = business_status.dependency_reports(evidence)
+    return [{"code": code, "dependency_task_id": dependency["task_id"], "require": require,
+             "dependency_state": dependency["state"], "dependency_business_status": status,
+             **({"dependency_business_reports": reports} if reports else {}),
+             "hint": "this dependency requires a reported business result; unreported blocks it even when "
+                     "the upstream CLI succeeds. Submit upstream work with --option result_file=out/result.json "
+                     "or --option require_business_status=true and ask for status=ok|partial|failed; JSON "
+                     "stop_reason must be null|blocked|needs_user|stopped_for_approval. For an already finished "
+                     "upstream, explicitly resume it or submit corrected work with a new key; this warning "
+                     "does not change or retry either task."}]
 
 
 def _refuse_session(problem: Dict[str, Any]) -> None:

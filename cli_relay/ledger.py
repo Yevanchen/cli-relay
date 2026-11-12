@@ -721,6 +721,10 @@ class Ledger:
             outcome = dependency["outcome"] or ("unknown" if dependency["state"] == "unknown" else None)
             details = {"dependency_task_id": payload["after"], "dependency_outcome": outcome,
                        "dependency_business_status": status, "require": require}
+            if status == "unreported":
+                reports = business_status.dependency_reports(business)
+                if reports:
+                    details["dependency_business_reports"] = reports
             terminal = dependency["state"] in ("finished", "unknown")
             satisfied = require == "any_terminal" or (
                 outcome == "succeeded" and not business.get("business_stop_reason") and
@@ -871,6 +875,9 @@ class Ledger:
                 summary = (f"dependency {rejected['dependency_task_id']} "
                            f"business_status={rejected['dependency_business_status']} "
                            f"outcome={rejected['dependency_outcome']} does not satisfy require={rejected['require']}")
+                if rejected.get("dependency_business_reports"):
+                    summary += " raw_reports=" + json.dumps(rejected["dependency_business_reports"],
+                                                             ensure_ascii=True, separators=(",", ":"))
                 self._close_in_tx(c, att, new_state="finished", kind="terminal", outcome="blocked",
                                   exit_code=None, exit_signal=None, exit_known=False, native=None,
                                   evidence={"reason_code": "dependency_not_satisfied", "details": rejected,
