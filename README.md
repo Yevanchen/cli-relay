@@ -69,7 +69,16 @@ the 30-minute ACK timeout, or its notification fails; it keeps the task's origin
 | `codex` | Codex (explicit sandbox required for new production work) |
 | `fixture` | Local stand-in for tests |
 
-New production work requires explicit task/resource class and tier-matched model/effort.
+New production work requires explicit task/resource class and tier-matched model/effort:
+
+| Task class | Engine | Model | Effort |
+|---|---|---|---|
+| simple | codex | gpt-6.1-terra | high |
+| complex | codex | gpt-6.1-sol | max |
+| highest_quality | claude | claude-opus-5-5 | max |
+| highest_quality | claude | claude-fable-5-2 | xhigh |
+| highest_quality | claude | claude-fable-5-2 | max |
+
 All scopes in one relay home share a configurable, memory-aware budget: by default at most
 four active jobs when available memory is at least 1536 MiB, one below that threshold, or
 two if memory cannot be read. Computer use stays limited to one job.
