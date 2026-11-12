@@ -829,7 +829,7 @@ Without Task/Agent opt-in, the launcher explicitly disables native Task and Agen
 New production submits require an explicit task/resource class, engine/model/effort and Codex
 sandbox. See the [routing table and migration rules](migration-20261106.md#new-production-requests).
 Use `simple` + Codex Terra/high, `complex` + Codex Sol/max (including computer use), or
-`highest_quality` + either Claude Opus 5.5/max or Claude Fable 5.2/xhigh (Extra High).
+`highest_quality` + Claude Opus 5.5/max or Claude Fable 5.2/xhigh (Extra High) or max.
 Unknown/deprecated models and mismatches are usage errors.
 Only `engine=fixture` has a test-only exemption. No defaults or global settings are changed.
 
