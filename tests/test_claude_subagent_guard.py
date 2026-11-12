@@ -82,7 +82,8 @@ class SubagentCeiling(unittest.TestCase):
         self.assertEqual(secret.read_text(), "unchanged")
 
     def test_config_and_shell_startup_writes_are_denied_even_inside_a_grant(self):
-        for path in ("out/.claude/settings.json", "out/.claude.json", "out/.git/config", "out/.mcp.json", "out/.bashrc", "out/.zshenv"):
+        for path in ("out/.claude/settings.json", "out/.claude.json", "out/.git/config", "out/.mcp.json", "out/.bashrc", "out/.zshenv",
+                     "out/.CLAUDE/settings.json", "out/.CLAUDE.JSON", "out/.GIT/config", "out/.BASHRC"):
             self.assertIsNotNone(self.denial("Write", {"file_path": path}), path)
 
     def test_custom_agents_modes_nested_resumed_and_background_agents_are_denied(self):
@@ -159,6 +160,28 @@ class SubagentCeiling(unittest.TestCase):
         env = {**self.env, "CLAUDE_CONFIG_DIR": str(self.cwd / "out" / "config")}
         with self.assertRaisesRegex(RuntimeError, "overlaps"):
             self.build(env=env)
+        with self.assertRaisesRegex(RuntimeError, "absolute"):
+            self.build(env={**self.env, "CLAUDE_CONFIG_DIR": "out/config"})
+        binary = self.cwd / "out" / "claude"
+        binary.write_bytes(Path(self.env["CLI_RELAY_CLAUDE_BIN"]).read_bytes())
+        binary.chmod(0o755)
+        with self.assertRaisesRegex(RuntimeError, "overlaps"):
+            self.build(env={**self.env, "CLI_RELAY_CLAUDE_BIN": str(binary)})
+        managed = self.cwd / "out" / "managed" / "managed-settings.json"
+        with patch.object(engines, "CLAUDE_MANAGED_SETTINGS", (managed,)):
+            with self.assertRaisesRegex(RuntimeError, "overlaps"):
+                self.build()
+
+    def test_config_overlap_through_case_or_unicode_alias_is_refused(self):
+        # Linux can have distinct OUT/out directories; over-denying that configuration is safe.
+        # macOS commonly aliases them and must never let the grant hide the live config dir.
+        config = self.cwd / "out" / "config"
+        config.mkdir()
+        env = {**self.env, "CLAUDE_CONFIG_DIR": str(config)}
+        with self.assertRaisesRegex(RuntimeError, "overlaps"):
+            self.build(options={**self.options, "allowed_write_dirs": ["OUT"]}, env=env)
+        self.assertTrue(guard.protected_scope_overlap(Path("/tmp/caf\u00e9/out"), Path("/tmp/cafe\u0301/OUT/config")))
+        self.assertFalse(guard.protected_scope_overlap(Path("/tmp/out"), Path("/tmp/out-other/config")))
 
     def test_managed_dropins_cannot_disable_the_policy_hook(self):
         managed = self.root / "managed-settings.json"

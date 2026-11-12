@@ -552,12 +552,20 @@ def claude_guard_problems(env: Dict[str, str], cwd: Optional[str], options: Dict
             problems += [layer + ":" + key for key in claude_guard.config_problems(data)]
         except (OSError, ValueError):
             problems.append(layer + ":unreadable")
-    config = claude_config_dir(env).resolve()
+    config_path = claude_config_dir(env)
+    if not config_path.is_absolute():
+        problems.append("subagent_guard_requires_absolute_claude_config_dir")
+    config = config_path.resolve()
+    binary = resolve_bin("claude", env)
+    if binary and not Path(binary).is_absolute():
+        problems.append("subagent_guard_requires_absolute_claude_binary")
     protected = (config, Path(sys.base_prefix).resolve(), Path(sys.prefix).resolve(),
-                 Path(sys.executable).resolve().parent)
+                 Path(sys.executable).resolve().parent, Path(__file__).resolve().parent,
+                 *(path.parent.resolve() for path in CLAUDE_MANAGED_SETTINGS),
+                 *((Path(binary).absolute(), Path(binary).resolve()) if binary else ()))
     for root in claude_guard.snapshot(options, cwd or os.getcwd())["write"]:
         grant = Path(root)
-        if any(path.is_relative_to(grant) or grant.is_relative_to(path) for path in protected):
+        if any(claude_guard.protected_scope_overlap(path, grant) for path in protected):
             problems.append("write_grant_overlaps_guard_runtime_or_claude_config")
     return problems
 

@@ -14,6 +14,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+import unicodedata
 from typing import Any
 
 from .errors import UsageError
@@ -33,6 +34,16 @@ def validate(options: dict) -> None:
     if any(command != "ls" for command in options.get("allowed_bash_commands", [])):
         raise UsageError("Task/Agent currently support only --allow-bash ls (or no Bash grant); "
                          "other commands need an outer sandbox; see docs/claude-subagents.md")
+
+
+def protected_scope_overlap(first: Path, second: Path) -> bool:
+    """Conservatively protect case/normalization aliases, including on macOS volumes.
+
+    Only deny decisions use this comparison. File grants keep their strict realpath checks;
+    folding a grant match would incorrectly authorize distinct paths on Linux.
+    """
+    a, b = (unicodedata.normalize("NFC", str(path)).casefold().rstrip("/") for path in (first, second))
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
 def check_version(binary: str, env: dict) -> None:
@@ -121,10 +132,10 @@ def evaluate(event: dict, policy: dict) -> str | None:
         # Keep CLI/tool configuration and git control files protected, including under a grant.
         protected = (".claude", ".claude.json", ".git", ".mcp.json", ".bashrc", ".bash_profile", ".bash_login", ".profile",
                      ".zshenv", ".zshrc", ".zprofile", ".zlogin", ".zlogout")
-        if any(part in protected for part in path.parts):
+        if any(part.casefold() in protected for part in path.parts):
             return "configuration writes are disabled"
         resolved = path.resolve()
-        if any(part in protected for part in resolved.parts):
+        if any(part.casefold() in protected for part in resolved.parts):
             return "configuration writes are disabled"
         if not any(resolved != Path(root) and resolved.is_relative_to(Path(root)) for root in policy["write"]):
             return "write is outside the directory ceiling"

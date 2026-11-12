@@ -316,7 +316,7 @@ foreground generated workers, directory-scoped writes, and `ls` or no Bash grant
   directory denials, symlink replacement, hard links, config writes, unknown tools, startup
   environment/config conflicts, version mismatch, argv mutation, default native denials,
   first run, exact parent resume, fresh rerun, receipts and stored policy.
-- Final full suite: Python 3.14.3, **591 tests passed** in 474.990 seconds, no skips or
+- Final full suite: Python 3.14.3, **592 tests passed** in 478.753 seconds, no skips or
   failures. The 0.03-hour fixture soak also returned **PASS**. The first full run's two old
   argv expectations were corrected before this full rerun; code hashes stayed unchanged
   throughout final validation.

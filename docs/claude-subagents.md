@@ -53,10 +53,18 @@ The evaluator enforces these conditions independently of an inherited broad allo
 Preflight and build reject executable customizations that could bypass/disable the hook:
 existing hooks, enabled plugins/mods, a selected custom session agent, hook-disabling
 settings, and relevant settings environment overrides. They also reject write grants
-overlapping the Claude config directory or the Python guard runtime. This does **not**
+overlapping Claude configuration/managed-policy directories, the Python runtime, the
+Claude executable or the active relay package. Guarded attempts require absolute config
+and executable paths so the preflight and child cannot resolve them against different cwd.
+This does **not**
 silently drop the user's permission policy: settings sources remain loaded and deny/ask
 rules remain in force. [Permission rule precedence](https://code.claude.com/docs/en/permissions#precedence-among-rules-hooks-and-mods)
 still applies; hook success does not approve a call or bypass a deny/ask rule.
+
+Protected configuration names and scope-overlap denials account for case aliases; overlap
+checks also normalize Unicode. This closes macOS volume aliases such as `out` / `OUT`.
+Folding is used only for denials: actual write grants retain strict resolved-path matching,
+so distinct Linux paths never gain an authorization through case folding.
 
 The CLI version must match **2.1.301 exactly**, both in preflight and before build. Another
 version blocks before model execution until native acceptance is repeated and the pin is
