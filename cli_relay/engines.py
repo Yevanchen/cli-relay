@@ -83,8 +83,10 @@ CLAUDE_PERMISSION_MODE = "dontAsk"
 CLAUDE_PERMISSION_MODES = ("default", "manual", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan")
 CLAUDE_EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
 # Tools a Claude task may add with ``allowed_tools``: exact names only, never a rule pattern, a
-# wildcard or another tool. Both need permission, so dontAsk denies them unless a rule allows them.
-CLAUDE_ALLOWABLE_TOOLS = ("WebFetch", "WebSearch")
+# wildcard or another tool. Task/Agent remain excluded: a custom subagent can override dontAsk
+# with permissionMode: acceptEdits/auto. See docs/claude-subagents.md before widening this list.
+CLAUDE_NETWORK_TOOLS = ("WebFetch", "WebSearch")
+CLAUDE_ALLOWABLE_TOOLS = ("TodoWrite", *CLAUDE_NETWORK_TOOLS)
 CLAUDE_ALLOWED_TOOLS_FLAGS = ("--allowedTools", "--allowed-tools")
 # Observed with Claude Code 2.1.312 under dontAsk, user settings excluded (issue #22): these commands,
 # called by their bare name with any flag, are denied under every scoped rule (Bash(cp -n a b:*), the
@@ -239,8 +241,11 @@ def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str]
     if engine == "claude" and "allowed_tools" in clean:
         tools = clean["allowed_tools"]
         if not all(isinstance(tool, str) and tool in CLAUDE_ALLOWABLE_TOOLS for tool in tools):
-            raise UsageError("allowed_tools accepts only the exact tool names WebFetch and WebSearch; "
-                             "rule patterns, wildcards and other tools are not accepted",
+            subagents = any(isinstance(tool, str) and tool in ("Task", "Agent") for tool in tools)
+            reason = ("; Task/Agent opt-ins are not enabled because custom subagent permissionMode can "
+                      "override dontAsk; see docs/claude-subagents.md" if subagents else "")
+            raise UsageError("allowed_tools accepts only the exact tool names " + ", ".join(CLAUDE_ALLOWABLE_TOOLS) +
+                             "; rule patterns, wildcards and other tools are not accepted" + reason,
                              allowed=list(CLAUDE_ALLOWABLE_TOOLS))
         if len(set(tools)) != len(tools):
             raise UsageError("allowed_tools names a tool more than once")
@@ -533,7 +538,7 @@ def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None, *,
 
 
 def claude_tool_rules(env: Dict[str, str], cwd: Optional[str] = None) -> Dict[str, Any]:
-    """For doctor: what the checked Claude settings layers say about the allowable tools before any
+    """For doctor: what the checked Claude settings layers say about the network tools before any
     task option. Claude evaluates deny, then ask, then allow, and dontAsk denies an ask, so a deny
     or ask rule naming a tool (with or without a specifier, ``*`` matching in the tool name) still
     wins over ``allowed_tools``; only a bare allow rule allows a whole tool. Managed
@@ -563,12 +568,12 @@ def claude_tool_rules(env: Dict[str, str], cwd: Optional[str] = None) -> Dict[st
             if not isinstance(rules, list) or not all(isinstance(rule, str) for rule in rules):
                 complete = False
                 rules = [rule for rule in rules if isinstance(rule, str)] if isinstance(rules, list) else []
-            for tool in CLAUDE_ALLOWABLE_TOOLS:
+            for tool in CLAUDE_NETWORK_TOOLS:
                 if (tool in rules if kind == "allow" else
                         any(fnmatch.fnmatchcase(tool, rule.split("(", 1)[0].strip()) for rule in rules)):
                     names.add(tool)
-    allowed = [tool for tool in CLAUDE_ALLOWABLE_TOOLS if tool in found["allow"] - found["ask"] - found["deny"]]
-    return {"allowed_by_default": allowed == list(CLAUDE_ALLOWABLE_TOOLS), "default_allowed": allowed,
+    allowed = [tool for tool in CLAUDE_NETWORK_TOOLS if tool in found["allow"] - found["ask"] - found["deny"]]
+    return {"allowed_by_default": allowed == list(CLAUDE_NETWORK_TOOLS), "default_allowed": allowed,
             "ask": sorted(found["ask"]), "denied": sorted(found["deny"]), "managed_rules_only": managed_only,
             "complete": complete}
 
@@ -867,7 +872,7 @@ def completion_marker(result: Any) -> Optional[str]:
 
 
 def requested_tools(engine: str, payload: Dict[str, Any]) -> List[str]:
-    """Expand a validated task's web tools, directory grants and command prefixes into rules."""
+    """Expand a validated task's named tools, directory grants and command prefixes into rules."""
     if engine != "claude":
         return []
     options = payload.get("options") or {}
@@ -1042,7 +1047,7 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
         sandboxes.add(CODEX_FULL_ACCESS)
     network = codex_network_override(engine, {"options": options})
     if engine == "claude":
-        if options and ("allowed_write_dirs" in options or "allowed_bash_commands" in options):
+        if options and any(key in options for key in ("allowed_tools", "allowed_write_dirs", "allowed_bash_commands")):
             try:
                 validated = validate_options(engine, options, cwd=cwd)
             except UsageError as exc:

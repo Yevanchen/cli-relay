@@ -777,6 +777,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "opt_in": "--option 'allowed_tools=[\"WebSearch\",\"WebFetch\"]'",
         "write_opt_in": "--allow-write-dir './out/**' (repeatable; allowed_write_dirs JSON list)",
         "bash_opt_in": "--allow-bash python3 (repeatable; allowed_bash_commands JSON list)",
+        "todo_opt_in": "--option 'allowed_tools=[\"TodoWrite\"]'",
+        "subagents": "Task/Agent opt-ins are not enabled: custom subagent permissionMode can override dontAsk; "
+                     "see docs/claude-subagents.md. This allowlist does not disable Claude's native tools",
         "effect": "adds --allowedTools for that task only; the permission mode stays dontAsk and no "
                   "--settings layer or settings file is changed",
         "precedence": "deny and ask rules of every settings layer, managed included, still win, and managed "

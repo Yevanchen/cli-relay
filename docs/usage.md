@@ -774,11 +774,20 @@ cli-relay submit --key research-1 --engine claude --cwd ~/code/app --prompt "Com
   --option 'allowed_tools=["WebSearch","WebFetch"]'
 ```
 
-`allowed_tools` is a JSON list of exact tool names from a fixed allowlist: `WebSearch` and
-`WebFetch` (either one alone is fine). A plain string such as `"WebSearch"`, any other tool, a
+`allowed_tools` is a JSON list of exact tool names from a fixed allowlist: `TodoWrite`,
+`WebSearch` and `WebFetch` (any subset is fine). To opt into todo tracking, use
+`--option 'allowed_tools=["TodoWrite"]'`. This adds no Bash, Edit or Write grant.
+A plain string such as `"WebSearch"`, any other tool, a
 rule pattern such as `WebFetch(domain:example.com)` or `Bash(curl *)`, a wildcard, or a repeated
 name is a usage error, and no task is created. The list is stored sorted, so its order is not
 part of the request.
+
+`Task` and `Agent` opt-ins are deliberately not enabled. Custom subagent definitions can
+override a parent's `dontAsk` mode; sharing a Claude session does not prove the same command
+and write-directory limits. The [investigation](claude-subagents.md) explains the official
+documentation, current limits and proposed acceptance gate. This option is an approval list,
+not a switch that removes Claude's native tools; a rejected name is not evidence that the
+tool is absent from the underlying CLI.
 
 - The adapter adds `--allowedTools WebFetch,WebSearch` (only the named tools) for that task,
   including exact resume and fresh reruns. Nothing else changes: the permission mode stays
@@ -788,7 +797,7 @@ part of the request.
   ask rule in any settings layer wins over the option. A managed deny cannot be overridden by
   `--allowedTools`, and managed `allowManagedPermissionRulesOnly` ignores `--allowedTools`
   altogether. A denial that the task does not recover from still ends it `needs_input`.
-- These tools reach the network: fetched pages are untrusted input, and a fetched URL can carry
+- `WebFetch` and `WebSearch` reach the network: fetched pages are untrusted input, and a fetched URL can carry
   data out of the task. Only opt in for tasks that need it.
 - Like every option, `allowed_tools` is part of the payload and `payload_sha256`, so another
   list under the same key is a payload conflict. `resume` cannot change it either: to rerun a

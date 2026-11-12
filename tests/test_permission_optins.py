@@ -41,6 +41,25 @@ class ScopedPermissions(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 engines.assert_safe("claude", argv, options={}, cwd=str(self.cwd))
 
+    def test_todo_opt_in_preserves_scoped_bash_and_write_rules(self):
+        scoped = {"allowed_write_dirs": ["out"], "allowed_bash_commands": ["python3"]}
+        for resume in (None, "old-session"):
+            with self.subTest(resume=resume):
+                before = self.build(scoped, resume)
+                options = {**scoped, "allowed_tools": ["TodoWrite"]}
+                after = self.build(options, resume)
+                expected = ["Bash(python3:*)", "Edit(./out/**)", "TodoWrite", "Write(./out/**)"]
+                self.assertEqual(after[after.index("--allowedTools") + 1], ",".join(expected))
+                without_todo = list(after)
+                without_todo[without_todo.index("--allowedTools") + 1] = ",".join(rule for rule in expected if rule != "TodoWrite")
+                self.assertEqual(without_todo, before)
+                engines.assert_safe("claude", after, options=options, cwd=str(self.cwd))
+                for rule in ("Bash", "Edit", "Write", "Edit(./other/**)", "Write(./other/**)"):
+                    widened = list(after)
+                    widened[widened.index("--allowedTools") + 1] += "," + rule
+                    with self.subTest(rule=rule), self.assertRaises(RuntimeError):
+                        engines.assert_safe("claude", widened, options=options, cwd=str(self.cwd))
+
     def test_paths_fail_closed(self):
         for path in ("../out", "out/../other", "/etc", str(self.cwd.parent / "work-other"),
                      ".", "./**", "out/*", "out/**/x", "out),Bash(*)", "out\n", "~/out", "", None, 1):

@@ -92,7 +92,10 @@ See [environment cleanup](docs/usage.md#per-task-environment-cleanup).
 ### Permission opt-ins
 
 Defaults stay minimal: Claude pins `dontAsk` and adds no allow rules; its existing
-`allowed_tools` option accepts only `WebFetch` and `WebSearch`. Existing Claude settings and
+`allowed_tools` option accepts only the exact names `TodoWrite`, `WebFetch` and `WebSearch`.
+`Task` / `Agent` opt-ins remain unavailable: custom subagents can override the parent's
+permission mode. See the [inheritance investigation and proposed safety gate](docs/claude-subagents.md).
+Existing Claude settings and
 deny rules remain active. `bypassPermissions` is rejected in task options, argv and every
 settings layer, including user/project defaults. Codex defaults to `read-only`.
 

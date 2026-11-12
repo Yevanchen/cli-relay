@@ -201,7 +201,7 @@ Permission posture does not depend on the CLIs' configuration of the moment:
   Every Claude run must report `permissionMode: dontAsk` in its init event; a mismatch or missing
   init blocks, including when reconciliation closes the attempt after a keeper crash.
 - A Claude task adds no tool unless it opts in with `allowed_tools`, a list of exact names from a
-  fixed allowlist (`WebSearch`, `WebFetch`), `allowed_write_dirs` (cwd subdirectories for Edit/Write),
+  fixed allowlist (`TodoWrite`, `WebSearch`, `WebFetch`), `allowed_write_dirs` (cwd subdirectories for Edit/Write),
   or `allowed_bash_commands` (literal command prefixes). Directory grants reject traversal and
   symlink escapes and are rechecked before launch. These are CLI rules, not a filesystem sandbox;
   permitted Bash programs can write elsewhere. That adds one `--allowedTools` value for the task,
@@ -210,6 +210,10 @@ Permission posture does not depend on the CLIs' configuration of the moment:
   known zero exit treats denied tools as `permission_denials` warnings (tool names only), with
   the completion marker gate still applied. Otherwise denials mean `needs_input`. Cancellation
   precedence and the allowlist are unchanged; `Monitor` is not allowed by the relay.
+  `Task` / `Agent` opt-ins remain excluded because subagent definitions can override `dontAsk`;
+  the parent init event cannot verify every child's mode. The allowlist does not disable native
+  Claude tools. See [the inheritance investigation](claude-subagents.md) for this limit and the
+  gate required before enabling subagent opt-ins.
 - Argv checks reject `danger-full-access` unless both task options opt in, a workspace network
   setting other than the one built from the task's options, and Claude `--allowedTools` unless it
   carries exactly the rules generated from the task's validated lists. Every permission-bypass flag, including

@@ -194,7 +194,10 @@ Claude adds no tool by default. `WebSearch` and `WebFetch` need permission, so u
 a research task without an allow rule for them ends `needs_input` with a structured denial
 (issue #6). A task may opt in with the typed list `allowed_tools`, for example
 `--option 'allowed_tools=["WebSearch","WebFetch"]'`. Only exact names from a fixed allowlist,
-`WebSearch` and `WebFetch`, are accepted. A string, another tool, a rule pattern such as
+`TodoWrite`, `WebSearch` and `WebFetch`, are accepted. Todo tracking does not grant command
+execution or file edits. `Task` and `Agent` remain excluded pending the
+[subagent permission gate](claude-subagents.md): custom definitions can override `dontAsk`.
+A string, another tool, a rule pattern such as
 `WebFetch(domain:…)` or `Bash(…)`, a wildcard or a repeated name is a usage error. Widening the
 allowlist is a code change, not an option. The list is stored sorted, so its order is not part
 of the request, and like every option it cannot be changed by a resume.
@@ -211,10 +214,11 @@ not block on such rules; the CLI enforces them.
 
 The list is part of the payload and its hash, like the Codex options. Receipts, `status`/`wait`,
 terminal/unknown events and notifications expose `allowed_tools` as requested permissions
-(`[]` by default). `doctor` explains the opt-in and its risk: these tools reach the network, so
+(`[]` by default). `doctor` explains the opt-in and its risk: the web tools reach the network, so
 fetched pages are untrusted input and a fetched URL can carry data out. With `--engine claude`
 it also reports whether the checked settings layers already allow, ask for or deny each
-allowable tool, by tool name and boolean only.
+network tool, by tool name and boolean only. Its `claude_tool_policy` also reports the todo
+opt-in and why subagent opt-ins are not enabled.
 
 Permission prompts that no host can answer are denied (`--permission-prompts none`).
 A Claude run with structured denials ends as `needs_input`, even if it also reports an
