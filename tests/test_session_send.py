@@ -302,7 +302,8 @@ class SessionSendRoundTrip(RelayTestCase):
         self.assertEqual(done["task"]["state"], "succeeded")
         self.assertEqual((attempt["reason"], attempt["resume_session_id"], attempt["native_session_id"]),
                          ("send", sid, sid))
-        self.assertEqual(attempt["native"]["result"], "resumed turn 2; previous prompt: remember APPLE")
+        self.assertEqual(attempt["native"]["result"],
+                         "resumed turn 2; previous prompt: " + self.attempt_row(first["task_id"])["prompt"][:60])
         self.assertEqual(done["task"]["target_session_id"], sid)
         body = done["events"][-1]["body"]
         self.assertEqual((body["kind"], body["target_session_id"], body["native_session_id"]), ("terminal", sid, sid))
@@ -325,7 +326,8 @@ class SessionSendRoundTrip(RelayTestCase):
         # The send task resumes like any task; a fresh rerun is refused.
         self.cli("resume", sub["task_id"], "--prompt", "third")
         done = self.cli("wait", sub["task_id"], "--timeout", "30")
-        self.assertEqual(done["attempts"][-1]["native"]["result"], "resumed turn 3; previous prompt: message send-1")
+        self.assertEqual(done["attempts"][-1]["native"]["result"],
+                         "resumed turn 3; previous prompt: " + self.attempt_row(sub["task_id"])["prompt"][:60])
         refused = self.cli("resume", sub["task_id"], "--fresh", "--confirm-rerun", expect=6)
         self.assertEqual(refused["error"], "fresh_not_supported")
 

@@ -87,7 +87,7 @@ class BriefAndAck(DirectRouteCase):
         self.assertEqual(ev["result_file"]["path"], str(result.resolve()))
         self.assertTrue(ev["result_file"]["exists"])
         self.assertEqual(len(ev["result_file"]["sha256"]), 64)
-        self.assertIn("部分完成", ev["message"])
+        self.assertIn("没说做完没", ev["message"])
         self.assertIn(str(result.resolve()), ev["message"])
         self.assertEqual(len(ev["message"].splitlines()), 1)
         self.assertIn(ev["message"], text)

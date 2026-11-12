@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from .errors import UsageError
 
 FIELDS = ("business_status", "business_status_source", "business_stop_reason", "business_reports",
-          "denials", "business_status_counts", "artifact_verification", "result_evidence")
+          "denials", "business_status_counts", "artifact_verification", "result_evidence", "completion_report")
 MAX_RESULT_FILE_BYTES = 1 << 20
 MAX_ARTIFACTS = 128
 STOP_ALIASES = {"blocked": "blocked", "needs_user": "needs_user", "needs_input": "needs_user",
@@ -27,6 +27,31 @@ _ALIASES = {"done": "ok", "ok": "ok", "partial": "partial", "failed": "failed", 
 _SEVERITY = {"unreported": -1, "ok": 0, "partial": 1, "failed": 2}
 _MARKER = re.compile(r"(?:[A-Z][A-Z0-9_]*_DONE )?status=(\w+)(?: (?:ok|fail|skip)=[0-9]+)*")
 _COUNT_TOKEN = re.compile(r"(?<!\S)(ok|fail|skip)=([0-9]+)(?!\S)")
+
+
+COMPLETION_PROMPT = """任务结束时，在最终回复中各单独一行，严格使用以下格式：
+做完没：做完 / 没做完 / 部分（只选一个）
+还差：具体剩余事项（没有写 无）
+下一步谁动：Evan / 某个 bot 的名字 / 没有（只写实际负责人）
+如果任务要求写 JSON 结果文件，也在其中写字符串字段 done、remaining、next_owner，值与这三行一致。
+如果任务还要求以状态标记作为最后一行，把这三行放在状态标记之前。"""
+
+
+def completion_report(text: Any) -> Dict[str, Any]:
+    """Accept one unambiguous, bounded line for each field in the final response."""
+    fields = {"做完没": "done", "还差": "remaining", "下一步谁动": "next_owner"}
+    found: Dict[str, List[str]] = {name: [] for name in fields}
+    if isinstance(text, str):
+        for line in text.splitlines():
+            for label in fields:
+                if line.startswith(label + "："):
+                    found[label].append(line[len(label) + 1:].strip())
+    if (any(len(values) != 1 for values in found.values()) or
+            any(not value or len(value) > 512 or not value.isprintable()
+                for values in found.values() for value in values) or
+            found["做完没"][0] not in ("做完", "没做完", "部分")):
+        return {"state": "没说做完没"}
+    return {"state": "已报告", **{key: found[label][0] for label, key in fields.items()}}
 
 
 def normalize_status(status: str) -> str:
@@ -234,7 +259,8 @@ def evaluate(engine: str, payload: Dict[str, Any], outcome: str,
         status, source = "partial", "denials"
     if status == "unreported" and options.get("require_business_status") is True:
         warnings.append({"code": "business_status_missing"})
-    return {"business_status": status, "business_status_source": source, "business_stop_reason": stop,
+    return {"completion_report": completion_report(text),
+            "business_status": status, "business_status_source": source, "business_stop_reason": stop,
             "business_reports": reports, "artifact_verification": verification, "denials": denials,
             **({"result_evidence": result_evidence} if result_evidence is not None else {}),
             **({"business_status_counts": counts} if counts else {}),

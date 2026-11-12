@@ -201,7 +201,7 @@ class MarkerRoundTrip(RelayTestCase):
         self.assertEqual(policy["opt_in"], "--option require_completion_marker=true")
         self.assertEqual((policy["complete_line"], policy["incomplete_line"]), (DONE, OPEN))
         self.assertIn("needs_input", policy["rule"])
-        self.assertIn("never edits a prompt", policy["prompt"])
+        self.assertIn("ask for one of the two lines", policy["prompt"])
         self.assertIn("not verification", policy["limits"])
 
 
@@ -215,7 +215,7 @@ args = sys.argv[1:]
 if args[0] == "login":
     print("Logged in using ChatGPT")
     sys.exit(0)
-prompt = sys.stdin.read()
+prompt = sys.stdin.read().split("\n\n任务结束时，在最终回复中", 1)[0]
 thread = args[-2] if "resume" in args else str(uuid.uuid4())
 directory = Path(os.environ["CODEX_HOME"]) / "sessions/2026/10/21"
 directory.mkdir(parents=True, exist_ok=True)

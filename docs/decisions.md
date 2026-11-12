@@ -526,7 +526,7 @@ Details and limits:
   same outcome. The evidence records `completion_check`, and event bodies name the marker, because the
   line is usually past the 2000-character excerpt.
 - Opt-in, not a default: a default would turn every existing dispatch whose prompt does not ask for the
-  line into `needs_input`. The relay never edits a prompt (the stored prompt is the one the CLI gets), so
+  line into `needs_input`. The relay does not add this opt-in marker to prompts, so
   the dispatcher asks for the line, in resume prompts too.
 - A self-report is not a verification. A CLI can claim `complete` wrongly, and the relay still does not
   decide business acceptance (D9). The marker only lets the CLI's own "not done" stop a `succeeded`.

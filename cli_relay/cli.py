@@ -125,11 +125,21 @@ def _parse_origin(raw: Optional[str]) -> Dict[str, Any]:
     return {"origin": origin}
 
 
+def event_body(row: Dict[str, Any]) -> Dict[str, Any]:
+    body = _loads(row["body_json"])
+    if row["kind"] in ("terminal", "unknown"):
+        body.setdefault("completion_report", {"state": "没说做完没"})
+    return body
+
+
 def attempt_view(a: Dict[str, Any], probe: bool = True) -> Dict[str, Any]:
     active = a["state"] in ("waiting", "claimed", "running")
     keeper_alive = procs.same_process_alive(a["keeper_pid"], a["keeper_token"]) if probe and active else None
     cli_alive = procs.same_process_alive(a["cli_pid"], a["cli_token"]) if probe and active and a["cli_pid"] else None
     evidence = _loads(a["evidence_json"])
+    if a["state"] in ("finished", "unknown"):
+        evidence = dict(evidence or {})
+        evidence.setdefault("completion_report", {"state": "没说做完没"})
     return {
         "attempt_no": a["attempt_no"], "attempt_id": a["attempt_id"], "reason": a["reason"], "state": a["state"],
         "outcome": a["outcome"], "host": a["host"], "cwd": a["cwd"],
@@ -164,7 +174,7 @@ def task_view(ledger: Ledger, task_id: str, probe: bool = True) -> Dict[str, Any
         "attempts": attempts,
         "events": [{"event_id": e["event_id"], "attempt_no": e["attempt_no"], "kind": e["kind"],
                     "created_at": e["created_at"], "acked_by": e["acked_by"], "acks": e["acks"],
-                    "body": _loads(e["body_json"])}
+                    "body": event_body(e)}
                    for e in ledger.events_of_task(task_id)],
     }
 
@@ -259,7 +269,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 consumer, chat = owner["consumer"], owner["chat"]
             bound = True
     native_sid = str(uuid.uuid4()) if engine in ("claude", "fixture") else None
-    status, task, sha = ledger.submit(scope=scope, key=key, payload=payload, prompt=prompt,
+    status, task, sha = ledger.submit(scope=scope, key=key, payload=payload, prompt=prompt + "\n\n" + business_status.COMPLETION_PROMPT,
                                       native_session_id=native_sid, notify_route=route,
                                       notify_consumer=consumer, notify_chat=chat, notify_bound=bound)
     _hook("submit_after_commit")  # fault injection: committed, keeper not yet started, no response sent
@@ -428,7 +438,7 @@ def cmd_events(args: argparse.Namespace) -> int:
                "owner_chat": owners.get(r["task_id"], {}).get("chat"),
                "route_bound": owners.get(r["task_id"], {}).get("bound", False),
                "owner_state": owners.get(r["task_id"], {}).get("binding_state", "manual_restore"),
-               "body": _loads(r["body_json"])} for r in rows]
+               "body": event_body(r)} for r in rows]
     out: Dict[str, Any] = {"ok": True, "consumer": consumer, **source, "events": events}
     if warning:
         out["warning"] = warning
@@ -464,18 +474,14 @@ def cmd_brief(args: argparse.Namespace) -> int:
                 if declared:
                     result_file = {"path": str(Path(task["cwd"]) / declared), "exists": None,
                                    "validation": "historical_unverified"}
+            report = body.get("completion_report", {"state": "没说做完没"})
             outcome = body.get("outcome") or row["kind"]
             status = body.get("business_status", "unreported")
             stop = body.get("business_stop_reason")
-            if stop or status == "stopped_for_approval":
-                conclusion = {"blocked": "业务受阻", "needs_user": "需要用户处理",
-                              "stopped_for_approval": "等待批准"}.get(stop, "等待批准")
-            elif outcome != "succeeded":
-                conclusion = {"failed": "执行失败", "blocked": "执行受阻", "needs_input": "需要输入",
-                              "unknown": "执行结果未知", "cancelled": "已取消"}.get(outcome, "执行结果未知")
-            else:
-                conclusion = {"ok": "已完成", "partial": "部分完成", "failed": "业务失败",
-                              "unreported": "CLI 已结束，业务结果未报告"}.get(status, "业务结果未报告")
+            conclusion = notify._clean(report.get("done", "没说做完没"), 512)
+            if report.get("state") == "已报告":
+                conclusion += (" | 还差：" + notify._clean(report["remaining"], 512) +
+                               " | 下一步谁动：" + notify._clean(report["next_owner"], 512))
             identity = {key: row[key] for key in ("event_id", "task_id", "attempt_no")}
             short = {"task_last8": row["task_id"][-8:], "event_last8": row["event_id"][-8:]}
             path = result_file["path"] if result_file else "无结果文件"
@@ -491,7 +497,8 @@ def cmd_brief(args: argparse.Namespace) -> int:
                            # billing and session blocks only: names, ids and the fix, never values
                            **({"preflight": body["preflight"]} if "preflight" in body else {}),
                            **({"target_session_id": body["target_session_id"]} if "target_session_id" in body else {}),
-                           "warnings": body.get("warnings", []), "result_file": result_file, "message": message})
+                           "warnings": body.get("warnings", []), "result_file": result_file,
+                           "completion_report": report, "message": message})
             refs.append({**identity, **source, "consumer": consumer})
         command = None
         if refs:
@@ -663,7 +670,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
                 _refuse_session(problem)
         native_sid = resume_sid
         reason = "resume"
-    new = ledger.new_attempt(task_id, expect_attempt_no=att["attempt_no"], reason=reason, prompt=prompt,
+    new = ledger.new_attempt(task_id, expect_attempt_no=att["attempt_no"], reason=reason, prompt=prompt + "\n\n" + business_status.COMPLETION_PROMPT,
                              resume_session_id=resume_sid, native_session_id=native_sid)
     try:
         spawn_keeper(args.home, task_id, new["attempt_id"])
@@ -724,7 +731,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "rule": "with the opt-in, a run that would end succeeded ends needs_input unless the last non-empty "
                 "line of the CLI's final message is exactly the complete line; the incomplete line, any other "
                 "last line or no final message gives needs_input, and other outcomes are unchanged",
-        "prompt": "the relay never edits a prompt: ask for one of the two lines in the task prompt and in "
+        "prompt": "ask for one of the two lines in the task prompt and in "
                   "resume prompts, as a plain last line without formatting",
         "limits": "a self-report, not verification: the relay runs no check of its own and reads no other "
                   "text of the result; without the opt-in, succeeded only means the CLI ended its turn "

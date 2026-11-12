@@ -152,7 +152,7 @@ args = sys.argv[1:]
 if args[0] == "login":
     print("Logged in using ChatGPT")
     sys.exit(0)
-prompt = sys.stdin.read()
+prompt = sys.stdin.read().split("\n\n任务结束时，在最终回复中", 1)[0]
 with open(CALLS, "a") as f:
     f.write(json.dumps(args) + "\n")
 if "--skip-git-repo-check" not in args or prompt == "reject":

@@ -285,6 +285,7 @@ def _event_ref(row: Dict[str, Any]) -> Dict[str, Any]:
                                           "result_file", "effective_settings", "target_session_id",
                                           *business_status.FIELDS)
                if key in body},
+            "completion_report": body.get("completion_report", {"state": "没说做完没"}),
             "result_excerpt": _clean(body.get("result_excerpt"), EXCERPT_MAX)}
 
 
@@ -330,6 +331,12 @@ def build_payload(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, re
         f"stop_reason={r.get('business_stop_reason')} artifacts={r.get('artifact_verification', {}).get('state', 'unverified')} "
         f"denials={json.dumps(r.get('denials', {}).get('count'))}"
         for r in refs if "business_status" in r)
+    completion = " | ".join(
+        f"{r['task_id']}#{r['attempt_no']} 做完没=" +
+        _clean(r.get("completion_report", {}).get("done", "没说做完没"), 512) +
+        (" 还差=" + _clean(r["completion_report"]["remaining"], 512) +
+         " 下一步谁动=" + _clean(r["completion_report"]["next_owner"], 512)
+         if r.get("completion_report", {}).get("state") == "已报告" else "") for r in refs)
     reasons = " | ".join(f"{r['task_id']}#{r['attempt_no']} {_clean(r['summary'], 300)}"
                          for r in refs if r.get("summary"))
     # The copy-pasteable billing fix is the only actionable part of that block; command adapters
@@ -345,7 +352,8 @@ def build_payload(cfg: Dict[str, Any], route: Dict[str, Any], ledger_id: str, re
               "reminder": reminder, "count": len(refs), "events": refs}
     return {"job": route["adapter"]["job"], "stage": f"{cfg['source_id']}/{route['name']}", "status": status,
             "summary": _clean(summary, SUMMARY_MAX) + (" | " + business if business else "")
-                       + (" | " + reasons if reasons else "") + (" | " + fixes if fixes else "") + " | " + permissions,
+                       + (" | " + reasons if reasons else "") + (" | " + fixes if fixes else "")
+                       + " | " + completion + " | " + permissions,
             "artifact": f"cli-relay:{cfg['source_id']}:{ledger_id}",
             "cli_relay": record}
 

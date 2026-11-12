@@ -753,7 +753,7 @@ CLI-RELAY-STATUS: incomplete."
   `CLI-RELAY-STATUS: incomplete`, any other last line (backticks, bold or a trailing period included)
   and no final message end it `needs_input`. `failed`, `blocked`, `cancelled` and the `needs_input` of
   an unresolved Claude permission denial are never changed: the marker cannot turn a failure into a success.
-- The relay never edits a prompt: ask for the line in the task prompt, and again in resume prompts.
+- Ask for the line in the task prompt, and again in resume prompts; the relay appends its separate completion self-report requirement.
   Each attempt is judged by its own final message, so a `needs_input` task can be continued with
   `resume`.
 - The attempt's evidence records the check, for example `"completion_check": {"marker":
@@ -884,3 +884,30 @@ and mismatched ACKs, cancel/complete races and storage failures. See
 [`acceptance.md`](acceptance.md) for the matrix and the latest recorded results. See
 [`reliability.md`](reliability.md) for the state machine, crash windows and the
 preconditions of every guarantee.
+
+### Completion self-report
+
+Every new submit and explicitly resumed or fresh attempt appends the same requirement to the
+engine prompt. The final response must contain exactly one line for each label, with a full-width
+colon and a nonempty value (at most 512 printable characters):
+
+```text
+做完没：部分
+还差：审核
+下一步谁动：Evan
+```
+
+`做完没` accepts only `做完`, `没做完`, or `部分`; use `无` for nothing remaining and `没有`
+when no one needs to act. If a JSON result file is requested, the producer should also write
+string fields `done`, `remaining`, and `next_owner` with the same values. The final response's
+three lines are the authoritative source for `completion_report` in terminal evidence, events,
+briefs, and notifications; the result file alone does not satisfy this check. A missing, empty,
+invalid, or duplicated line produces `{"state":"没说做完没"}`. Historical events without the
+field read as missing; no history is rewritten. Self-reports are not independently verified.
+Command-adapter notification summaries include all three reported values outside excerpt
+truncation, so the remaining work and owner are also visible without reading the JSON payload.
+
+This report does not change the process outcome, business status, dependency rules, or cause a
+retry. In particular, `succeeded` and business `ok` are not proof that the task is done; consumers
+must inspect `completion_report`. The existing final `status=...` marker, if used, can follow the
+three lines. Prompt augmentation does not alter the submitted payload hash or existing attempts.
