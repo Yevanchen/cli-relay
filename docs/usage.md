@@ -98,8 +98,9 @@ cli-relay submit --scope friday --key what-is-dify-en-04 --engine claude --cwd ~
 and scope. At most one task in a queue is admitted to preflight/execution at a time. Other
 tasks wait FIFO by their original submission time; ties use ledger insertion order. Pending
 keepers also hold their place. A queue head waiting for a dependency holds up later tasks.
-All engines/scopes share a home-wide two-job cap and a computer-use singleton, including tasks
-without `--queue`. One canonical relay home must serve each Mac. See [capacity and rollout](migration-20261106.md#shared-local-admission).
+All engines/scopes share a home-wide [memory-aware concurrency budget](#local-concurrency-and-available-memory)
+and a computer-use singleton, including tasks without `--queue`. One canonical relay home must
+serve each Mac. See [capacity and rollout](migration-20261106.md#shared-local-admission).
 Combine `--after` and `--queue` to require both gates. Failed/blocked/cancelled queue tasks
 release their place; an `unknown` holder retains it because its engine may still be alive and
 needs the existing explicit recovery decision. Resume/fresh reruns retain both gates and the
@@ -131,6 +132,95 @@ The optional top-level payload fields are `after` (resolved id), `after_require`
 explicitly supplied) and `queue`. Supplied fields participate in idempotency: changing them
 under the same key conflicts. Omitting all three preserves the previous payload and hash.
 No ledger schema change or migration is required; existing databases and events remain readable.
+
+### Local concurrency and available memory
+
+Admission checks available memory before claiming each new or resumed attempt. Defaults:
+
+| Setting in `local_concurrency` | Environment override | Default | Meaning |
+|---|---|---|---|
+| `hard_max` | `CLI_RELAY_LOCAL_HARD_MAX` | `4` | Total active jobs allowed when memory is sufficient; always an upper bound |
+| `min_available_mib` | `CLI_RELAY_LOCAL_MIN_AVAILABLE_MIB` | `1536` | Minimum available memory for an additional parallel job (1.5 GiB; 1 MiB = 1,048,576 bytes) |
+| `fallback_max` | `CLI_RELAY_LOCAL_FALLBACK_MAX` | `2` | Fixed cap if the memory observation fails, clipped to `hard_max` |
+
+When available memory is below the threshold, the effective cap is one. A task waits in
+`waiting`, keeps its original attempt and key, and starts once memory or capacity recovers;
+low memory never rejects or ends it. At least one eligible task can run even at zero available
+memory, subject to the existing dependency, queue, session and computer-use gates. Already
+running work is never killed or preempted when memory falls or a setting is lowered.
+Claimed/preflight work and unknown attempts without proof of stopped processes still count.
+Computer-use work continues to share the total budget and its separate cap of **one**.
+
+Settings use the existing JSON configuration in the relay home (`--home`, `$CLI_RELAY_HOME`,
+or `~/.cli-relay`). Add `local_concurrency` to `<home>/notifier.json`, keeping existing routes
+and other settings. It is optional; an absent file or section uses the defaults. A ledger
+with no notification routes can use this complete file:
+
+```json
+{
+  "source_id": "mac-mini",
+  "routes": {},
+  "local_concurrency": {
+    "hard_max": 4,
+    "fallback_max": 2,
+    "min_available_mib": 1536,
+    "sources": {
+      "mac-mini": {"hard_max": 4, "min_available_mib": 1536},
+      "mbp": {"hard_max": 6, "min_available_mib": 2048}
+    }
+  }
+}
+```
+
+Precedence, highest first: environment variable → `sources[source_id]` → shared
+`local_concurrency` field → default. The machine identity is the existing top-level
+`source_id` in `notifier.json`; unmatched identities use the shared settings. Machine
+entries may override any of the three fields independently. `hard_max` and `fallback_max`
+must be integers ≥ 1; `min_available_mib` must be an integer ≥ 0. Zero disables the memory
+threshold when a reading is available; `hard_max: 2` restores a two-job ceiling. Unknown
+keys, booleans and fractional values are invalid. A bad file or environment setting leaves
+new admissions waiting with `invalid_concurrency_config` until corrected, while status
+remains readable and running tasks continue. Route registration preserves this section.
+
+For a one-command environment override:
+
+```sh
+CLI_RELAY_LOCAL_HARD_MAX=3 CLI_RELAY_LOCAL_MIN_AVAILABLE_MIB=2048 \
+  cli-relay submit --key example --engine fixture --cwd "$PWD" --prompt "fixture example"
+```
+
+Use the same environment for every relay process using that home. A keeper inherits the
+environment of the command that starts it; changing another shell's environment cannot
+change an already-waiting keeper. File settings and memory are reread at every admission
+poll (the existing keeper polls every 2–10 seconds); replace JSON files atomically when
+editing them. No install or daemon restart is needed for file changes in an upgraded keeper.
+Do not mix old installed keepers with the upgraded code during a later rollout.
+
+On macOS, a single `/usr/bin/vm_stat` call with a one-second timeout estimates available
+bytes as `(Pages free + Pages inactive + Pages purgeable) × reported page size`, including
+both 4 KiB and 16 KiB pages. It needs no `sudo`. These fields and the output format are
+documented in [Apple's vm_stat source](https://github.com/apple-oss-distributions/system_cmds/blob/main/vm_stat/vm_stat.c).
+On Linux, the value is `/proc/meminfo`'s `MemAvailable` in KiB, the kernel's estimate of
+memory available to new applications ([kernel documentation](https://www.kernel.org/doc/html/latest/filesystems/proc.html#meminfo)).
+An unsupported system, missing command, timeout, unreadable file or malformed output uses
+the fixed fallback and reports the probe error. No memory-reading failure crashes the keeper.
+This is a point-in-time admission check, not a reservation of future task memory or an
+out-of-memory guarantee. CPU idle percentage does not affect admission.
+
+`cli-relay doctor` and `cli-relay status TASK_ID` include `local_concurrency` with the current
+`source_id`, `hard_max`, `fallback_max`, threshold, per-setting sources, effective `max_active`,
+`available_bytes`, `memory_source`, `memory_error`, `mode` and `reason`. Available memory is
+`null` when unreadable. Doctor marks an invalid concurrency configuration unhealthy; a probe
+failure alone is a reported fallback, not a failed health check.
+
+For a waiting task, `task.waiting_on.capacity` and the current attempt's `waiting_on.capacity`
+also show holders, eligible tasks ahead and `reasons`: `hard_max`, `low_available_memory`,
+`fixed_fallback_limit`, `computer_use_limit`, or `invalid_concurrency_config`. Multiple limits
+can apply. Other gates keep their existing dependency/queue/session diagnostics. The waiting
+event is one durable initial snapshot; status shows the current decision. For example, with
+two tasks active and only 200 MiB available, a third stays `waiting` with
+`reasons: ["low_available_memory"]`, `hard_max: 4`, `max_active: 1` and
+`available_bytes: 209715200`. The two active tasks keep running.
 
 ### Business-status dependency diagnostics (issue #32)
 

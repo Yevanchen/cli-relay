@@ -121,6 +121,10 @@ Private to each machine. Never commit it. Keep it readable only by its owner (`c
 
 - `source_id` names the machine in every payload, e.g. `host-a` and `host-b`. It must differ between
   machines.
+- Optional `local_concurrency` configures the home-wide hard cap, available-memory threshold
+  and fixed fallback, with per-machine overrides selected by this same `source_id`.
+  See [settings, defaults and diagnostics](usage.md#local-concurrency-and-available-memory).
+  Route management preserves this section; omitting it keeps the configuration's old shape.
 - `routes`: name → the consumer name used for its ACKs, a chat label, and the adapter.
   - A task chooses its route with `submit --notify-route NAME`.
   - Without one it uses `default_route`.

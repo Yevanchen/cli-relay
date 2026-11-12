@@ -41,8 +41,10 @@ Resume retains the stored request and permissions; old requests are not silently
 ## Shared local admission
 
 Use one canonical relay home for all bots/engines on a Mac. The ledger's write transaction
-admits at most two jobs in total, including preflight/claimed work, and at most one declared
-computer-use job. It covers all scopes and queues in that home. Separate relay homes are separate
+uses a [configurable, memory-aware total budget](usage.md#local-concurrency-and-available-memory):
+by default four jobs with at least 1536 MiB available, one below that threshold, and two if
+memory cannot be read. Preflight/claimed work counts, and the separate limit of at most one
+declared computer-use job is unchanged. It covers all scopes and queues in that home. Separate relay homes are separate
 budgets and must not be used to split a machine's production workload.
 
 Pending and dependency-waiting jobs do not use running slots. Among eligible jobs, older attempts

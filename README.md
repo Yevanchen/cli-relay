@@ -70,7 +70,12 @@ the 30-minute ACK timeout, or its notification fails; it keeps the task's origin
 | `fixture` | Local stand-in for tests |
 
 New production work requires explicit task/resource class and tier-matched model/effort.
-All scopes in one relay home share at most two active jobs and one computer-use job.
+All scopes in one relay home share a configurable, memory-aware budget: by default at most
+four active jobs when available memory is at least 1536 MiB, one below that threshold, or
+two if memory cannot be read. Computer use stays limited to one job.
+Configure `local_concurrency` in `<home>/notifier.json` (including overrides by `source_id`)
+or `CLI_RELAY_LOCAL_*` environment variables; `status` and `doctor` show the effective settings
+and memory observation. See [local concurrency](docs/usage.md#local-concurrency-and-available-memory).
 See [migration notes](docs/migration-20261106.md); deployment and cross-machine coordination remain operator work.
 Model and effort are set per task with `--option`. More engine options are documented in
 [`docs/usage.md`](docs/usage.md#engines), and their guards in [`docs/reliability.md`](docs/reliability.md).

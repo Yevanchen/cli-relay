@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from . import business_status, engines, procs, transport
+from . import business_status, concurrency, engines, procs, transport
 from .errors import Refused, UsageError
 from .keeper import _hook
 from .ledger import Ledger, canonical_json, iso_age_seconds, now_iso
@@ -116,7 +116,7 @@ def load_config(home: Path) -> Dict[str, Any]:
 def validate_config(raw: Any) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise _bad("top level must be an object")
-    allowed = {"source_id", "default_route", "routes", "notify_outcomes", "retry", "reminder"}
+    allowed = {"source_id", "default_route", "routes", "notify_outcomes", "retry", "reminder", "local_concurrency"}
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise _bad("unknown keys", keys=unknown)
@@ -145,7 +145,9 @@ def validate_config(raw: Any) -> Dict[str, Any]:
     reminder = _numbers(raw.get("reminder", {}), {"ack_timeout_s": (1800.0, 0.01, 7 * 86400.0),
                                                   "max_wakes": (2, 1, 10)}, "reminder")
     return {"source_id": source_id, "default_route": default_route, "routes": clean_routes,
-            "notify_outcomes": list(outcomes), "retry": retry, "reminder": reminder}
+            "notify_outcomes": list(outcomes), "retry": retry, "reminder": reminder,
+            **({"local_concurrency": concurrency.validate_config(raw["local_concurrency"])}
+               if "local_concurrency" in raw else {})}
 
 
 def _numbers(spec: Any, fields: Dict[str, Tuple[Any, Any, Any]], where: str) -> Dict[str, Any]:
