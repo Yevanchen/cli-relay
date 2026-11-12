@@ -58,6 +58,17 @@ def normalize_status(status: str) -> str:
     return _ALIASES.get(status, "unreported")
 
 
+def dependency_reports(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    """Only bounded raw status fields from the upstream's frozen terminal evidence."""
+    reports = evidence.get("business_reports")
+    if not isinstance(reports, dict):
+        return {}
+    return {source: {key: report[key][:128] if isinstance(report.get(key), str) else None
+                     for key in ("raw_status", "raw_stop_reason")}
+            for source in ("result_file", "status_line")
+            if isinstance(report := reports.get(source), dict)}
+
+
 def validate_result_file(value: str, cwd: Optional[str]) -> str:
     """Literal cwd-relative path, without traversal or symlink escapes."""
     if (cwd is None or not value or value != value.strip()
