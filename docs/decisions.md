@@ -194,15 +194,22 @@ Claude adds no tool by default. `WebSearch` and `WebFetch` need permission, so u
 a research task without an allow rule for them ends `needs_input` with a structured denial
 (issue #6). A task may opt in with the typed list `allowed_tools`, for example
 `--option 'allowed_tools=["WebSearch","WebFetch"]'`. Only exact names from a fixed allowlist,
-`WebSearch` and `WebFetch`, are accepted. A string, another tool, a rule pattern such as
+`Task`, `Agent`, `TodoWrite`, `WebSearch` and `WebFetch`, are accepted. Todo tracking does not
+grant command execution or file edits. Task/Agent require the pinned, live-verified
+[subagent permission ceiling](claude-subagents.md); they permit only concurrent foreground
+relay workers, directory-scoped writes, and `ls` or no Bash grant. Other custom agents and
+mode/delegation overrides are denied before dispatch. Native Task/Agent are disabled by
+default when neither name is requested.
+A string, another tool, a rule pattern such as
 `WebFetch(domain:…)` or `Bash(…)`, a wildcard or a repeated name is a usage error. Widening the
 allowlist is a code change, not an option. The list is stored sorted, so its order is not part
 of the request, and like every option it cannot be changed by a resume.
 
 The adapter passes the tools as one `--allowedTools` value, including on exact resume; argv
 checks accept that flag only with the stored list, and only in that form, since a further value
-of the variadic flag would be one more allow rule. It never passes them through `--settings`,
-never changes the permission mode and never writes a settings file. Claude's own precedence
+of the variadic flag would be one more allow rule. Task/Agent additionally generate an
+inline settings policy hook and fixed worker definition; no settings file is written and
+the parent stays in dontAsk. Other settings sources remain loaded. Claude's own precedence
 therefore still holds: deny and ask rules from every settings layer are evaluated before allow
 rules, a managed deny cannot be overridden by `--allowedTools`, and managed
 `allowManagedPermissionRulesOnly` ignores it. A tool that stays denied is still a structured
@@ -211,10 +218,11 @@ not block on such rules; the CLI enforces them.
 
 The list is part of the payload and its hash, like the Codex options. Receipts, `status`/`wait`,
 terminal/unknown events and notifications expose `allowed_tools` as requested permissions
-(`[]` by default). `doctor` explains the opt-in and its risk: these tools reach the network, so
+(`[]` by default). `doctor` explains the opt-in and its risk: the web tools reach the network, so
 fetched pages are untrusted input and a fetched URL can carry data out. With `--engine claude`
 it also reports whether the checked settings layers already allow, ask for or deny each
-allowable tool, by tool name and boolean only.
+network tool, by tool name and boolean only. Its `claude_tool_policy` also reports the todo
+opt-in and the restricted subagent opt-in and version requirements.
 
 Permission prompts that no host can answer are denied (`--permission-prompts none`).
 A Claude run with structured denials ends as `needs_input`, even if it also reports an

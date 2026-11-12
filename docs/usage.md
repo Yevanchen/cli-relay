@@ -774,21 +774,33 @@ cli-relay submit --key research-1 --engine claude --cwd ~/code/app --prompt "Com
   --option 'allowed_tools=["WebSearch","WebFetch"]'
 ```
 
-`allowed_tools` is a JSON list of exact tool names from a fixed allowlist: `WebSearch` and
-`WebFetch` (either one alone is fine). A plain string such as `"WebSearch"`, any other tool, a
+`allowed_tools` is a JSON list of exact tool names from a fixed allowlist: `Task`, `Agent`,
+`TodoWrite`, `WebSearch` and `WebFetch`. To opt into todo tracking, use
+`--option 'allowed_tools=["TodoWrite"]'`. This adds no Bash, Edit or Write grant.
+A plain string such as `"WebSearch"`, any other tool, a
 rule pattern such as `WebFetch(domain:example.com)` or `Bash(curl *)`, a wildcard, or a repeated
 name is a usage error, and no task is created. The list is stored sorted, so its order is not
 part of the request.
 
+`Task` and `Agent` opt-ins require the [subagent ceiling](claude-subagents.md), verified with
+Claude Code 2.1.301 exactly. Only relay-generated `cli-relay-worker` foreground agents may
+run; request two foreground calls concurrently for parallel work. Use `--allow-write-dir`
+for outputs and either `--allow-bash ls` or no Bash grant. Other Bash grants combined with
+these opt-ins are rejected. Existing hooks, enabled plugins/mods or settings that disable
+the guard block launch; the relay never edits that configuration for you. Custom agents,
+mode overrides, nested/background/team/fork execution and child resumes are denied.
+Without Task/Agent opt-in, the launcher explicitly disables native Task and Agent tools.
+
 - The adapter adds `--allowedTools WebFetch,WebSearch` (only the named tools) for that task,
-  including exact resume and fresh reruns. Nothing else changes: the permission mode stays
-  `dontAsk`, no `--settings` layer is added and no settings file is written. Argv checks accept
+  including exact resume and fresh reruns. The permission mode stays `dontAsk` and no settings
+  file is written. Task/Agent also install a validated inline `--settings` policy hook and
+  fixed worker definition; existing permission settings remain loaded. Argv checks accept
   `--allowedTools` only with the task's stored list.
 - Claude's own rules still decide. It evaluates deny, then ask, then allow rules, so a deny or
   ask rule in any settings layer wins over the option. A managed deny cannot be overridden by
   `--allowedTools`, and managed `allowManagedPermissionRulesOnly` ignores `--allowedTools`
   altogether. A denial that the task does not recover from still ends it `needs_input`.
-- These tools reach the network: fetched pages are untrusted input, and a fetched URL can carry
+- `WebFetch` and `WebSearch` reach the network: fetched pages are untrusted input, and a fetched URL can carry
   data out of the task. Only opt in for tasks that need it.
 - Like every option, `allowed_tools` is part of the payload and `payload_sha256`, so another
   list under the same key is a payload conflict. `resume` cannot change it either: to rerun a

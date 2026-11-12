@@ -23,7 +23,8 @@ TOOLS = ["WebFetch", "WebSearch"]
 OPT_IN = {"allowed_tools": ["WebSearch", "WebFetch"]}
 SID = "11111111-1111-4111-8111-111111111111"
 RESUME = "22222222-2222-4222-8222-222222222222"
-BASE = ["claude", "-p", "--permission-mode", "dontAsk", "--permission-prompts", "none"]
+BASE = ["claude", "-p", "--permission-mode", "dontAsk", "--permission-prompts", "none",
+        "--disallowedTools", "Task,Agent"]
 
 
 class AllowedToolsOptionsAndArgv(unittest.TestCase):
@@ -34,7 +35,11 @@ class AllowedToolsOptionsAndArgv(unittest.TestCase):
 
     def test_only_exact_allowlisted_names_in_a_list_are_accepted(self) -> None:
         for tools, stored in ((["WebSearch"], ["WebSearch"]), (["WebFetch"], ["WebFetch"]),
-                              (["WebSearch", "WebFetch"], TOOLS), (TOOLS, TOOLS), ([], [])):
+                              (["WebSearch", "WebFetch"], TOOLS), (TOOLS, TOOLS), ([], []),
+                              (["TodoWrite"], ["TodoWrite"]),
+                              (["Task"], ["Task"]), (["Agent"], ["Agent"]),
+                              (["Task", "Agent"], ["Agent", "Task"]),
+                              (["WebSearch", "TodoWrite", "WebFetch"], ["TodoWrite", *TOOLS])):
             with self.subTest(tools=tools):
                 self.assertEqual(engines.validate_options("claude", {"allowed_tools": tools}),
                                  {"allowed_tools": stored})
@@ -45,14 +50,40 @@ class AllowedToolsOptionsAndArgv(unittest.TestCase):
                       ["WebFetch(domain:*)"], ["WebSearch(*)"], ["*"], ["Web*"], ["mcp__web__fetch"],
                       ["websearch"], ["WEBFETCH"], [" WebSearch"], ["WebSearch "], [""], ["WebSearch,Bash"],
                       ["WebSearch Bash"], ["WebFetch", "Bash"], [None], [1], [True], [["WebSearch"]],
-                      [{"tool": "WebSearch"}]):
+                      [{"tool": "WebSearch"}], ["Todo*"], ["TodoWrite(*)"], ["todowrite"],
+                      ["Task(*)"], ["Agent(general-purpose)"], ["Agent*"], ["Write"], ["TaskCreate"]):
             with self.subTest(tools=tools), self.assertRaisesRegex(UsageError, "exact tool names"):
                 engines.validate_options("claude", {"allowed_tools": tools})
-        with self.assertRaisesRegex(UsageError, "more than once"):
-            engines.validate_options("claude", {"allowed_tools": ["WebSearch", "WebFetch", "WebSearch"]})
+        for duplicate in ("WebSearch", "TodoWrite"):
+            with self.subTest(duplicate=duplicate), self.assertRaisesRegex(UsageError, "more than once"):
+                engines.validate_options("claude", {"allowed_tools": [duplicate, duplicate]})
         for engine in ("codex", "fixture"):
             with self.subTest(engine=engine), self.assertRaisesRegex(UsageError, "not supported"):
                 engines.validate_options(engine, {"allowed_tools": ["WebSearch"]})
+
+    def test_subagent_opt_ins_require_a_guarded_argv(self) -> None:
+        for tools in (["Task"], ["Agent"], ["Task", "Agent", "WebFetch", "WebSearch", "TodoWrite"]):
+            with self.subTest(tools=tools), self.assertRaisesRegex(RuntimeError, "ceiling"):
+                engines.assert_safe("claude", BASE, options={"allowed_tools": tools}, cwd="/")
+
+    def test_todo_opt_in_adds_only_its_exact_name_on_new_and_resumed_runs(self) -> None:
+        for resume in (None, RESUME):
+            with self.subTest(resume=resume):
+                argv = self.build({"allowed_tools": ["TodoWrite"]}, resume)
+                self.assertEqual(argv[argv.index("--allowedTools") + 1], "TodoWrite")
+                self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+                self.assertEqual(argv[argv.index("--permission-prompts") + 1], "none")
+                self.assertEqual(argv.count("--allowedTools"), 1)
+                self.assertNotIn("--settings", argv)
+                engines.assert_safe("claude", argv, options={"allowed_tools": ["TodoWrite"]})
+
+    def test_argv_recheck_rejects_invalid_names_even_if_argv_omits_them(self) -> None:
+        # The argv guard must not silently filter an unvalidated/stale payload into a smaller list.
+        for extra in ("task", "agent", "Bash", "Todo*", "TodoWrite(*)"):
+            for tools in ([extra], ["TodoWrite", extra], [*TOOLS, extra]):
+                for flags in ([], ["--allowedTools", "TodoWrite"], ["--allowedTools", "WebFetch,WebSearch"]):
+                    with self.subTest(tools=tools, flags=flags), self.assertRaisesRegex(RuntimeError, "unvalidated"):
+                        engines.assert_safe("claude", BASE + flags, options={"allowed_tools": tools})
 
     def test_default_adds_no_tool_and_keeps_dont_ask(self) -> None:
         for resume in (None, RESUME):
@@ -61,6 +92,7 @@ class AllowedToolsOptionsAndArgv(unittest.TestCase):
                     argv = self.build(options, resume)
                     self.assertFalse(set(argv) & set(engines.CLAUDE_ALLOWED_TOOLS_FLAGS))
                     self.assertFalse([arg for arg in argv if any(tool in arg for tool in TOOLS)])
+                    self.assertEqual(argv[argv.index("--disallowedTools") + 1], "Task,Agent")
                     self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
                     self.assertNotIn("--settings", argv)
 
@@ -148,14 +180,14 @@ class NetworkToolDefaultsForDoctor(unittest.TestCase):
                                         "managed_rules_only": False, "complete": True})
 
     def test_bare_allow_rules_are_reported_by_tool_name_only(self) -> None:
-        self.write(self.user, {"allow": ["WebSearch", "Bash(npm test)"], "deny": ["Read(./secrets/**)"]},
+        self.write(self.user, {"allow": ["WebSearch", "TodoWrite", "Bash(npm test)"], "deny": ["Read(./secrets/**)"]},
                    env={"PRIVATE_SETTING": "value-never-reported"}, model="private-model-name")
         self.write(self.project / "settings.local.json", {"allow": ["WebFetch"]})
         report = self.rules()
         self.assertEqual((report["allowed_by_default"], report["default_allowed"]), (True, TOOLS))
         self.assertEqual((report["ask"], report["denied"]), ([], []))
         text = json.dumps(report)
-        for content in ("value-never-reported", "PRIVATE_SETTING", "private-model-name", "Bash", "npm", "secrets"):
+        for content in ("value-never-reported", "PRIVATE_SETTING", "private-model-name", "Bash", "npm", "secrets", "TodoWrite"):
             self.assertNotIn(content, text)
 
     def test_a_scoped_allow_does_not_allow_the_whole_tool(self) -> None:
@@ -222,6 +254,9 @@ def recording_claude(tmp: Path) -> Path:
 import json, os, sys
 from pathlib import Path
 args = sys.argv[1:]
+if args[0] == "--version":
+    print('2.1.301 (Claude Code)')
+    sys.exit(0)
 if args[0] == "auth":
     print('{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}')
     sys.exit(0)
@@ -318,13 +353,34 @@ class AllowedToolsRoundTrip(RelayTestCase):
 
     def test_unknown_tools_are_refused_before_a_task_exists(self) -> None:
         for tools in (["Bash"], ["WebFetch(domain:example.com)"], ["*"], ["websearch"], ["WebSearch", "WebSearch"],
-                      "WebSearch"):
+                      "WebSearch", ["task"], ["agent"], ["Task(*)"]):
             with self.subTest(tools=tools):
                 rejected = self.submit_claude(options={"allowed_tools": tools}, expect=2)
                 self.assertEqual(rejected["error"], "usage")
                 self.assertIn("allowed_tools", rejected["message"])
         self.assertEqual(db_rows(self.home, "SELECT task_id FROM tasks"), [])
         self.assertEqual(self.calls(), [])
+
+    def test_todo_opt_in_is_retained_on_exact_resume_and_fresh_rerun(self) -> None:
+        expected = ["TodoWrite", *TOOLS]
+        sub = self.submit_claude(options={"allowed_tools": ["WebSearch", "TodoWrite", "WebFetch"]})
+        self.assertEqual(sub["allowed_tools"], expected)
+        self.assertEqual(self.wait(sub["task_id"])["task"]["state"], "succeeded")
+        resumed = self.cli("resume", sub["task_id"], "--prompt", "continue", env=self.env)
+        self.assertEqual(resumed["allowed_tools"], expected)
+        self.assertEqual(self.wait(sub["task_id"])["task"]["state"], "succeeded")
+        fresh = self.cli("resume", sub["task_id"], "--fresh", "--confirm-rerun", env=self.env)
+        self.assertEqual(fresh["allowed_tools"], expected)
+        done = self.wait(sub["task_id"])
+        self.assertEqual(done["task"]["state"], "succeeded")
+        self.assertEqual(done["task"]["options"]["allowed_tools"], expected)
+        self.assertTrue(all(event["body"]["allowed_tools"] == expected for event in done["events"]))
+        first, again, rerun = self.calls()
+        self.assertEqual(again[again.index("--resume") + 1], sub["native_session_id"])
+        self.assertNotEqual(rerun[rerun.index("--session-id") + 1], sub["native_session_id"])
+        for call in (first, again, rerun):
+            self.assertEqual(call[call.index("--allowedTools") + 1], ",".join(expected))
+            self.assertEqual(call[call.index("--permission-mode") + 1], "dontAsk")
 
     def test_a_different_tool_list_under_the_same_key_is_a_conflict(self) -> None:
         sub = self.submit_claude()
@@ -334,6 +390,27 @@ class AllowedToolsRoundTrip(RelayTestCase):
                 self.assertEqual(conflict["error"], "conflict")
                 self.assertEqual(conflict["detail"]["existing_payload_sha256"], sub["payload_sha256"])
         self.assertEqual(self.wait(sub["task_id"])["task"]["state"], "succeeded")
+
+    def test_guarded_subagents_keep_their_ceiling_on_exact_resume_and_fresh_rerun(self) -> None:
+        options = {"allowed_tools": ["Task", "Agent", "WebSearch"], "allowed_write_dirs": ["out"],
+                   "allowed_bash_commands": ["ls"]}
+        sub = self.submit_claude(options=options)
+        self.assertEqual(self.wait(sub["task_id"])["task"]["state"], "succeeded")
+        self.cli("resume", sub["task_id"], "--prompt", "continue", env=self.env)
+        self.assertEqual(self.wait(sub["task_id"])["task"]["state"], "succeeded")
+        self.cli("resume", sub["task_id"], "--fresh", "--confirm-rerun", env=self.env)
+        done = self.wait(sub["task_id"])
+        self.assertEqual(done["task"]["state"], "succeeded", done)
+        calls = self.calls()
+        self.assertEqual(len(calls), 3)
+        for call in calls:
+            settings = json.loads(call[call.index("--settings") + 1])
+            self.assertEqual(settings["hooks"]["PreToolUse"][0]["hooks"][0]["onFailure"], "block")
+            self.assertEqual(json.loads(call[call.index("--agents") + 1])["cli-relay-worker"]["permissionMode"], "dontAsk")
+            self.assertIn("Bash(ls:*)", call[call.index("--allowedTools") + 1])
+            self.assertNotIn("--disallowedTools", call)
+        self.assertEqual(calls[0][calls[0].index("--settings") + 1], calls[1][calls[1].index("--settings") + 1])
+        self.assertEqual(done["task"]["options"]["allowed_tools"], ["Agent", "Task", "WebSearch"])
 
     def test_opt_in_survives_exact_resume_a_keeper_crash_and_a_fresh_rerun(self) -> None:
         sub = self.submit_claude()
@@ -377,8 +454,10 @@ class AllowedToolsRoundTrip(RelayTestCase):
             "env": {"SOME_PRIVATE_NAME": "never-printed-value"}}))
         doctor = self.cli("doctor", "--engine", "claude", "--cwd", str(self.work), env=self.env)
         policy = doctor["claude_tool_policy"]
-        self.assertEqual((policy["default_allowed_tools"], policy["allowable_tools"]), ([], TOOLS))
+        self.assertEqual((policy["default_allowed_tools"], policy["allowable_tools"]), ([], ["Task", "Agent", "TodoWrite", *TOOLS]))
         self.assertEqual(policy["opt_in"], "--option 'allowed_tools=[\"WebSearch\",\"WebFetch\"]'")
+        self.assertEqual(policy["todo_opt_in"], "--option 'allowed_tools=[\"TodoWrite\"]'")
+        self.assertIn("cli-relay-worker", policy["subagents"])
         self.assertIn("dontAsk", policy["effect"])
         self.assertIn("deny", policy["precedence"])
         tools = doctor["engine"]["network_tools"]

@@ -777,8 +777,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "opt_in": "--option 'allowed_tools=[\"WebSearch\",\"WebFetch\"]'",
         "write_opt_in": "--allow-write-dir './out/**' (repeatable; allowed_write_dirs JSON list)",
         "bash_opt_in": "--allow-bash python3 (repeatable; allowed_bash_commands JSON list)",
+        "todo_opt_in": "--option 'allowed_tools=[\"TodoWrite\"]'",
+        "subagents": "Task/Agent opt-ins require Claude Code 2.1.301 and the task-local ceiling; only "
+                     "cli-relay-worker foreground subagents may run, with ls-only Bash grants; see "
+                     "docs/claude-subagents.md. Without opt-in native Task and Agent are disabled",
         "effect": "adds --allowedTools for that task only; the permission mode stays dontAsk and no "
-                  "--settings layer or settings file is changed",
+                  "settings file is changed; Task/Agent additionally install a validated inline policy hook",
         "precedence": "deny and ask rules of every settings layer, managed included, still win, and managed "
                       "allowManagedPermissionRulesOnly ignores --allowedTools; a tool still denied ends the "
                       "task needs_input",
