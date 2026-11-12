@@ -47,7 +47,7 @@ class ArgvSafety(unittest.TestCase):
         new = self.build("claude").argv
         self.assertEqual(new[1:], ["-p", "--output-format", "stream-json", "--verbose", "--session-id",
                                    "11111111-1111-4111-8111-111111111111", "--permission-mode", "dontAsk",
-                                   "--permission-prompts", "none"])
+                                   "--permission-prompts", "none", "--disallowedTools", "Task,Agent"])
         res = self.build("claude", resume="22222222-2222-4222-8222-222222222222").argv
         self.assertIn("--resume", res)
         self.assertNotIn("--session-id", res)

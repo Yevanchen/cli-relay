@@ -92,9 +92,11 @@ See [environment cleanup](docs/usage.md#per-task-environment-cleanup).
 ### Permission opt-ins
 
 Defaults stay minimal: Claude pins `dontAsk` and adds no allow rules; its existing
-`allowed_tools` option accepts only the exact names `TodoWrite`, `WebFetch` and `WebSearch`.
-`Task` / `Agent` opt-ins remain unavailable: custom subagents can override the parent's
-permission mode. See the [inheritance investigation and proposed safety gate](docs/claude-subagents.md).
+`allowed_tools` option accepts only the exact names `Task`, `Agent`, `TodoWrite`, `WebFetch`
+and `WebSearch`. Task/Agent use a version-pinned permission ceiling and permit concurrent
+foreground `cli-relay-worker` agents, with scoped writes and either `ls` or no Bash grant.
+Other command grants, custom agents and background delegation are rejected for these tasks.
+See the [enforcement, live acceptance and limits](docs/claude-subagents.md).
 Existing Claude settings and
 deny rules remain active. `bypassPermissions` is rejected in task options, argv and every
 settings layer, including user/project defaults. Codex defaults to `read-only`.

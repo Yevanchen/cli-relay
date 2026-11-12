@@ -201,19 +201,21 @@ Permission posture does not depend on the CLIs' configuration of the moment:
   Every Claude run must report `permissionMode: dontAsk` in its init event; a mismatch or missing
   init blocks, including when reconciliation closes the attempt after a keeper crash.
 - A Claude task adds no tool unless it opts in with `allowed_tools`, a list of exact names from a
-  fixed allowlist (`TodoWrite`, `WebSearch`, `WebFetch`), `allowed_write_dirs` (cwd subdirectories for Edit/Write),
+  fixed allowlist (`Task`, `Agent`, `TodoWrite`, `WebSearch`, `WebFetch`), `allowed_write_dirs` (cwd subdirectories for Edit/Write),
   or `allowed_bash_commands` (literal command prefixes). Directory grants reject traversal and
   symlink escapes and are rechecked before launch. These are CLI rules, not a filesystem sandbox;
   permitted Bash programs can write elsewhere. That adds one `--allowedTools` value for the task,
-  on every attempt, and changes neither the mode nor any settings layer. Deny and ask rules of
+  on every attempt, and keeps the parent mode and existing settings sources. Deny and ask rules of
   every layer, and managed `allowManagedPermissionRulesOnly`, still win. Native success plus a
   known zero exit treats denied tools as `permission_denials` warnings (tool names only), with
   the completion marker gate still applied. Otherwise denials mean `needs_input`. Cancellation
   precedence and the allowlist are unchanged; `Monitor` is not allowed by the relay.
-  `Task` / `Agent` opt-ins remain excluded because subagent definitions can override `dontAsk`;
-  the parent init event cannot verify every child's mode. The allowlist does not disable native
-  Claude tools. See [the inheritance investigation](claude-subagents.md) for this limit and the
-  gate required before enabling subagent opt-ins.
+  Task/Agent require the [live-verified permission ceiling](claude-subagents.md): only pinned
+  Claude Code 2.1.301 and generated foreground workers, scoped file writes, and `ls` or no
+  Bash grant. The inline fail-closed hook checks every parent/child call, independent of
+  inherited broad allows. Custom agents and mode/delegation overrides are blocked. Hook or
+  plugin configurations that can defeat the ceiling block launch. Without opt-in, native
+  Task/Agent are explicitly disabled. Existing non-subagent Bash prefixes remain unchanged.
 - Argv checks reject `danger-full-access` unless both task options opt in, a workspace network
   setting other than the one built from the task's options, and Claude `--allowedTools` unless it
   carries exactly the rules generated from the task's validated lists. Every permission-bypass flag, including

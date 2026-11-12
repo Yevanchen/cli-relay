@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from . import business_status, git_state, policy, procs
+from . import business_status, claude_guard, git_state, policy, procs
 from .errors import UsageError
 
 ENGINES = ("claude", "codex", "fixture")
@@ -83,10 +83,10 @@ CLAUDE_PERMISSION_MODE = "dontAsk"
 CLAUDE_PERMISSION_MODES = ("default", "manual", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan")
 CLAUDE_EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
 # Tools a Claude task may add with ``allowed_tools``: exact names only, never a rule pattern, a
-# wildcard or another tool. Task/Agent remain excluded: a custom subagent can override dontAsk
-# with permissionMode: acceptEdits/auto. See docs/claude-subagents.md before widening this list.
+# wildcard or another tool. Task/Agent require the version-pinned, task-local ceiling in
+# claude_guard; native acceptance is recorded in docs/claude-subagents.md.
 CLAUDE_NETWORK_TOOLS = ("WebFetch", "WebSearch")
-CLAUDE_ALLOWABLE_TOOLS = ("TodoWrite", *CLAUDE_NETWORK_TOOLS)
+CLAUDE_ALLOWABLE_TOOLS = ("Task", "Agent", "TodoWrite", *CLAUDE_NETWORK_TOOLS)
 CLAUDE_ALLOWED_TOOLS_FLAGS = ("--allowedTools", "--allowed-tools")
 # Observed with Claude Code 2.1.312 under dontAsk, user settings excluded (issue #22): these commands,
 # called by their bare name with any flag, are denied under every scoped rule (Bash(cp -n a b:*), the
@@ -241,11 +241,8 @@ def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str]
     if engine == "claude" and "allowed_tools" in clean:
         tools = clean["allowed_tools"]
         if not all(isinstance(tool, str) and tool in CLAUDE_ALLOWABLE_TOOLS for tool in tools):
-            subagents = any(isinstance(tool, str) and tool in ("Task", "Agent") for tool in tools)
-            reason = ("; Task/Agent opt-ins are not enabled because custom subagent permissionMode can "
-                      "override dontAsk; see docs/claude-subagents.md" if subagents else "")
             raise UsageError("allowed_tools accepts only the exact tool names " + ", ".join(CLAUDE_ALLOWABLE_TOOLS) +
-                             "; rule patterns, wildcards and other tools are not accepted" + reason,
+                             "; rule patterns, wildcards and other tools are not accepted",
                              allowed=list(CLAUDE_ALLOWABLE_TOOLS))
         if len(set(tools)) != len(tools):
             raise UsageError("allowed_tools names a tool more than once")
@@ -257,6 +254,8 @@ def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str]
             clean["allowed_write_dirs"] = _write_dirs(clean["allowed_write_dirs"], cwd)
         if "allowed_bash_commands" in clean:
             clean["allowed_bash_commands"] = _bash_commands(clean["allowed_bash_commands"])
+        if claude_guard.enabled(clean):
+            claude_guard.validate(clean)
     if "effort" in clean and clean["effort"] not in EFFORT_LEVELS:
         raise UsageError("effort must be low, medium, high, xhigh or max", allowed=list(EFFORT_LEVELS))
     for key in ("side_effect_file", "descendant_pid_file"):
@@ -537,6 +536,32 @@ def claude_settings_problems(env: Dict[str, str], cwd: Optional[str] = None, *,
     return problems, read
 
 
+def claude_guard_problems(env: Dict[str, str], cwd: Optional[str], options: Dict[str, Any]) -> List[str]:
+    problems = []
+    layers = _claude_layers(env, cwd)
+    for managed in CLAUDE_MANAGED_SETTINGS:
+        dropins = managed.parent / "managed-settings.d"
+        if dropins.exists():
+            # Do not ignore additional admin policy files that can disable non-managed hooks.
+            layers += [("managed", path) for path in sorted(dropins.glob("*.json"))]
+    for layer, path in layers:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not isinstance(data.get("env", {}), dict):
+                raise ValueError("invalid configuration")
+            problems += [layer + ":" + key for key in claude_guard.config_problems(data)]
+        except (OSError, ValueError):
+            problems.append(layer + ":unreadable")
+    config = claude_config_dir(env).resolve()
+    protected = (config, Path(sys.base_prefix).resolve(), Path(sys.prefix).resolve(),
+                 Path(sys.executable).resolve().parent)
+    for root in claude_guard.snapshot(options, cwd or os.getcwd())["write"]:
+        grant = Path(root)
+        if any(path.is_relative_to(grant) or grant.is_relative_to(path) for path in protected):
+            problems.append("write_grant_overlaps_guard_runtime_or_claude_config")
+    return problems
+
+
 def claude_tool_rules(env: Dict[str, str], cwd: Optional[str] = None) -> Dict[str, Any]:
     """For doctor: what the checked Claude settings layers say about the network tools before any
     task option. Claude evaluates deny, then ask, then allow, and dontAsk denies an ask, so a deny
@@ -609,11 +634,18 @@ def preflight(engine: str, env: Dict[str, str], cwd: Optional[str] = None, *,
         opts = validate_options(engine, opts, cwd=cwd)
         problems, layers = claude_settings_problems(env, cwd, permission_mode=CLAUDE_PERMISSION_MODE,
                                                    effort=opts.get("effort"))
+        if claude_guard.enabled(opts):
+            problems += claude_guard_problems(env, cwd, opts)
     if problems:
         return result(False, "config_not_subscription", {"settings": problems})
     binary = resolve_bin(engine, env)
     if not binary:
         return result(False, "cli_not_found", {"engine": engine})
+    if engine == "claude" and claude_guard.enabled(opts):
+        try:
+            claude_guard.check_version(binary, env)
+        except RuntimeError as exc:
+            return result(False, "subagent_guard_unverified", {"message": str(exc)})
     argv = [binary, "auth", "status"] if engine == "claude" else [binary, "login", "status"]
     try:
         out = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=child_env(env),
@@ -1038,7 +1070,7 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
     bad = sorted(set(args) & _FORBIDDEN[engine])
     if engine in ("codex", "claude"):
         bad = sorted({arg for arg in args if arg.partition("=")[0] in _FORBIDDEN[engine]})
-    if engine == "claude" and any("bypasspermissions" in arg.lower() for arg in args):
+    if engine == "claude" and any(arg.lower() == "bypasspermissions" for arg in args):
         bad.append("bypassPermissions")
     if bad:
         raise RuntimeError(f"refusing to run {engine} with forbidden flags {bad}")
@@ -1057,6 +1089,20 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
                  if arg == "--permission-mode"]
         if modes != [CLAUDE_PERMISSION_MODE] or any(arg.startswith("--permission-mode=") for arg in args):
             raise RuntimeError("refusing to run claude without the explicit dontAsk permission mode")
+        if claude_guard.enabled(options or {}):
+            if not cwd:
+                raise RuntimeError("subagent ceiling requires the task cwd")
+            claude_guard.assert_flags(args, options, cwd)
+            prompt_index = args.index("--permission-prompts") if "--permission-prompts" in args else -1
+            if (args.count("--permission-prompts") != 1 or args[prompt_index + 1:prompt_index + 2] != ["none"] or
+                    any(arg.startswith("--permission-prompts=") for arg in args) or
+                    (args[prompt_index + 2:prompt_index + 3] and not args[prompt_index + 2].startswith("--"))):
+                raise RuntimeError("subagent ceiling requires unattended denials")
+        else:
+            if (args.count("--disallowedTools") != 1 or
+                    args[args.index("--disallowedTools") + 1:args.index("--disallowedTools") + 2] != ["Task,Agent"] or
+                    any(arg.startswith(("--disallowedTools=", "--disallowed-tools")) for arg in args)):
+                raise RuntimeError("refusing native subagents without a guarded task opt-in")
     tools = ",".join(requested_tools(engine, {"options": options}))
     for i, arg in enumerate(args):
         sandbox = override = None
@@ -1091,7 +1137,10 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
                 setting = json.loads(args[i + 1])
             except (IndexError, ValueError):
                 setting = None
-            if not any(setting == {"env": {CLAUDE_EFFORT_ENV: e}} for e in EFFORT_LEVELS):
+            guarded = claude_guard.enabled(options or {})
+            expected = claude_guard.settings(options, cwd) if guarded else None
+            if not (guarded and setting == expected) and not (
+                    not guarded and any(setting == {"env": {CLAUDE_EFFORT_ENV: e}} for e in EFFORT_LEVELS)):
                 raise RuntimeError("refusing claude settings other than a task-local effort override")
         if engine == "claude" and arg == "--effort":
             if i + 1 == len(args) or args[i + 1] not in EFFORT_LEVELS:
@@ -1114,9 +1163,24 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
     evidence: Dict[str, Any] = {}
     if engine == "claude":
         binary = resolve_bin(engine, env)
+        guarded = claude_guard.enabled(opts)
+        if guarded:
+            problems = claude_guard_problems(cenv, cwd, opts)
+            if problems:
+                raise RuntimeError("subagent ceiling conflicts with configuration: " + ", ".join(problems))
+            cenv = claude_guard.clean_env(cenv)
+            claude_guard.check_version(binary, cenv)
         argv = [binary, "-p", "--output-format", "stream-json", "--verbose"]
         argv += ["--resume", resume] if resume else ["--session-id", attempt["native_session_id"]]
         argv += ["--permission-mode", CLAUDE_PERMISSION_MODE, "--permission-prompts", "none"]
+        if guarded:
+            argv += claude_guard.flags(opts, cwd)
+            evidence["claude_subagent_guard"] = {"version": claude_guard.VERIFIED_VERSION,
+                                                 "worker": claude_guard.WORKER,
+                                                 "policy": claude_guard.snapshot(opts, cwd)}
+        else:
+            # No native delegation without the task's explicit guarded opt-in.
+            argv += ["--disallowedTools", "Task,Agent"]
         tools = requested_tools(engine, {"options": opts})
         if tools:
             # Allow rules for this session only: deny and ask rules of every settings layer, managed
@@ -1127,8 +1191,9 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
         if opts.get("effort"):
             # Settings env can override the shell and --effort. This generated one-key CLI
             # settings layer wins over user/project values without changing auth or any rules.
-            argv += ["--effort", opts["effort"], "--settings",
-                     json.dumps({"env": {CLAUDE_EFFORT_ENV: opts["effort"]}}, separators=(",", ":"))]
+            argv += ["--effort", opts["effort"]]
+            if not guarded:
+                argv += ["--settings", json.dumps({"env": {CLAUDE_EFFORT_ENV: opts["effort"]}}, separators=(",", ":"))]
     elif engine == "codex":
         binary = resolve_bin(engine, env)
         last_message = str(run_dir / "last_message.txt")
