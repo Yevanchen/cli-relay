@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from . import business_status, engines, policy
+from . import business_status, concurrency, engines, policy
 from .errors import (
     AckMismatch,
     Conflict,
@@ -836,6 +836,9 @@ class Ledger:
                    not json.loads(r['evidence_json'] or '{}').get('processes_stopped'))]
         used = len(active)
         cu = sum(policy.uses_cu_budget(json.loads(r['payload_json'])) for r in active)
+        # Observe memory once per admission decision, inside the same serialized write
+        # transaction as the claim. Each waiting poll reloads home settings and memory.
+        capacity = concurrency.snapshot(self.home)
         ahead = []
         for row in rows:
             if row['attempt_state'] not in ('pending', 'waiting'):
@@ -845,10 +848,17 @@ class Ledger:
                 continue  # a dependency wait does not reserve a slot
             row_payload = json.loads(row['payload_json'])
             is_cu = policy.uses_cu_budget(row_payload)
-            fits = used < policy.LOCAL_MAX_ACTIVE and (not is_cu or cu < policy.LOCAL_MAX_COMPUTER_USE)
+            fits = used < capacity['max_active'] and (not is_cu or cu < policy.LOCAL_MAX_COMPUTER_USE)
             if row['task_id'] == task['task_id']:
                 if not fits:
-                    waiting['capacity'] = {'max_active': policy.LOCAL_MAX_ACTIVE,
+                    reasons = []
+                    if used >= capacity['max_active']:
+                        reasons.append({'memory': 'hard_max', 'memory_limited': 'low_available_memory',
+                                        'fixed_fallback': 'fixed_fallback_limit',
+                                        'invalid_config': 'invalid_concurrency_config'}[capacity['mode']])
+                    if is_cu and cu >= policy.LOCAL_MAX_COMPUTER_USE:
+                        reasons.append('computer_use_limit')
+                    waiting['capacity'] = {**capacity, 'reasons': reasons,
                         'max_computer_use': policy.LOCAL_MAX_COMPUTER_USE,
                         'active_task_ids': [r['task_id'] for r in active], 'ready_ahead_task_ids': ahead,
                         'resource_class': row_payload.get('resource_class', 'standard' if row['engine'] == 'fixture' else 'unknown'),

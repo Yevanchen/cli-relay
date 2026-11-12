@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import __version__, business_status, engines, notify, policy, procs, routes
+from . import __version__, business_status, concurrency, engines, notify, policy, procs, routes
 from .errors import NotFound, Refused, RelayError, UsageError
 from .keeper import _hook
 from .ledger import ACTIVE_STATES, AFTER_REQUIRE, SCHEDULING_FIELDS, Ledger, canonical_json, init_ledger
@@ -413,7 +413,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     task_id = _resolve_task(ledger, args)
     actions = [] if args.no_reconcile else reconcile_task(ledger, task_id, kick=True, spawn=_spawner(args.home))
     _after_reconcile(args.home, actions)
-    emit({"ok": True, **task_view(ledger, task_id), "reconcile": actions})
+    emit({"ok": True, **task_view(ledger, task_id), "reconcile": actions,
+          "local_concurrency": concurrency.snapshot(args.home)})
     return 0
 
 
@@ -732,6 +733,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
 def cmd_doctor(args: argparse.Namespace) -> int:
     out: Dict[str, Any] = {"ok": True, "version": __version__, "python": platform.python_version(),
                            "platform": platform.system()}
+    out["local_concurrency"] = {**concurrency.snapshot(args.home),
+                                "max_computer_use": policy.LOCAL_MAX_COMPUTER_USE, "scope": "relay_home"}
+    out["ok"] = out["ok"] and out["local_concurrency"]["ok"]
     out["codex_sandbox_policy"] = {
         "default_sandbox": "read-only", "full_access_default": False,
         "full_access_opt_in": '--option sandbox="danger-full-access" --option allow_full_access=true',
@@ -938,7 +942,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="dependency release condition (default: ok; requires --after)")
     s.add_argument("--queue", metavar="NAME", help="FIFO queue in this home and scope; one running task at a time")
     s.add_argument("--task-class", choices=tuple(policy.TIERS), help="required for new production work; fixes engine/model/effort")
-    s.add_argument("--resource-class", choices=policy.RESOURCE_CLASSES, help="explicit standard or computer_use; shared home cap 2, CU cap 1")
+    s.add_argument("--resource-class", choices=policy.RESOURCE_CLASSES,
+                   help="explicit standard or computer_use; shared home memory gate and configurable hard cap (default 4), CU cap 1")
     s.add_argument("--test-only-reason", help="audited exemption reason; only engine=fixture can use this")
     s.set_defaults(func=cmd_submit)
 

@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -10,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import helpers
-from cli_relay import cli, policy
+from cli_relay import cli, concurrency, policy
 from cli_relay.errors import UsageError
 from cli_relay.ledger import Ledger, init_ledger, payload_hash
 
@@ -132,6 +133,13 @@ class ProductionTiers(unittest.TestCase):
 
 class SharedCapacity(unittest.TestCase):
     def setUp(self):
+        # These legacy recovery/FIFO cases deliberately exercise a configured two-slot
+        # budget; they must not depend on the test host's current free memory.
+        self.enterContext(patch.dict(os.environ, {
+            'CLI_RELAY_LOCAL_HARD_MAX': '2', 'CLI_RELAY_LOCAL_FALLBACK_MAX': '2',
+            'CLI_RELAY_LOCAL_MIN_AVAILABLE_MIB': '0'}))
+        self.memory = self.enterContext(patch.object(concurrency, 'read_available_memory',
+            return_value=concurrency.Memory(8 * 1024**3, 'mock')))
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name) / 'ledger'
@@ -180,6 +188,101 @@ class SharedCapacity(unittest.TestCase):
         self.assertFalse(self.ledger.mark_spawning(attempts[3]['attempt_id'], keeper_pid=999))
         self.assertTrue(self.ledger.mark_spawning(attempts[3]['attempt_id'], keeper_pid=123))
         self.assertFalse(self.ledger.mark_spawning(attempts[3]['attempt_id'], keeper_pid=123))
+
+    def test_memory_allows_four_cross_scope_simultaneous_starts_with_hard_cap(self):
+        with patch.dict(os.environ, {'CLI_RELAY_LOCAL_HARD_MAX': '4'}):
+            attempts = [self.submit(str(i), engine='codex' if i % 2 else 'claude') for i in range(8)]
+            barrier = threading.Barrier(len(attempts))
+            def claim(att):
+                with contextlib.closing(Ledger(self.home)) as db:
+                    barrier.wait(timeout=10)
+                    return self.claim(att, db)
+            with ThreadPoolExecutor(max_workers=len(attempts)) as pool:
+                states = list(pool.map(claim, attempts))
+            self.assertEqual(states.count('claimed'), 4)
+            self.assertEqual(states.count('waiting'), 4)
+            capacity = self.ledger.waiting_on(attempts[4]['task_id'])['capacity']
+            self.assertEqual(capacity['reasons'], ['hard_max'])
+            self.assertEqual(capacity['max_active'], 4)
+            self.assertEqual(capacity['available_bytes'], 8 * 1024**3)
+
+    def test_low_memory_queues_then_admits_on_recovery_without_a_new_attempt(self):
+        with patch.dict(os.environ, {'CLI_RELAY_LOCAL_HARD_MAX': '4',
+                                    'CLI_RELAY_LOCAL_MIN_AVAILABLE_MIB': '1536'}):
+            one, two, three, four = [self.submit(str(i)) for i in range(4)]
+            self.assertEqual(self.claim(one), 'claimed')
+            self.assertEqual(self.claim(two), 'claimed')
+            self.memory.return_value = concurrency.Memory(200 * concurrency.MIB, 'mock')
+            self.assertEqual(self.claim(three), 'waiting')
+            self.assertEqual(self.claim(four), 'waiting')
+            self.assertEqual(self.ledger.admit_waiting(three['attempt_id'], keeper_pid=123), 'waiting')
+            capacity = self.ledger.waiting_on(three['task_id'])['capacity']
+            self.assertEqual(capacity['reasons'], ['low_available_memory'])
+            self.assertEqual(capacity['max_active'], 1)
+            self.assertEqual(capacity['min_available_bytes'], 1536 * concurrency.MIB)
+            self.assertEqual(self.ledger.get_attempt(one['attempt_id'])['state'], 'claimed')
+            self.memory.return_value = concurrency.Memory(1536 * concurrency.MIB, 'mock')
+            # Memory exactly at the threshold is sufficient; ready work keeps FIFO.
+            with patch.dict(os.environ, {'CLI_RELAY_LOCAL_HARD_MAX': '3'}):
+                self.assertEqual(self.ledger.admit_waiting(four['attempt_id'], keeper_pid=123), 'waiting')
+                self.assertEqual(self.ledger.admit_waiting(three['attempt_id'], keeper_pid=123), 'ready')
+            self.assertEqual(self.ledger.admit_waiting(four['attempt_id'], keeper_pid=123), 'ready')
+            self.assertEqual(len(self.ledger.attempts(three['task_id'])), 1)
+            self.assertEqual([e['kind'] for e in self.ledger.events_of_task(three['task_id'])], ['waiting'])
+
+    def test_zero_available_memory_still_allows_one_and_preserves_fifo(self):
+        self.memory.return_value = concurrency.Memory(0, 'mock')
+        with patch.dict(os.environ, {'CLI_RELAY_LOCAL_HARD_MAX': '4',
+                                    'CLI_RELAY_LOCAL_MIN_AVAILABLE_MIB': '1536'}):
+            one, two, three = [self.submit(str(i)) for i in range(3)]
+            self.assertEqual(self.claim(three), 'waiting', 'the oldest eligible task gets the single slot')
+            self.assertEqual(self.claim(one), 'claimed')
+            self.assertEqual(self.claim(two), 'waiting')
+            self.finish(one)
+            self.assertEqual(self.ledger.admit_waiting(two['attempt_id'], keeper_pid=123), 'ready')
+            self.assertEqual(self.ledger.admit_waiting(three['attempt_id'], keeper_pid=123), 'waiting')
+            self.finish(two)
+            self.assertEqual(self.ledger.admit_waiting(three['attempt_id'], keeper_pid=123), 'ready')
+
+    def test_failed_memory_probe_uses_configured_fixed_fallback(self):
+        self.memory.return_value = concurrency.Memory(None, 'mock', 'TimeoutExpired')
+        with patch.dict(os.environ, {'CLI_RELAY_LOCAL_HARD_MAX': '4',
+                                    'CLI_RELAY_LOCAL_FALLBACK_MAX': '3'}):
+            attempts = [self.submit(str(i)) for i in range(4)]
+            self.assertEqual([self.claim(a) for a in attempts], ['claimed'] * 3 + ['waiting'])
+            capacity = self.ledger.waiting_on(attempts[-1]['task_id'])['capacity']
+            self.assertEqual(capacity['reasons'], ['fixed_fallback_limit'])
+            self.assertEqual(capacity['max_active'], 3)
+            self.assertIsNone(capacity['available_bytes'])
+            self.assertEqual(capacity['memory_error'], 'TimeoutExpired')
+
+    def test_cu_remains_singleton_with_four_slots_and_low_memory(self):
+        with patch.dict(os.environ, {'CLI_RELAY_LOCAL_HARD_MAX': '4',
+                                    'CLI_RELAY_LOCAL_MIN_AVAILABLE_MIB': '1536'}):
+            cu1, cu2 = self.submit('cu1', resource='computer_use'), self.submit('cu2', resource='computer_use')
+            standard = [self.submit(str(i)) for i in range(3)]
+            self.assertEqual(self.claim(cu1), 'claimed')
+            self.assertEqual(self.claim(cu2), 'waiting')
+            self.assertEqual([self.claim(a) for a in standard], ['claimed'] * 3)
+            capacity = self.ledger.waiting_on(cu2['task_id'])['capacity']
+            self.assertEqual(capacity['reasons'], ['hard_max', 'computer_use_limit'])
+            self.finish(standard[0])
+            self.assertEqual(self.ledger.waiting_on(cu2['task_id'])['capacity']['reasons'], ['computer_use_limit'])
+            self.memory.return_value = concurrency.Memory(0, 'mock')
+            self.finish(cu1)
+            self.assertEqual(self.ledger.admit_waiting(cu2['attempt_id'], keeper_pid=123), 'waiting')
+            self.finish(standard[1]); self.finish(standard[2])
+            self.assertEqual(self.ledger.admit_waiting(cu2['attempt_id'], keeper_pid=123), 'ready')
+
+    def test_bad_live_config_waits_and_recovers_without_losing_the_keeper(self):
+        one, two = self.submit('one'), self.submit('two')
+        self.assertEqual(self.claim(one), 'claimed')
+        with patch.dict(os.environ, {'CLI_RELAY_LOCAL_HARD_MAX': 'invalid'}):
+            self.assertEqual(self.claim(two), 'waiting')
+            self.assertEqual(self.ledger.admit_waiting(two['attempt_id'], keeper_pid=123), 'waiting')
+            self.assertEqual(self.ledger.waiting_on(two['task_id'])['capacity']['reasons'],
+                             ['invalid_concurrency_config'])
+        self.assertEqual(self.ledger.admit_waiting(two['attempt_id'], keeper_pid=123), 'ready')
 
     def test_cu_singleton_does_not_block_standard_slot_and_releases(self):
         cu1, cu2, standard = self.submit('cu1', resource='computer_use'), self.submit('cu2', resource='computer_use'), self.submit('s')

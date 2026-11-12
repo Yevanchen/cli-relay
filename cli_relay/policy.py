@@ -22,7 +22,6 @@ def tier(task_class: str, index: int = 0) -> tuple:
 
 
 RESOURCE_CLASSES = ("standard", "computer_use")
-LOCAL_MAX_ACTIVE = 2
 LOCAL_MAX_COMPUTER_USE = 1
 
 
