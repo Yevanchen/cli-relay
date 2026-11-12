@@ -25,7 +25,7 @@ class ProductionTiers(unittest.TestCase):
         self.addCleanup(self.ledger.close)
 
     def payload(self, task_class='complex', resource_class='standard'):
-        engine, model, effort = policy.TIERS[task_class]
+        engine, model, effort = policy.tier(task_class)
         return dict(engine=engine, cwd=self.tmp.name, prompt='fixture', task_class=task_class,
                     resource_class=resource_class, options=dict(model=model, effort=effort,
                     **({'sandbox': 'workspace-write'} if engine == 'codex' else {})))
@@ -35,12 +35,35 @@ class ProductionTiers(unittest.TestCase):
             p = self.payload(tier)
             policy.validate_new(p)
             settings = policy.settings(p['engine'], p)['effective_settings']
-            self.assertEqual((settings['engine'], settings['model'], settings['effort']), policy.TIERS[tier])
+            self.assertEqual((settings['engine'], settings['model'], settings['effort']), policy.tier(tier))
             self.assertEqual(settings['verification'], 'invocation_only')
         policy.validate_new(self.payload(resource_class='computer_use'))
         for tier in ('simple', 'highest_quality'):
             with self.assertRaises(UsageError):
                 policy.validate_new(self.payload(tier, 'computer_use'))
+
+    def test_highest_quality_also_allows_fable_extra(self):
+        p = self.payload('highest_quality')
+        p['options']['model'] = 'claude-fable-5-2'
+        p['options']['effort'] = 'xhigh'
+        policy.validate_new(p)
+        settings = policy.settings(p['engine'], p)['effective_settings']
+        self.assertEqual((settings['engine'], settings['model'], settings['effort']),
+                         ('claude', 'claude-fable-5-2', 'xhigh'))
+        self.assertEqual(policy.TIERS['highest_quality'][0], ('claude', 'claude-opus-5-5', 'max'))
+        for model, effort in (('claude-fable-5-2', 'max'), ('claude-opus-5-5', 'xhigh'),
+                              ('claude-fable-5-2', 'high'), ('claude-fable-5-1', 'xhigh')):
+            bad = self.payload('highest_quality')
+            bad['options']['model'] = model
+            bad['options']['effort'] = effort
+            with self.subTest(model=model, effort=effort), self.assertRaises(UsageError):
+                policy.validate_new(bad)
+        for task_class in ('simple', 'complex'):
+            other = self.payload(task_class)
+            other['options']['model'] = 'claude-fable-5-2'
+            other['options']['effort'] = 'xhigh'
+            with self.subTest(task_class=task_class), self.assertRaises(UsageError):
+                policy.validate_new(other)
 
     def test_missing_unknown_deprecated_and_effort_mismatch(self):
         for field, value in (('model', None), ('model', ''), ('model', 'gpt-6-astra'),
@@ -120,7 +143,7 @@ class SharedCapacity(unittest.TestCase):
         p = dict(engine=engine, cwd=self.tmp.name, options={}, prompt='fixture', resource_class=resource, **extra)
         if engine != 'fixture':
             task_class = 'complex' if engine == 'codex' else 'highest_quality'
-            _, model, effort = policy.TIERS[task_class]
+            _, model, effort = policy.tier(task_class)
             p.update(task_class=task_class, options=dict(model=model, effort=effort,
                      **({'sandbox':'workspace-write'} if engine == 'codex' else {})))
         _, task, _ = self.ledger.submit(scope=scope or key, key=key, payload=p, prompt='fixture', native_session_id=None)

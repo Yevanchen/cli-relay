@@ -25,6 +25,8 @@ cli-relay ack --consumer grok --task t-… --attempt 1 --event e-…
 cli-relay brief --consumer grok --text # read-only message lines and one batch ACK command
 cli-relay status t-…               # full record: attempts, identities, exit status, native result
 cli-relay resume t-… --prompt "Continue with the next failing test."   # exact native session
+cli-relay submit --key follow-up-1 --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
+  --session 5b2f0c1e-… --prompt "Also update the changelog."   # next turn of an existing session
 cli-relay cancel t-…
 
 # v0.2: wake a consumer when tasks end (configuration in <home>/notifier.json, see docs/notifier.md)
@@ -129,6 +131,114 @@ The optional top-level payload fields are `after` (resolved id), `after_require`
 explicitly supplied) and `queue`. Supplied fields participate in idempotency: changing them
 under the same key conflicts. Omitting all three preserves the previous payload and hash.
 No ledger schema change or migration is required; existing databases and events remain readable.
+
+## Sending a message to an existing session
+
+`submit --session SESSION_ID` delivers the prompt as the next turn of an existing Claude Code
+session or Codex thread, instead of starting a new one (issue #18). It is a submit mode: key,
+scope, cwd, engine, task/resource class, options, routes, origin, `--after` and `--queue` work as
+for any task, and the result goes through the same ledger, events, notifications, `brief` and ACK.
+
+```sh
+cli-relay submit --key follow-up-1 --engine codex --cwd ~/code/app --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"' \
+  --session 01a1bb19-1c70-70b0-af39-97a899ae2e77 --prompt "Also handle the empty-list case."
+```
+
+| Engine | The turn runs as | `--session` |
+|---|---|---|
+| `claude` | `claude -p … --resume <id> --permission-mode dontAsk --permission-prompts none` | the Claude session UUID |
+| `codex` | `codex exec --sandbox <s> resume -c sandbox_mode="<s>" … <id> -` | the Codex thread UUID |
+| `fixture` | the fixture's own `--resume <id>` | a fixture session (tests) |
+
+The argv is the existing exact-resume argv, built from this task's own options: permission mode,
+sandbox, network pin, `--allowedTools`, model and effort. Nothing is taken from the settings the
+session ran with before.
+
+Where session ids come from (checked locally with Claude Code 2.1.312 and codex-cli 0.162.1
+unless noted):
+
+- cli-relay: `native_session_id` in a Claude submit receipt (the relay chooses it), and in
+  `status`/`wait` attempts and terminal events once a Codex run has started (`thread.started`).
+- Claude Code: `session_id` in the output of `claude -p --output-format json` or `stream-json`, and
+  the transcript name `~/.claude/projects/<project>/<session-id>.jsonl` (under `CLAUDE_CONFIG_DIR` if
+  set). The interactive `/status` view was not checked.
+- Codex: `thread_id` of the `thread.started` event of `codex exec --json`, and the rollout name
+  `~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<thread-id>.jsonl` (under `CODEX_HOME` if set). The
+  Codex App and the `codex resume` picker were not checked.
+
+Only an exact UUID is accepted, normalised to lower case; names, `--last` and patterns are usage
+errors. The session must exist on this machine, for the user and configuration directories the
+keeper inherits from `submit`.
+
+**Checks and failure reasons.** For a new key, `submit` refuses with exit 6 and creates nothing.
+The keeper checks again right before the turn is sent; a failure then closes the attempt as
+`blocked` without starting the CLI, with `preflight`, `reason_code` and a one-line `summary` in
+attempt evidence, the terminal event body and the notification summary:
+
+| Reason | When |
+|---|---|
+| `session_not_found` | no Claude transcript, Codex rollout or fixture state for the id; `searched` names the pattern |
+| `session_busy` | another task in this relay home holds the session or waits for it (`holder: "relay_task"`, `holder_task_ids`); a live Claude Code process has it open (`holder: "claude_process"`, `pid`, `kind`, `entrypoint`, `status`); or the Codex thread-writer lock is held or cannot be checked (`holder: "codex_thread_writer_lock"`, `lock`) |
+| `provider_not_subscription`, `provider_unverified` | the Codex thread's own record does not name the built-in `openai` provider, or has no such record |
+| `session_permissions_wider` (submit only) | the Codex thread belongs to an ordinary relay task whose sandbox or network is narrower than this message's: that task's resumes check every turn of its thread, so a wider turn would block them for good |
+| the existing preflight reasons | billing variables, configuration layers and login, as for every task (`billing_env_present`, `config_not_subscription`, `auth_not_subscription`, …) |
+
+After the run the existing checks apply: Claude's init event must show `dontAsk` and no API-key
+source; the Codex thread must name `openai`, and the turn must show the requested sandbox and
+network. For a message to an existing thread only the turns after the attempt's pre-run checkpoint
+are checked: earlier turns were not run by this task, so a user's `workspace-write` history neither
+blocks a `read-only` follow-up nor counts as permission for it. A Codex resume that loses a race to
+another writer exits without a turn record: it ends `blocked` (`permissions_unverified`) with a
+`session_busy` warning. A receipt warning `session_cwd_differs` notes a session created in another
+directory: the turn runs in `--cwd`, where its tools and the relay's git, result-file and artifact
+checks apply. In local checks a turn resumed from another directory recorded that directory, in the
+Claude transcript and in Codex's `turn_context.cwd`.
+
+`resume` of such a task makes the same session checks as `submit --session`. Scopes are not a
+security boundary here: any caller of a relay home can send to any session of the machine's user,
+and the reply carries that session's context into the caller's own events. Treat a session id like
+access to the session. A keeper that a later `status`, `wait` or `events` restarts inherits that
+command's environment, so poll with the same `HOME`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME` as the
+submit. Before rolling back to a release without `--session`, let waiting and pending messages end
+or cancel them: an older keeper would resume the session without these checks.
+
+**Records.** The payload gains `target_session_id`. It is part of the hash: the same key with
+another session is a conflict, and without `--session` the field is omitted, so existing hashes are
+unchanged. The first attempt has `reason: "send"` and `resume_session_id = native_session_id = <id>`.
+Receipts, `status`/`wait` task records, terminal and unknown event bodies, notification entries and
+`brief` JSON carry `target_session_id`. No ledger migration is needed. `resume` continues the same
+session with another message; `resume --fresh` is refused (`fresh_not_supported`), because a new
+session would lose the context the message was meant for.
+
+**Concurrency.**
+
+- In one relay home at most one attempt runs a session at a time, across scopes. While another
+  task holds the session or waits for it, `submit --session` and `resume` refuse with
+  `session_busy`. To queue a message behind a running task, submit it with
+  `--after <that task> --after-require any_terminal`: it waits (`waiting_on.dependency` and
+  `waiting_on.session`) and runs right after, in the same session. At admission the keeper also
+  waits, first come first served, for any other holder, so two relay attempts never overlap on one
+  session. An `unknown` holder keeps the session until its processes are proven stopped.
+- Claude Code takes no lock of its own. With 2.1.312, `claude -p --resume <id>` ran while another
+  process had the session open; the open process did not see the appended turn, its next turn forked
+  the transcript, and a later `--resume` continued that fork, so the appended turn was lost. The
+  relay therefore refuses while `<config>/sessions/<pid>.json` names the session with a live pid.
+  Claude Code registers interactive (`entrypoint: "cli"`) and `-p` (`"sdk-cli"`) sessions there. An
+  entry whose pid is gone, a zombie, or a process that started more than a minute after the
+  registered `startedAt` (a pid reused after a crash) is ignored; a refusal names the entry's file.
+- Codex holds `<CODEX_HOME>/thread-writer-locks/<id>.lock` while a turn writes the thread, and a
+  second writer fails with `thread … already has an active writer`. The relay probes that lock with
+  a non-blocking shared lock, released at once, so it only conflicts with a writer. This was
+  observed on macOS; on Linux, where `flock` and `fcntl` locks are independent, the probe is
+  **not verified** against Codex, and a missed writer is still caught by Codex's own refusal.
+- Submit and resume repeat the relay check inside their write transaction, so concurrent submits
+  of two messages for one session cannot both be accepted.
+- A message cannot be injected into a turn that is already running: `claude -p` and `codex exec`
+  read their prompt once at start. Queue it with `--after` as above.
+- Not detected: a session used from another machine, user or configuration directory, or by a
+  process that does not register as above. Whether the Codex App holds the writer lock while a
+  thread is open but idle, and how an open Claude Code TUI or Codex App window displays a turn added
+  by another process, were **not verified**.
 
 ## Per-task routes and origin (issue #4)
 
@@ -310,7 +420,9 @@ details also contain `fix.submit_flags` (for example `--unset-env ANTHROPIC_API_
 before `cli-relay`; flags go on `submit`. The `env -u` prefix applies only to that invocation;
 use `--unset-env` to retain cleanup for future resumes. `doctor --engine claude` shows
 the same hint when billing variables block it. Blocked terminal events
-include these billing preflight details too.
+include these billing preflight details too. The notification summary, which is all a command
+adapter receives, ends with the same copyable fix (`billing_env_present fix: submit with a new key
+and --unset-env NAME …`), and `brief` JSON events carry the `preflight` object.
 
 Submit/resume receipts, task records and terminal events include `unset_env` only when requested.
 Once the keeper observes the attempt's environment, attempt evidence and terminal events also
@@ -468,28 +580,56 @@ Codex also accepts `--network-access` or the `network_access` JSON alias. See th
 ### allowed_bash_commands
 
 `--allow-bash 'cp -n a b'` and `--option 'allowed_bash_commands=["cp -n a b"]'` request the same
-`Bash(cp -n a b:*)` prefix rule. Claude Code itself decides whether a command matches. In the
-2026-11-04 reproduction with Claude Code 2.1.312, `dontAsk` and a clean non-Git cwd, these
-commands were each listed in the same `--allowedTools` argument:
+`Bash(cp -n a b:*)` prefix rule. All rules go into one `--allowedTools` argv element, comma
+separated, without a shell. Claude Code itself decides whether a command matches.
 
-| Observed result | Commands |
+**Isolated reproduction (2026-11-08, issue #22).** Claude Code 2.1.312, `dontAsk`, one fresh
+non-Git directory per case, a minimal environment without billing or session variables, and
+the argv from `cli_relay.engines.build` wherever cli-relay can express the rule. The user's
+`~/.claude/settings.json` (its allow list, `bypassPermissions` default, hooks and plugins) was
+excluded with `--setting-sources project,local`; an empty `HOME` cannot be used on macOS because it
+loses the keychain login. Each case asked the model to run one exact command once; 60 real runs.
+Nine cases repeated with the user's settings loaded gave the same results, so that configuration
+is not a factor.
+
+| Result | Commands |
 |---|---|
-| Denied | `cp -n a.example a.txt`, `cp -p a.example f.txt`, `cp -n a.example g.txt` |
-| Denied for dotfiles and scoped output too | `cp -n .env.example .env`, `cp -n .env.example env.txt`, `cp -n x.example .env2`, `cp -n a.example out/c.txt` (with `allowed_write_dirs=["out"]`) |
-| Allowed | `cp a.example b.txt`, `cp a.example out/m.txt` |
-| Allowed, including other commands with flags | `cat a.example`, `touch d.txt`, `mkdir e`, `ls -la a.example`, `mkdir -p k/l` |
+| Denied under every scoped rule: `Bash(<cmd>:*)` as cli-relay builds it, the exact `Bash(<cmd>)`, `Bash(cp:*)`, `Bash(cp -n:*)`, `Bash(cp *)`, `Bash(cp -n *)`, and with `Edit(./**)`/`Write(./**)` added | `cp -n a.example a.txt`, `cp -p …`, `cp -f …`, `cp -r adir bdir`, `cp -n .env.example .env`, `cp -n a.example out/c.txt` (with `allowed_write_dirs=["out"]`), `mv -n x.example y.txt` |
+| Allowed by an unrestricted `Bash` rule only | the same `cp -n a.example a.txt` |
+| Allowed by its `Bash(<cmd>:*)` rule | `cp a.example b.txt`, `cp .env.example .env`, `mv x.example y.txt`, `rm -f x.example`, `rm x.example`, `mkdir -p k/l`, `ln -s …`, `ln -sf …`, `sed -i.bak s/x/y/ x.example`, `chmod -R u+w adir`, `./tool.sh hello`, `cp <task cwd>/a.example <task cwd>/o2.txt`, and `test -e a.txt \|\| cp a.example a.txt` with rules for both parts |
+| Denied under its exact rule: a path outside the task directory | `cp <outside>/a.example <outside>/o1.txt`, `cp ../outside/a.example o6.txt`, `ls -la <outside>/a.example`, `cat <outside>/a.example`, `mkdir <outside>/m`, `touch <outside>/t.txt`, `mv <outside>/a.example <outside>/b.txt`, `rm <outside>/a.example` |
+| Allowed although outside | `python3 <outside>/s.py`; the outside `cp` when the directory is added with `claude --add-dir` (cli-relay never passes it) |
+| Without any rule | `ls -la a.example` allowed (read-only); `cp a.example b.txt`, `cp -n …`, `mkdir -p k/l`, `touch d.txt` and `./tool.sh hello` denied |
+| Write tool under `Edit(./cfg/**)`/`Write(./cfg/**)` | `cfg/.env`, `cfg/.env.local` and `cfg/notes.txt` all allowed |
 
-This is an observed Claude matching limitation for `cp` with flags, including `-n` and `-p`.
-The relay keeps the rule construction, settings and permission mode unchanged. Use
-`cp <src> <dst>` without flags (remove `-n` only when overwriting the destination is acceptable),
-or check existence with `test -e` first (request a prefix for that check too). An existence
-check followed by a copy is not atomic.
+So the relay's rule construction is not at fault: multi-word rules match, and for `cp`/`mv` with a
+flag no scoped spelling helps. Claude Code does not protect `.env`-like files specially either: the
+flag decides. Two Claude Code checks explain every denial: `cp`/`mv` called by bare name with any
+flag, and file commands called by bare name with a path outside the working directories. Both
+apply even when a rule matches.
+
+The relay keeps the rule construction, settings and permission mode unchanged, and offers no
+unrestricted Bash grant. Workarounds: use `cp <src> <dst>` without flags (remove `-n` only when
+overwriting the destination is acceptable), or run `test -e <dst> || cp <src> <dst>` and allow the
+two prefixes `test -e <dst>` and `cp <src> <dst>` (an existence check followed by a copy is not
+atomic). For paths outside the task directory, submit with a `--cwd` that contains them.
+
+Caution: the same commands called by absolute path were allowed under their rules
+(`/bin/cp -n a.example a.txt`, `/bin/mv -n x.example y.txt`, and even `/bin/cp ../outside/a.example
+o8.txt`), because Claude Code applies those two checks to the bare names only. cli-relay does not
+recommend this: a prefix such as `/bin/cp …` then reaches outside the task directory with nothing
+but the prefix rule in the way.
 
 - Submit receipts include one `{"code": "bash_rule_not_honoured", "command": "cp -n a b", "hint": "…"}`
-  per affected entry: its first word is `cp` and a later token starts with `-`. Only `cp` is on
-  the observed command list; this does not predict a problem with `mv`, `rm` or other commands.
-  The hint names the observed Claude version and workarounds. Submission still succeeds;
-  the warning is receipt metadata and does not change the stored payload or its hash.
+  per affected entry: its first word is `cp` or `mv` and a later token starts with `-`. Other
+  commands with flags (`rm -f`, `mkdir -p`, `ln -s`, `sed -i`) were allowed and do not warn.
+- Submit receipts include one `{"code": "bash_rule_path_outside_cwd", "command": "…", "paths": […],
+  "hint": "…"}` per entry whose first word is `cat`, `cp`, `ls`, `mkdir`, `mv`, `rm` or `touch` and
+  that has a path argument resolving outside the task cwd, `..` and symlinks included. `paths`
+  lists those arguments. Interpreters such as `python3` and absolute binary paths are not checked.
+- The hints name the observed Claude version and workarounds; the observations may change with
+  another Claude Code version. Submission still succeeds; the warnings are receipt metadata and do
+  not change the stored payload or its hash.
 - After a Claude run, structured Bash denials whose stripped `tool_input.command` equals a
   requested prefix or starts with that prefix plus a space add one
   `{"code": "allowed_rule_denied", "commands": ["cp -n a b"]}` warning. This applies to any
@@ -565,7 +705,8 @@ part of the request.
 New production submits require an explicit task/resource class, engine/model/effort and Codex
 sandbox. See the [routing table and migration rules](migration-20261106.md#new-production-requests).
 Use `simple` + Codex Terra/high, `complex` + Codex Sol/max (including computer use), or
-`highest_quality` + Claude Opus 5.5/max. Unknown/deprecated models and mismatches are usage errors.
+`highest_quality` + either Claude Opus 5.5/max or Claude Fable 5.2/xhigh (Extra High).
+Unknown/deprecated models and mismatches are usage errors.
 Only `engine=fixture` has a test-only exemption. No defaults or global settings are changed.
 
 `effective_settings` appears in submit/status/events/brief/notification records. It records
@@ -663,7 +804,8 @@ CLI_RELAY mac-a 12345678/90abcdef article：部分完成 | process=succeeded bus
 The conclusion uses outcome and business status; an unreported status makes no completion claim.
 JSON has `events[]` with full `event_id`, `task_id`, `attempt_no`, `ledger_id`, `source_id`,
 `task_last8`, `event_last8`, `key`, `origin`, `outcome`, `business_status`,
-`business_status_source`, `warnings`, `result_file` (object above or null) and `message`.
+`business_status_source`, `warnings`, `result_file` (object above or null) and `message`;
+billing-blocked events also carry `preflight` (names and the copyable fix, never values).
 `ack_command` is shell-quoted for the selected home and all listed event identities. No
 text-mode ids need to be copied by hand: each `CLI_RELAY` line is preceded by its full metadata
 as `field=value` pairs, and the final line is the batch command. Send only the `CLI_RELAY` lines.
@@ -762,6 +904,8 @@ three lines are the authoritative source for `completion_report` in terminal evi
 briefs, and notifications; the result file alone does not satisfy this check. A missing, empty,
 invalid, or duplicated line produces `{"state":"没说做完没"}`. Historical events without the
 field read as missing; no history is rewritten. Self-reports are not independently verified.
+Command-adapter notification summaries include all three reported values outside excerpt
+truncation, so the remaining work and owner are also visible without reading the JSON payload.
 
 This report does not change the process outcome, business status, dependency rules, or cause a
 retry. In particular, `succeeded` and business `ok` are not proof that the task is done; consumers

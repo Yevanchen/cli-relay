@@ -8,6 +8,7 @@ workspace network access and extra Claude tools require an explicit task opt-in;
 
 from __future__ import annotations
 
+import fcntl
 import fnmatch
 import glob
 import json
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from . import business_status, git_state, policy
+from . import business_status, git_state, policy, procs
 from .errors import UsageError
 
 ENGINES = ("claude", "codex", "fixture")
@@ -85,8 +86,14 @@ CLAUDE_EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
 # wildcard or another tool. Both need permission, so dontAsk denies them unless a rule allows them.
 CLAUDE_ALLOWABLE_TOOLS = ("WebFetch", "WebSearch")
 CLAUDE_ALLOWED_TOOLS_FLAGS = ("--allowedTools", "--allowed-tools")
-# Observed with Claude Code 2.1.312: prefix rules for these commands with flags are denied.
-CLAUDE_BASH_FLAG_RULE_COMMANDS = {"cp"}
+# Observed with Claude Code 2.1.312 under dontAsk, user settings excluded (issue #22): these commands,
+# called by their bare name with any flag, are denied under every scoped rule (Bash(cp -n a b:*), the
+# exact Bash(cp -n a b), Bash(cp:*), Bash(cp *)); only an unrestricted Bash rule allows them.
+CLAUDE_BASH_FLAG_RULE_COMMANDS = {"cp", "mv"}
+# Observed likewise: these commands, called by their bare name, are denied whenever a path argument
+# resolves outside the working directory, even under a matching rule (interpreters such as python3
+# are not checked this way).
+CLAUDE_BASH_PATH_CHECKED_COMMANDS = {"cat", "cp", "ls", "mkdir", "mv", "rm", "touch"}
 
 # Configuration layers outside the user's own files that the CLIs also read.
 CODEX_SYSTEM_CONFIG = (Path("/etc/codex/config.toml"),)
@@ -630,6 +637,162 @@ def codex_rollout(env: Dict[str, str], thread_id: str) -> Optional[Path]:
     return Path(sorted(matches)[0]) if matches else None
 
 
+# ------------------------------------------------------------------- existing sessions (issue #18)
+# `submit --session ID` delivers the prompt as the next turn of an existing native session. The id is
+# an exact UUID (a Claude session id or a Codex thread id), never a name, `--last` or a pattern.
+SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+SESSION_PREFLIGHT_REASONS = ("session_not_found", "session_busy", "provider_not_subscription", "provider_unverified")
+# Codex refuses a second writer on a thread with this message on stderr (observed with codex-cli 0.162.1).
+CODEX_ACTIVE_WRITER = b"already has an active writer"
+
+
+def validate_session_id(value: Any) -> str:
+    sid = value.strip().lower() if isinstance(value, str) else ""
+    if not SESSION_ID_RE.fullmatch(sid):
+        raise UsageError("--session must be an exact native session UUID (a Claude session id or a Codex thread "
+                         "id); names, --last and patterns are not accepted")
+    return sid
+
+
+def session_record(engine: str, env: Dict[str, str], session_id: str, *, fixture_state_dir: str) -> Optional[Path]:
+    """The CLI's own record of the session on this machine, or None."""
+    if engine == "claude":
+        pattern = str(claude_config_dir(env) / "projects" / "*" / f"{glob.escape(session_id)}.jsonl")
+        matches = sorted(glob.glob(pattern))
+        return Path(matches[0]) if matches else None
+    if engine == "codex":
+        return codex_rollout(env, session_id)
+    path = Path(fixture_state_dir) / f"{session_id}.json"
+    return path if path.is_file() else None
+
+
+def session_cwd(engine: str, record: Path) -> Optional[str]:
+    """The directory the session recorded when it was created, if its first lines name one."""
+    for n, ev in enumerate(iter_json_lines(record)):
+        if n >= 50:
+            return None
+        payload = ev.get("payload") if engine == "codex" and ev.get("type") == "session_meta" else None
+        cwd = payload.get("cwd") if isinstance(payload, dict) else ev.get("cwd") if engine == "claude" else None
+        if isinstance(cwd, str) and cwd:
+            return cwd
+    return None
+
+
+def _claude_registration_live(pid: Any, started_ms: Any) -> bool:
+    """A registry entry counts while its pid may be the registering process: gone, zombie or a pid
+    reused by a process that started after the session (a crash leaves the file behind) do not."""
+    if type(pid) is not int or not 0 < pid < 2 ** 31:
+        return False
+    if procs.same_process_alive(pid, None) is False:
+        return False
+    started = procs.start_epoch(pid)
+    return not (started is not None and isinstance(started_ms, (int, float)) and not isinstance(started_ms, bool)
+                and started > started_ms / 1000 + 60)
+
+
+def codex_widens(owner: Dict[str, Any], send: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Codex only: would a sent turn fall outside what the thread's owner accepts? An ordinary task's
+    resumes check every turn of its thread (``permission_violation``), so a wider turn sent into it
+    would block them for good."""
+    allowed = {"read-only"} if requested_sandbox("codex", owner) in (None, "read-only") \
+        else {"read-only", CODEX_WORKSPACE_WRITE}
+    if full_access_enabled("codex", owner):
+        allowed.add(CODEX_FULL_ACCESS)
+    owner_network = network_enabled("codex", owner) or full_access_enabled("codex", owner)
+    sandbox = requested_sandbox("codex", send)
+    network = network_enabled("codex", send) or full_access_enabled("codex", send)
+    if sandbox in allowed and (owner_network or not network):
+        return None
+    return {"owner_sandbox": requested_sandbox("codex", owner), "owner_network_access": owner_network,
+            "sandbox": sandbox, "network_access": network}
+
+
+def session_holder(engine: str, env: Dict[str, str], session_id: str) -> Optional[Dict[str, Any]]:
+    """A live process outside this relay that owns the session, from the CLI's own records.
+
+    Claude Code (observed 2.1.312) registers every running session, TUI and `-p` alike, in
+    ``<config>/sessions/<pid>.json`` and takes no lock for ``--resume``: an open session neither sees
+    a turn appended by another process nor keeps it, because its next turn forks the transcript.
+    Codex (observed 0.162.1) holds ``thread-writer-locks/<id>.lock`` while a turn writes the thread
+    and refuses a second writer. A lock that cannot be checked counts as held."""
+    if engine == "claude":
+        for path in sorted(glob.glob(str(claude_config_dir(env) / "sessions" / "*.json"))):
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict) or data.get("sessionId") != session_id:
+                continue
+            if _claude_registration_live(data.get("pid"), data.get("startedAt")):
+                return {"holder": "claude_process", "pid": data["pid"], "record": path,
+                        **{k: data[k] for k in ("kind", "entrypoint", "status") if isinstance(data.get(k), str)}}
+        return None
+    if engine == "codex":
+        lock = codex_home(env) / "thread-writer-locks" / f"{session_id}.lock"
+        try:
+            fd = os.open(lock, os.O_RDONLY | os.O_NONBLOCK)  # never waits, not even on a non-file
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return {"holder": "codex_thread_writer_lock", "record": str(lock), "lock": "unverifiable"}
+        try:
+            # Non-blocking shared probe, released at once: it conflicts only with a writer's exclusive
+            # lock, works on a read-only descriptor, and never waits for or keeps another lock.
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None
+        except BlockingIOError:
+            return {"holder": "codex_thread_writer_lock", "record": str(lock), "lock": "held"}
+        except OSError:
+            return {"holder": "codex_thread_writer_lock", "record": str(lock), "lock": "unverifiable"}
+        finally:
+            os.close(fd)
+    return None
+
+
+def session_preflight(engine: str, env: Dict[str, str], session_id: str, *, fixture_state_dir: str,
+                      check_holder: bool = True) -> Optional[Dict[str, Any]]:
+    """Before a turn is delivered to an existing session: the session exists on this machine, no live
+    process outside the relay owns it, and a Codex thread was created by the built-in openai provider
+    (its rollout records that once, so a foreign thread is checked before any turn is sent)."""
+    if session_record(engine, env, session_id, fixture_state_dir=fixture_state_dir) is None:
+        where = {"claude": str(claude_config_dir(env) / "projects" / "*" / f"{session_id}.jsonl"),
+                 "codex": str(codex_home(env) / "sessions" / "*" / "*" / "*" / f"rollout-*{session_id}.jsonl"),
+                 "fixture": str(Path(fixture_state_dir) / f"{session_id}.json")}[engine]
+        return {"reason": "session_not_found", "session_id": session_id, "searched": where}
+    holder = session_holder(engine, env, session_id) if check_holder else None
+    if holder is not None:
+        return {"reason": "session_busy", "session_id": session_id, **holder}
+    provider = provider_violation(engine, env, session_id)
+    if provider is not None:
+        return {**provider, "session_id": session_id}
+    return None
+
+
+def session_problem_message(problem: Dict[str, Any]) -> str:
+    sid, reason = problem.get("session_id"), problem.get("reason")
+    if reason == "session_not_found":
+        return f"session {sid} does not exist on this machine (searched {problem.get('searched')})"
+    if reason == "session_busy" and problem.get("holder") == "claude_process":
+        return (f"session {sid} is open in a live Claude Code process (pid {problem.get('pid')}); a turn appended "
+                "now would not reach it and its next turn would fork the transcript; close that session first")
+    if reason == "session_busy" and problem.get("holder") == "codex_thread_writer_lock":
+        return (f"Codex thread {sid} has an active writer ({problem.get('lock')} thread-writer lock); "
+                "wait until that session is idle")
+    if reason == "session_busy":
+        return (f"session {sid} is in use by relay task(s) {', '.join(problem.get('holder_task_ids', []))}; wait "
+                "for them to end, or queue this message behind the one holding it with --after <task id> "
+                "--after-require any_terminal")
+    if reason == "session_permissions_wider":
+        return (f"Codex thread {sid} belongs to relay task {problem.get('owner_task_id')} (sandbox="
+                f"{problem.get('owner_sandbox')}, network_access={str(problem.get('owner_network_access')).lower()}); "
+                f"a turn with sandbox={problem.get('sandbox')}, network_access="
+                f"{str(problem.get('network_access')).lower()} would make that task's later resumes fail their "
+                "permission check. Send with the same or narrower permissions, or submit a new task")
+    return (f"Codex thread {sid} is not shown to have been created by the built-in openai provider "
+            f"({reason}); refusing to continue it")
+
+
 def codex_permission_checkpoint(env: Dict[str, str], session_id: str) -> Dict[str, Any]:
     """Capture the existing thread boundary before a resumed CLI can append its turn."""
     path = codex_rollout(env, session_id)
@@ -719,18 +882,40 @@ def requested_tools(engine: str, payload: Dict[str, Any]) -> List[str]:
     return sorted(rules)
 
 
+def _outside(arg: str, cwd: str) -> bool:
+    """Whether a path argument resolves (symlinks and .. included) outside the task directory."""
+    root = os.path.realpath(cwd)
+    path = os.path.realpath(arg if os.path.isabs(arg) else os.path.join(root, arg))
+    return path != root and not path.startswith(root.rstrip(os.sep) + os.sep)
+
+
 def bash_rule_warnings(engine: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Submit diagnostics only; never alter a request or its permission rules."""
-    warnings = []
-    if engine == "claude":
-        for command in (payload.get("options") or {}).get("allowed_bash_commands", []):
-            words = command.split()
-            if words[0] in CLAUDE_BASH_FLAG_RULE_COMMANDS and any(word.startswith("-") for word in words[1:]):
-                warnings.append({"code": "bash_rule_not_honoured", "command": command,
-                                 "hint": "Claude Code (observed 2.1.312) denies cp with flags even when its prefix "
-                                         "rule is listed; use cp <src> <dst> without flags (drop -n only when "
-                                         "overwriting the destination is acceptable), or check existence "
-                                         "with test -e first."})
+    warnings: List[Dict[str, Any]] = []
+    if engine != "claude":
+        return warnings
+    for command in (payload.get("options") or {}).get("allowed_bash_commands", []):
+        name, *args = command.split()
+        if name in CLAUDE_BASH_FLAG_RULE_COMMANDS and any(word.startswith("-") for word in args):
+            warnings.append({"code": "bash_rule_not_honoured", "command": command,
+                             "hint": f"Claude Code (observed 2.1.312) denies {name} with flags even when a matching "
+                                     f"prefix rule is listed, also under Bash({name}:*), Bash({name} *) or an exact "
+                                     "rule; only an unrestricted Bash rule, which cli-relay does not offer, allows "
+                                     f"it. Use {name} <src> <dst> without flags (drop -n only when overwriting the "
+                                     "destination is acceptable), or check existence with test -e first: run "
+                                     f"`test -e <dst> || {name} <src> <dst>` and allow both the `test -e <dst>` and "
+                                     f"`{name} <src> <dst>` prefixes."})
+        cwd = payload.get("cwd")
+        if not cwd or name not in CLAUDE_BASH_PATH_CHECKED_COMMANDS:
+            continue
+        outside = sorted({arg for arg in args if not arg.startswith("-") and _outside(arg, cwd)})
+        if outside:
+            checked = ", ".join(sorted(CLAUDE_BASH_PATH_CHECKED_COMMANDS))
+            warnings.append({"code": "bash_rule_path_outside_cwd", "command": command, "paths": outside,
+                             "hint": f"Claude Code (observed 2.1.312) denies {checked} when a path argument is "
+                                     "outside the task directory, even when the prefix rule matches; use paths "
+                                     "inside --cwd, or submit with a --cwd that contains every path the command "
+                                     "needs."})
     return warnings
 
 
@@ -770,17 +955,21 @@ def request_details(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             **({"settings_warnings": settings_warnings} if settings_warnings else {}),
             "completion_marker_required": completion_marker_required(payload),
             **billing_policy(engine, options),
-            **({"unset_env": options["unset_env"]} if "unset_env" in options else {})}
+            **({"unset_env": options["unset_env"]} if "unset_env" in options else {}),
+            **({"target_session_id": payload["target_session_id"]} if "target_session_id" in payload else {})}
 
 
 def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[str],
                          sandbox: Optional[str], *, permission_checkpoint: Optional[Dict[str, Any]] = None,
                          resume_session_id: Optional[str] = None,
-                         allow_full_access: bool = False, allow_network: bool = False) -> Optional[Dict[str, Any]]:
+                         allow_full_access: bool = False, allow_network: bool = False,
+                         own_turns_only: bool = False) -> Optional[Dict[str, Any]]:
     """After a run: Codex records each turn's effective sandbox and any active named permission
     profile in the thread's rollout (``turn_context``). Every turn must have run in the requested
     sandbox or a narrower one, without network access unless the task opted in, and with no named
-    profile; a thread without that record is not shown to have kept the requested permissions."""
+    profile; a thread without that record is not shown to have kept the requested permissions.
+    ``own_turns_only`` (a message sent to an existing thread) checks only the turns after the
+    attempt's checkpoint: earlier turns were not run by this task and are not its to certify."""
     if engine != "codex":
         return None
     if sandbox == CODEX_FULL_ACCESS and allow_full_access is not True:
@@ -809,7 +998,8 @@ def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[
         if not any(ev.get("type") == "turn_context" for ev in iter_json_lines(path, offset=checkpoint["offset"])):
             return {"reason": "permissions_unverified", "missing": "current_turn_context"}
     turns = []
-    for ev in iter_json_lines(path):
+    for ev in iter_json_lines(path, offset=permission_checkpoint["offset"] if resume_session_id and own_turns_only
+                              else 0):
         if ev.get("type") == "turn_context":
             payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
             policy = payload.get("sandbox_policy")
@@ -1005,6 +1195,19 @@ def codex_git_repo_check_warning(stderr_path: Path) -> Optional[Dict[str, str]]:
                     "skip_git_repo_check=true to pass --skip-git-repo-check."}
 
 
+def codex_session_busy_warning(stderr_path: Path) -> Optional[Dict[str, str]]:
+    """Codex refused a resume because another process writes the thread. Only a fixed hint is exported."""
+    try:
+        with open(stderr_path, "rb") as f:
+            if not any(CODEX_ACTIVE_WRITER in line for line in f):
+                return None
+    except OSError:
+        return None
+    return {"code": "session_busy",
+            "hint": "Codex refused to resume the thread because another process is writing to it (thread-writer "
+                    "lock). Wait until that session is idle, then resume this task or submit a new key."}
+
+
 def iter_json_lines(path: Path, *, offset: int = 0) -> Iterable[Dict[str, Any]]:
     try:
         f = open(path, "rb")
@@ -1187,7 +1390,7 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
            permission_checkpoint: Optional[Dict[str, Any]] = None,
            resume_session_id: Optional[str] = None,
            allow_full_access: bool = False, allow_network: bool = False,
-           require_completion_marker: bool = False) -> Tuple[str, Dict[str, Any]]:
+           require_completion_marker: bool = False, own_turns_only: bool = False) -> Tuple[str, Dict[str, Any]]:
     """Name an attempt's outcome from what the run left behind; returns (outcome, evidence).
 
     The keeper and reconciliation both call this, so the outcome does not depend on which of
@@ -1212,7 +1415,8 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
         return "blocked", {"provider_check": provider}
     permissions = permission_violation(engine, env, session_id, sandbox,
                                        permission_checkpoint=permission_checkpoint, resume_session_id=resume_session_id,
-                                       allow_full_access=allow_full_access, allow_network=allow_network)
+                                       allow_full_access=allow_full_access, allow_network=allow_network,
+                                       own_turns_only=own_turns_only)
     if permissions is not None:
         return "blocked", {"permission_check": permissions}
     native = parsed.get("native")

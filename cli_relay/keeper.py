@@ -172,6 +172,20 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
             log(pf.detail["message"])
         close("blocked", {"preflight": {"reason": pf.reason, **pf.detail}})
         return 0
+    if "target_session_id" in payload and att["resume_session_id"]:
+        # A message for an existing session (issue #18): checked again right before the turn is sent.
+        try:
+            problem = engines.session_preflight(engine, env, att["resume_session_id"],
+                                                fixture_state_dir=str(Path(home) / "fixture-sessions"))
+        except Exception as exc:  # like preflight: end the attempt, never crash-loop the keeper
+            log(f"session preflight failed: {exc!r}")
+            close("blocked", {"preflight": {"reason": "preflight_error", "error": type(exc).__name__}})
+            return 0
+        if problem is not None:
+            log(f"session preflight blocked: {problem['reason']}")
+            close("blocked", {"preflight": problem, "reason_code": problem["reason"],
+                              "summary": engines.session_problem_message(problem)})
+            return 0
     permission_checkpoint = None
     if engine == "codex":  # reconciliation must look for the thread record where this run writes it
         ledger.add_evidence(attempt_id, {"codex_home": str(engines.codex_home(env))})
@@ -332,7 +346,8 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
                                       allow_network=engines.network_enabled(engine, payload),
                                       require_completion_marker=engines.completion_marker_required(payload),
                                       permission_checkpoint=permission_checkpoint,
-                                      resume_session_id=att["resume_session_id"])
+                                      resume_session_id=att["resume_session_id"],
+                                      own_turns_only="target_session_id" in payload)
     cleanup_stopped = True
     if signalled_at is not None or outcome in ("cancelled", "blocked"):
         cleanup_stopped = stop_group()

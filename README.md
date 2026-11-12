@@ -20,6 +20,7 @@ It is not a model proxy, an agent framework, a networked relay, an orchestrator,
 | **Wake on finish** | Optional notifier (script or webhook) can wake a consumer such as a Grok Bot routine when a task ends. A wake is not an ACK. |
 | **Results to the submitting bot** | A verified per-bot route wakes that bot directly. `brief` prints complete identities, Chinese message lines and one batch ACK command; `acks.message_id` records the visible delivery. |
 | **Dependencies and queues** | `submit --after <task id or key>` requires business `ok` by default; `--queue NAME` runs tasks one at a time in FIFO order within a home and scope. [Waiting, cancellation and release rules](docs/usage.md#dependencies-and-queues). |
+| **Messages to existing sessions** | `submit --session <id>` runs the prompt as the next turn of an existing Claude Code session or Codex thread, through the same ledger, events and ACK. It is refused while the session is missing, used by another task or a live CLI process, or not the subscription's; one relay attempt per session at a time. [Engines, session ids and concurrency](docs/usage.md#sending-a-message-to-an-existing-session). |
 
 ## Quick start
 
@@ -108,9 +109,12 @@ launch, including resume. Command prefixes become `Bash(python3:*)` and
 quotes within the value, substitutions and wildcard/rule syntax are rejected. Shell quoting
 around the CLI argument, as above, is fine.
 
-Claude Code (observed 2.1.312) denies `cp` with flags even when its Bash prefix rule is listed.
-Submit receipts warn with `bash_rule_not_honoured`; a matching structured Bash denial adds
-`allowed_rule_denied` to status, terminal events and notifications. See the
+Claude Code (observed 2.1.312) denies `cp` and `mv` with flags under every scoped Bash rule, and
+denies file commands such as `cp`, `ls` and `cat` whose path is outside the task directory, even
+when the rule matches. An isolated reproduction showed that the relay's rules are correct and that
+`.env` files are not special. Submit receipts warn with `bash_rule_not_honoured` and
+`bash_rule_path_outside_cwd`; a matching structured Bash denial adds `allowed_rule_denied` to
+status, terminal events and notifications. See the
 [observed commands and workarounds](docs/usage.md#allowed_bash_commands).
 
 These are Claude permission rules, not an OS sandbox. A permitted interpreter or installer

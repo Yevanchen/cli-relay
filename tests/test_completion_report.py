@@ -3,7 +3,7 @@ import json
 import unittest
 
 from cli_relay import business_status, notify
-from helpers import RelayTestCase
+from helpers import RelayTestCase, db_rows
 from test_terminal_observations import notification
 
 
@@ -48,5 +48,25 @@ class CompletionRoundTrip(RelayTestCase):
         expected = {"state": "已报告", "done": "部分", "remaining": "审核", "next_owner": "Evan"}
         self.assertEqual(done["events"][0]["body"]["completion_report"], expected)
         self.assertEqual(notification(done)["cli_relay"]["events"][0]["completion_report"], expected)
+        summary = notification(done)["summary"]
+        for field in ("做完没=部分", "还差=审核", "下一步谁动=Evan"):
+            self.assertIn(field, summary)
         brief = self.cli("brief", "--consumer", "reader")["events"][0]
         self.assertIn("下一步谁动：Evan", brief["message"])
+
+    def test_resume_and_fresh_get_one_requirement_and_keep_the_original_payload(self):
+        sub = self.submit("prompts", prompt="original request", duration=0)
+        original = self.cli("wait", sub["task_id"], "--timeout", "30")
+        payload = json.loads(db_rows(self.home, "SELECT payload_json FROM tasks WHERE task_id=?",
+                                     (sub["task_id"],))[0][0])
+        self.assertEqual(payload["prompt"], "original request")
+        self.cli("resume", sub["task_id"], "--prompt", "follow up")
+        self.cli("wait", sub["task_id"], "--timeout", "30")
+        self.cli("resume", sub["task_id"], "--fresh", "--confirm-rerun")
+        done = self.cli("wait", sub["task_id"], "--timeout", "30")
+        self.assertEqual(json.loads(db_rows(self.home, "SELECT payload_json FROM tasks WHERE task_id=?",
+                                           (sub["task_id"],))[0][0]), payload)
+        self.assertEqual(done["task"]["payload_sha256"], original["task"]["payload_sha256"])
+        for attempt_no, user_prompt in enumerate(("original request", "follow up", "original request"), 1):
+            self.assertEqual(self.attempt_row(sub["task_id"], attempt_no)["prompt"],
+                             user_prompt + "\n\n" + business_status.COMPLETION_PROMPT)

@@ -14,6 +14,10 @@ and effort. Codex also needs an explicit sandbox. The relay validates; it does n
 | simple | codex | gpt-6.1-terra | high |
 | complex | codex | gpt-6.1-sol | max |
 | highest_quality | claude | claude-opus-5-5 | max |
+| highest_quality | claude | claude-fable-5-2 | xhigh |
+
+The `highest_quality` class accepts either listed combination; Opus 5.5/max remains valid.
+Simple and complex Codex tiers are unchanged.
 
 Resources are `standard` or `computer_use`. Computer use requires the complex Codex tier and
 has no extra sandbox grant. Choose the minimum task permissions; file work normally uses

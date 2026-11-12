@@ -148,6 +148,14 @@ Signals follow the same rule.
 Concurrency rules:
 - **Concurrent submits** of one key converge on one task and one execution (`BEGIN IMMEDIATE` plus a unique `(scope, key)` index).
 - **Concurrent resumes** create exactly one new attempt, via a CAS on `current_attempt`.
+- **One attempt per native session** in a home (issue #18). An attempt that resumes a session is
+  admitted only while no other task's current attempt holds that session (claimed, running, or
+  `unknown` without proof that its processes stopped) and no earlier attempt waits for it. The
+  check runs in the same `BEGIN IMMEDIATE` transaction as the claim or admission, so two keepers
+  cannot both win. Submit and resume refuse such a session up front (`session_busy`); a send
+  queued with `--after` waits. Processes outside the relay are recognised only through the CLIs'
+  own records (Claude's session registry, Codex's thread-writer lock), checked again right before
+  the turn is sent. See [usage](usage.md#sending-a-message-to-an-existing-session).
 - **A stale keeper** can only move its own attempt's state, and only from the expected state.
   A superseded attempt cannot change the task's state.
   - The state-guarded writes are claim, spawn record, pid record, finish and unknown.

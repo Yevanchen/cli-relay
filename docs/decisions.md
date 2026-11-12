@@ -621,3 +621,65 @@ start from explicitly synthetic proof fixtures. The manual acceptance script's l
 implements the same protocol. No real route verification was performed for this change; new
 webhooks are not approved. The 25-hour soak
 remains outside this issue and no new long-run reliability claim is made.
+
+## D17. Issue #18: a message as the next turn of an existing session
+
+**Problem.** Dispatchers need to follow up in a session that already exists (a finished relay
+task, or a session a person opened) without a new task that loses the context. Exact resume
+existed only for a task's own session.
+
+**Decision: a submit mode, not a new command or channel.** `submit --session <uuid>` creates an
+ordinary task whose first attempt resumes that session (`reason: "send"`). Keys, payload hashes,
+options, tiers, routes, origin, `--after`/`--queue`, events, notifications, `brief` and ACK are
+unchanged. The argv is the existing exact-resume argv (D6), built from the task's own options;
+`assert_safe` and every preflight and post-run check still apply. `target_session_id` is part of
+the payload and appears in receipts, task records, event bodies and notification entries. No
+schema change: the attempt already has `resume_session_id`.
+
+**Evidence (2026-11-08, real CLIs on the MBP, small models, no relay involved).**
+
+- Claude Code 2.1.312: a `claude -p --input-format stream-json` process kept session S open. Another
+  process ran `claude -p --resume S` meanwhile: it was accepted, with the same session id. The open
+  process's next answer did not include the appended turn; the transcript then had one fork, and a
+  later `--resume S` continued the open process's branch, so the appended turn was lost. `--resume`
+  from another directory found the session and appended to it. Running sessions, `-p` (`sdk-cli`)
+  and TUI (`cli`) alike, are registered in `<config>/sessions/<pid>.json` with `sessionId` and `pid`.
+- codex-cli 0.162.1: while a resumed turn ran, `thread-writer-locks/<id>.lock` was held (flock and
+  lockf both blocked) and removed afterwards. A concurrent `codex exec resume` failed in 1.3 s with
+  `thread … already has an active writer (code -32600)`, exit 1. Resume from another directory
+  worked; the rollout's `session_meta` records `id`, `cwd` and `model_provider`.
+
+**Locks.** Inside the relay, one attempt per (engine, session) per home: a FIFO admission gate like
+`--queue`, across scopes, holding while another task's current attempt is claimed, running or
+`unknown` without proof that its processes stopped. Submit and resume refuse with `session_busy`
+instead of queueing silently, checked again inside their write transaction; `--after <holder>` is
+the explicit way to queue. Outside the relay, the CLIs' own records: a live pid in Claude's session
+registry (gone, zombie or reused pids ignored), and a non-blocking shared probe of the Codex writer
+lock (released at once, so it can only collide with a writer that is starting at that instant,
+which the relay's own resume would collide with anyway; Linux behaviour not verified). A lock that
+cannot be checked counts as held.
+
+**Provider and permissions.** A foreign Codex thread is checked before any turn is sent: its
+rollout must name the built-in `openai` provider. After the run, only the turns after the attempt's
+pre-run checkpoint are checked for sandbox, network and named profiles, because earlier turns were
+not run by the task. Relay resumes of ordinary tasks still check every turn, as before, so a send
+may not widen an ordinary relay task's own thread: submit refuses a sandbox or network wider than
+that task's (`session_permissions_wider`), which would otherwise block its later resumes for good.
+An independent review of the branch found that interaction; the refusal keeps the existing
+fail-closed check unchanged instead of relaxing it.
+
+**Not done.** Live injection into a running turn: both CLIs read the prompt once, so the closest is a
+follow-up queued with `--after <task> --after-require any_terminal`. `--fresh` for a send is refused.
+No `--bg`/app-server path (D6). Sessions on another machine, user or configuration directory are not
+visible to these checks.
+
+**Open questions of the issue.**
+
+1. *Does an open Claude Code / Codex App window see a turn appended from outside?* For Claude Code,
+   an open session process does not (verified with a long-lived `-p` stream-json process, which
+   registers like the TUI), and its next turn forks the transcript; hence the refusal. The Claude
+   Code TUI and the Codex App were not driven: **not verified**. Whether the Codex App holds the
+   writer lock while a thread is open but idle: **not verified**.
+2. *Should the target session be locked?* Yes: Claude Code has no lock of its own for `--resume`,
+   so the relay adds its own gate and refuses sessions registered as open; Codex already refuses a
+   second writer, and the relay refuses earlier with a clear reason.
