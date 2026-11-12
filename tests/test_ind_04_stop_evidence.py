@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from helpers import isolated_env
 
-from cli_relay import keeper, procs, reconcile
+from cli_relay import concurrency, keeper, procs, reconcile
 from cli_relay.ledger import Ledger, init_ledger
 
 
@@ -54,6 +54,10 @@ class KeeperStopEvidence(unittest.TestCase):
 
         with ExitStack() as stack:
             stack.enter_context(patch.object(keeper, "Ledger", return_value=self.ledger))
+            # This test replaces every Popen with a fake CLI child. Keep the unrelated
+            # macOS vm_stat subprocess out of that mock and make capacity deterministic.
+            stack.enter_context(patch.object(concurrency, "read_available_memory",
+                                return_value=concurrency.Memory(8 * 1024**3, "mock")))
             stack.enter_context(patch.dict(os.environ, isolated_env(Path(self.tmp.name),
                                 {"CLI_RELAY_KEEPER_DETACHED": "1"}), clear=True))
             stack.enter_context(patch.object(keeper.signal, "signal"))
