@@ -170,8 +170,11 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         log(f"preflight blocked: {pf.reason}")
         if pf.detail.get("message"):
             log(pf.detail["message"])
-        close("blocked", {"preflight": {"reason": pf.reason, **pf.detail}})
+        close("blocked", {"preflight": {"reason": pf.reason, **pf.detail},
+                          **({"reason_code": pf.reason, "summary": pf.detail["message"]} if engine == "agy" else {})})
         return 0
+    if engine == "agy":
+        ledger.add_evidence(attempt_id, {"agy_preflight": pf.detail})
     if "target_session_id" in payload and att["resume_session_id"]:
         # A message for an existing session (issue #18): checked again right before the turn is sent.
         try:
@@ -334,6 +337,8 @@ def run(home: Path, task_id: str, attempt_id: str) -> int:
         exit_info["billing_guard"] = violation  # survives a keeper that dies before the commit below
     last_message = Path(spec.last_message_path) if spec.last_message_path else None
     parsed = engines.parse_output(engine, stdout_path, last_message,
+                                 stderr_path=stderr_path, exit_known=True,
+                                 exit_code=exit_info["exit_code"], exit_signal=exit_info["signal"],
                                  allowed_bash_commands=(payload.get("options") or {}).get("allowed_bash_commands", []))
     if parsed["session_id"] and parsed["session_id"] != recorded_sid:
         ledger.set_native_session(attempt_id, parsed["session_id"])

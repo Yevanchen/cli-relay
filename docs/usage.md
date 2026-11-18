@@ -551,6 +551,7 @@ notification event entries carry the same fields. No ledger migration is needed.
 | `claude` | `claude -p --output-format stream-json --verbose --session-id <uuid> --permission-mode dontAsk --permission-prompts none` (prompt on stdin) | `--resume <exact uuid>` (same permission mode) |
 | `codex` | `codex exec --json -C <cwd> -o <file> --sandbox <s> -`, where new production requests must explicitly select `<s>` (legacy requests default to `read-only`); `workspace-write` or explicitly opted-in `danger-full-access` may be requested. `workspace-write` also gets `-c sandbox_workspace_write.network_access=<n>`: `false` unless the task opts in with `allow_network=true` | `codex exec --sandbox <s> resume -c sandbox_mode="<s>" [-c sandbox_workspace_write.network_access=<n>] --json -o <file> <exact id> -` (same `<s>` and `<n>`) |
 | `fixture` | a deterministic local stand-in used by tests and the soak run | same, against its own state |
+| `agy` | gated `agy --print --model <full Carbon ID>`, prompt on stdin; standard text tasks only | no native sessions; only explicit fresh rerun |
 
 Never used: `--dangerously-*`, `bypassPermissions`, `--approve-for-me`, `--yolo`, `--full-auto`,
 `--continue`, `--last`, `--bare`.
@@ -836,6 +837,90 @@ Only `engine=fixture` has a test-only exemption. No defaults or global settings 
 `effective_settings` appears in submit/status/events/brief/notification records. It records
 adapter invocation settings with `verification=invocation_only`, not a provider-side observation.
 Legacy duplicates and resumes retain their payload and hash; new requests use the new contract.
+
+### agy Carbon subscription text tasks
+
+Carbon is a separate, explicit request. `simple` remains Codex `gpt-6.1-terra/high`, `complex`
+remains Codex `gpt-6.1-sol/max`, and `highest_quality` remains Claude `claude-opus-5-5/max` or
+`claude-fable-5-2/xhigh`. Carbon is never a fallback for any of them.
+
+| task class | engine | model | effort | resource class |
+|---|---|---|---|---|
+| carbon | agy | gemini-4-carbon-low | low | standard |
+| carbon | agy | gemini-4-carbon-medium | medium | standard |
+| carbon | agy | gemini-4-carbon-high | high | standard |
+
+All fields are required. High is the highest Carbon tier. Missing suffixes, aliases,
+Orchestrator, `xhigh`/`max`, mismatched effort, other task classes, `computer_use`, sandbox,
+Claude tools, raw argv, `--billing-mode` (including subscription) and test exemptions are usage
+errors (exit 2). `effort` is relay validation/display metadata; only the full model ID selects
+the native tier. No separate effort flag is sent to agy.
+
+Candidate usage, **after native acceptance on the already logged-in machine** (currently MBP):
+
+```sh
+cli-relay submit --key carbon-text-01 --engine agy --task-class carbon \
+  --resource-class standard --cwd /absolute/path/to/task \
+  --option 'model="gemini-4-carbon-high"' --option 'effort="high"' \
+  --option require_completion_marker=true \
+  --prompt '请根据材料写中文分析。只输出文本。完成时最后一行写 CLI-RELAY-STATUS: complete；未完成写 CLI-RELAY-STATUS: incomplete。'
+```
+
+`--prompt-file` stores the full prompt as usual. The candidate stdin adapter consumes that
+attempt's stored prompt once, including relay completion-report instructions. No shell/TTY,
+permission bypass, plugins, configuration-directory override, file-editing support or native
+resume is added. Print mode is not a Codex filesystem sandbox; the absence of plugins says
+nothing about built-in tools.
+
+Executable discovery is `CLI_RELAY_AGY_BIN`, then the current user's `~/.local/bin/agy`, then
+PATH. The explicit override must be an absolute executable file; a bad or empty override
+fails without fallback. Build rechecks it. No alias or login shell is used.
+
+On Mini without agy, `doctor --engine agy --cwd DIR` fails (exit 6) with `cli_not_found` and a
+fixed message directing the user to the installed, logged-in MBP. Submit still returns
+`accepted` (exit 0, an accounting receipt); the keeper closes it as `blocked`, with the reason
+in status/wait/events. Repeating the same key returns the same task without new probes or calls.
+The relay never installs, copies binaries/accounts, logs in, invokes magpie, switches providers
+or sends work to another machine.
+
+**Native support is deliberately gated in this candidate.** 1.5.11 is the acceptance target;
+stdin, unauthenticated no-login behavior, tool authorization, native error/output formats and
+absence of implicit API/proxy fallback have not been verified. `AGY_CONTRACT` in source is
+therefore `None`; any found binary returns `agy_capability_unverified` before executing even a
+version/models probe. There is no environment/config flag to bypass this. A future reviewed
+compatibility change must pin native parsers and safe probe arguments to independent evidence;
+the synthetic test contract is not native evidence. If subscription isolation cannot be proven,
+the compatibility contract must keep `agy_subscription_unverified`.
+
+The agy branch never calls Claude/Codex config, login or trace checks and never reads `~/.codex`.
+The MBP's custom Codex/magpie endpoint is unrelated and stays as configured. Known agy API/Vertex
+route variables (`GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`,
+`GOOGLE_GENAI_USE_VERTEXAI`) are checked for presence, even empty; only their names are reported
+as `agy_non_subscription_route`. No value or referenced credential file is read or cleared.
+This initial name list alone does not prove absence of other native routes.
+
+Once a native contract is verified, probes are limited to 20 seconds and 64 KiB combined
+output per command. Only version, matching Carbon IDs, return codes and fixed reasons are
+exported. Confirmed native stderr errors can yield `agy_auth_required`,
+`agy_subscription_unavailable`, `agy_quota_exhausted` or `agy_non_subscription_route`; model
+absence gives `agy_model_unavailable`. Unknown output/network failures give
+`agy_preflight_unverified`, timeouts `agy_probe_timeout`. None triggers login or retry.
+Model directory visibility is not proof of inference, quota or Google's actual billing.
+
+Print stdout is UTF-8 text (the existing `stdout.jsonl` filename is retained). Normalized results
+carry `source=agy_print`, never a provider-native terminal event or session ID. Only a known,
+valid zero exit without signal and a nonempty validated answer can succeed. Empty output gives
+`agy_empty_output`, unknown output gives `agy_output_unverified`, and other native failures
+give `agy_cli_failed` unless the verified stderr contract supplies a fixed category. stderr is
+never an answer. Model-authored JSON and auth/quota prose never change metadata or routing.
+Completion markers and business/artifact checks still apply and cannot promote a failure.
+
+If the keeper disappears, a valid `exit.json` is parsed identically; text without exit evidence
+stays observed while processes may live, then `unknown` without rerun. `submit --session` is
+refused as `agy_session_unsupported` (exit 6), ordinary resume gives `no_native_session`.
+Only `resume --fresh --confirm-rerun`, after proof that the previous process stopped, explicitly
+spends quota again. Shared capacity, scopes, queues and dependencies use the existing ledger.
+See [the pending native acceptance checklist](acceptance.md#2026-11-19-agy-carbon-candidate).
 
 ### Business status
 

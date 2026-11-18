@@ -68,6 +68,14 @@ the 30-minute ACK timeout, or its notification fails; it keeps the task's origin
 | `claude` | Claude Code (`dontAsk`; tools follow your existing Claude settings) |
 | `codex` | Codex (explicit sandbox required for new production work) |
 | `fixture` | Local stand-in for tests |
+| `agy` | Explicit Carbon subscription text tasks; native compatibility acceptance is still pending |
+
+`agy` requires the separate `--task-class carbon`, `--resource-class standard`, and an exact
+`gemini-4-carbon-low|medium|high` model with matching effort. The original three tiers keep
+their existing mappings, including Fable 5.2/**xhigh**. No automatic Carbon routing.
+Mini without agy fails `cli_not_found`; an installed but unverified CLI fails
+`agy_capability_unverified` before any probe or inference. No installation, login, API-key
+fallback or remote execution is attempted. See [Carbon usage and acceptance gates](docs/usage.md#agy-carbon-subscription-text-tasks).
 
 New production work requires explicit task/resource class and tier-matched model/effort.
 All scopes in one relay home share a configurable, memory-aware budget: by default at most

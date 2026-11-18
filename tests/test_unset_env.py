@@ -35,9 +35,9 @@ class UnsetEnvOptionsAndArgv(unittest.TestCase):
                                       "attempt_id": "a-test"}, run_dir=self.work,
                              fixture_state_dir=str(self.work / "sessions"), env=self.env)
 
-    def test_all_billing_names_are_supported_sorted_and_deduplicated_for_every_engine(self):
+    def test_all_billing_names_are_supported_sorted_and_deduplicated_for_cleanup_engines(self):
         values = list(reversed(NAMES)) + NAMES[:2]
-        for engine in engines.ENGINES:
+        for engine in ('claude', 'codex', 'fixture'):  # agy rejects route overrides, including cleanup
             with self.subTest(engine=engine):
                 self.assertEqual(engines.validate_options(engine, {"unset_env": values}), {"unset_env": NAMES})
                 self.assertEqual(engines.validate_options(engine, {}), {})
@@ -58,7 +58,7 @@ class UnsetEnvOptionsAndArgv(unittest.TestCase):
 
     def test_first_and_resumed_builds_keep_explicit_cleanup_and_codex_subscription_default(self):
         original = dict(self.env)
-        for engine in engines.ENGINES:
+        for engine in ('claude', 'codex', 'fixture'):  # agy has neither native resume nor unset_env
             for resume in (None, "old-session"):
                 with self.subTest(engine=engine, resume=resume):
                     default = self.build(engine, {}, resume)
