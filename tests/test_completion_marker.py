@@ -69,7 +69,8 @@ class OutcomeGate(unittest.TestCase):
                                      ("needs_input", {"completion_check": {"marker": None,
                                                                            "downgraded_from": "succeeded"}}))
                 self.assertEqual(self.decide({"ok": True, "result": DONE}, engine=engine, exit_known=False)[0],
-                                 "succeeded", "a run closed from its native result is gated the same way")
+                                 "unknown" if engine == "agy" else "succeeded",
+                                 "agy print text requires known exit evidence; structured engines retain native recovery")
 
     def test_without_the_opt_in_nothing_changes(self) -> None:
         for required in (False, None, "true", 1):

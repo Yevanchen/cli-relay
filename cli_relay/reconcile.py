@@ -81,7 +81,16 @@ def reconcile_attempt(ledger: Ledger, att: Dict[str, Any], *, kick: bool,
     payload = json.loads(task["payload_json"])
     run_dir = ledger.run_dir(att["task_id"], att["attempt_no"])
     exit_info = _read_exit(run_dir)
+    if engine == "agy" and exit_info is not None:
+        # An arbitrary JSON object is not waitpid evidence. Leave all existing adapters unchanged.
+        code, sig = exit_info.get("exit_code"), exit_info.get("signal")
+        if not ((type(code) is int and code >= 0 and sig is None) or
+                (code is None and type(sig) is int and sig > 0)):
+            exit_info = None
     parsed = engines.parse_output(engine, run_dir / "stdout.jsonl", run_dir / "last_message.txt",
+                                 stderr_path=run_dir / "stderr.log", exit_known=exit_info is not None,
+                                 exit_code=(exit_info or {}).get("exit_code"),
+                                 exit_signal=(exit_info or {}).get("signal"),
                                  allowed_bash_commands=(payload.get("options") or {}).get("allowed_bash_commands", []))
     if parsed["session_id"] and parsed["session_id"] != att["native_session_id"]:
         ledger.set_native_session(att["attempt_id"], parsed["session_id"])

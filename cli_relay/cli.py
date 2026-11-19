@@ -201,6 +201,8 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_submit(args: argparse.Namespace) -> int:
     engine = engines.validate_engine(args.engine)
+    if engine == "agy" and args.session is not None:
+        raise Refused("agy_session_unsupported", "agy 首期不支持原生会话或 --session；未启动任务。")
     scope = _check_name("scope", args.scope)
     key = _check_key(args.key)
     prompt = _read_prompt(args)
@@ -945,7 +947,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--after-require", choices=AFTER_REQUIRE,
                    help="dependency release condition (default: ok; requires --after)")
     s.add_argument("--queue", metavar="NAME", help="FIFO queue in this home and scope; one running task at a time")
-    s.add_argument("--task-class", choices=tuple(policy.TIERS), help="required for new production work; fixes engine/model/effort")
+    s.add_argument("--task-class", choices=policy.TASK_CLASSES,
+                   help="required for new production work; carbon explicitly selects agy (standard text tasks only)")
     s.add_argument("--resource-class", choices=policy.RESOURCE_CLASSES,
                    help="explicit standard or computer_use; shared home memory gate and configurable hard cap (default 4), CU cap 1")
     s.add_argument("--test-only-reason", help="audited exemption reason; only engine=fixture can use this")
@@ -1009,7 +1012,7 @@ def build_parser() -> argparse.ArgumentParser:
     rc.add_argument("task_id", nargs="?")
     rc.set_defaults(func=cmd_reconcile)
 
-    d = sub.add_parser("doctor", help="check the ledger, disk space and (optionally) an engine's auth path")
+    d = sub.add_parser("doctor", help="check the ledger, disk space and an engine's auth/capability path; agy never logs in")
     d.add_argument("--engine", choices=engines.ENGINES)
     d.add_argument("--cwd", help="task directory whose project configuration is checked (default: current)")
     d.set_defaults(func=cmd_doctor)

@@ -10,6 +10,65 @@ Three kinds of evidence are reported separately and never stand in for one anoth
 
 Status words: **PASS**, **FAIL**, **NOT RUN** (with the reason), **RUNNING**.
 
+## 2026-11-19 agy Carbon candidate
+
+Source: branch `feat/agy-carbon-subscription-20261119`, based on main
+`d98674a6494527f78ce5c28824b1ca764e1c16fc`; exact candidate head is recorded in the PR and job
+`out/result.json`. Earlier acceptance rows below retain their original scope. This candidate
+has not been merged or deployed. No MBP connection, native inference, login, credential read,
+installed cli-relay change, or Codex/agy/magpie configuration change was made.
+
+The original `simple`, `complex`, `highest_quality` dictionary and order are asserted exactly,
+including Fable 5.2/xhigh. Carbon is a separate agy/standard opt-in with three exact suffix/effort
+pairs. `AGY_CONTRACT=None` intentionally blocks every installed native version before probes.
+The 1.5.11 synthetic contract used in tests is not evidence for real agy 1.5.11 compatibility.
+No public option, environment flag or acceptance-script flag can bypass that gate.
+
+| Evidence | Command / coverage | Result |
+|---|---|---|
+| Fake agy | `python3.14 -m unittest discover -s tests -t tests -p test_agy_engine.py -v`; exact routing, discovery, no foreign config reads, bounded probes, sanitized errors, stdin, UTF-8, normalized print/exit, marker/business/artifact checks, cancellation, queue/shared capacity, idempotency, crash windows and session refusal | PASS (31 tests, synthetic native contract only) |
+| Existing full suite | `python3.14 -m unittest discover -s tests -t tests -v`, Darwin 25.2.0 / Python 3.14.3 | PASS (644 tests, 491.943 seconds) |
+| Short fixture soak | `python3.14 scripts/soak.py run --dir <task-local-soak> --hours 0.03` | PASS: 15 attempts, 11 short tasks, one driver restart; no lost/changed events or unexpected executions; all events ACKed |
+| Mini real missing executable | candidate `doctor --engine agy --cwd <task-work>` with a new task-local relay home | PASS: exit 6, `cli_not_found`; no native probe or inference |
+| CI | unchanged Python 3.11 / 3.12 / 3.14 matrix, complete suite and short fixture soak | NOT RUN locally on Linux; PR CI is authoritative |
+
+Native acceptance is a separate Evan-owned follow-up on the already installed/logged-in MBP.
+Use only fresh task directories and a temporary acceptance relay home; never the production
+ledger, notifier, secrets, LaunchAgents or registry. Do not log out, manufacture quota failure,
+copy an account/binary, open a login flow, or change the expected custom Codex/magpie endpoint.
+
+| Native 1.5.11 gate | Required evidence | Result |
+|---|---|---|
+| No automatic login | trusted version-specific public implementation/docs or an independent no-credential environment that cannot launch a browser; no invented auth/no-login flags | NOT RUN |
+| Print input/output | verified exact print/model syntax, stdin consumption once (including leading `-`, Unicode and multi-line input), UTF-8 stdout/stderr and exit behavior | NOT RUN |
+| Tool/authorization behavior | standard single text task cannot launch authorization or execute unapproved built-in tools; an empty plugin list does not prove this | NOT RUN |
+| Subscription isolation | native subscription evidence and no implicit API/key/Vertex/proxy fallback; names-only environment checks are insufficient alone | NOT RUN |
+| Model directory | exact low/medium/high IDs on the current native login; no identity or directory dump retained | NOT RUN |
+| Three tiny native requests | each complete ID, exit 0 and nonempty text; high is the maximum, no xhigh/max/Orchestrator trials | NOT RUN |
+| Detached end-to-end relay | same user's native context, effective settings, terminal event, completion marker, business report and duplicate key | NOT RUN |
+| Cancellation/group | independent harmless task, only if its duration allows; record NOT RUN if too fast | NOT RUN |
+
+Only after independent no-login/input/tool/route/output evidence is reviewed should a separate
+compatibility change populate the internal contract and native parsers. Unknown versions stay
+`agy_capability_unverified`; unproven billing isolation stays `agy_subscription_unverified`.
+Never substitute a successful logged-in request for unauthenticated failure safety.
+
+The separate helper does not alter `real_cli_acceptance.py`'s Claude/Codex exact-resume contract:
+
+```sh
+# Default: gated preflight and NOT RUN report only; --dir must not already exist.
+python3.14 scripts/agy_acceptance.py --dir /absolute/new/task-local-acceptance
+# Future MBP-only, after compatibility evidence has been reviewed; explicitly consumes quota.
+python3.14 scripts/agy_acceptance.py --dir /absolute/new/mbp-acceptance --run-models
+```
+
+The helper writes `report.json` with source SHA, safe capability fields, fixed failure reasons,
+PASS/FAIL/NOT RUN and per-model invocation/exit evidence. It never logs in, installs, reads
+credentials, sets a notifier, sends a message or attempts native sessions. Missing/unverified
+capabilities exit 3 (NOT RUN); the real CLI `doctor` still uses exit 6. A timed-out acceptance
+wait requests cancellation explicitly and does not resend the prompt. Passing the short soak
+or fake tests is not Carbon subscription acceptance; no 25-hour native soak is claimed.
+
 ## Code under test
 
 - Branch `v0.2.0`; original candidate evidence is in section 2.4; subsequent independent-review

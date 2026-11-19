@@ -74,6 +74,21 @@ Three facts are stored separately and never substituted for one another:
   `CLI-RELAY-STATUS: complete` in the CLI's final message, and a run without it is `needs_input`.
   That is still the CLI's self-report, not acceptance ([`decisions.md`](decisions.md) D15).
 
+The gated agy adapter has a different terminal contract: stdout is print text and
+`native.source=agy_print` is relay normalization, not a provider event. It is constructed only
+with known exit evidence. Nonempty text, JSON-looking answers or a complete marker without a
+valid exit record cannot recover success. Keeper loss therefore observes surviving processes,
+then records `unknown`; it never retries the prompt. A valid `exit.json` is parsed with the
+same stdout/stderr/exit inputs as the keeper, preserving the single terminal event.
+
+agy preflight branches before all Claude/Codex config/auth/trace reads. Discovery failure is
+`cli_not_found`; a found binary is blocked before any probe while its no-login, stdin,
+text/tool and subscription contract remains unverified. This candidate has no verified native
+contract or runtime bypass. Names-only API/Vertex route detection is an additional guard, not
+proof of Google's billing. After independent verification, bounded probes and exact native
+stderr classifiers may classify auth, subscription and quota failures; model prose never does.
+The original engine guards and all three production tiers retain their existing semantics.
+
 Git observations are separate attempt evidence, never an outcome gate or request-payload input.
 For a detected work tree, `git` contains `head_before`, `head_after` and the final `dirty` flag;
 unavailable observations are `null`. A dirty tree adds an `uncommitted_changes` warning,

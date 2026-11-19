@@ -163,7 +163,7 @@ class BusinessReports(unittest.TestCase):
                 self.assertIn('business_status_result_path_mismatch',self.codes(r))
 
     def test_reporting_options_do_not_change_engine_argv_or_permissions(self):
-        for engine in engines.ENGINES:
+        for engine in ('claude', 'codex', 'fixture'):  # agy requires explicit Carbon settings and has no native resume
             for resume in (None,'old-session'):
                 def build(options):
                     return engines.build(engine,payload={'cwd':str(self.work),'options':options},

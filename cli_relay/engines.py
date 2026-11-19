@@ -1,7 +1,7 @@
 """Engine adapters for the official CLIs (and a deterministic fixture).
 
 Each adapter: validates options, builds argv (never via a shell), checks the auth path
-before spawning, and parses the CLI's own machine-readable output. Codex full access, Codex
+before spawning, and parses the CLI's own output (structured events, or gated agy print text). Codex full access, Codex
 workspace network access and extra Claude tools require an explicit task opt-in;
 ``assert_safe`` re-checks every argv before it is used.
 """
@@ -14,18 +14,21 @@ import glob
 import json
 import os
 import re
+import selectors
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import business_status, claude_guard, git_state, policy, procs
 from .errors import UsageError
 
-ENGINES = ("claude", "codex", "fixture")
+ENGINES = ("claude", "codex", "fixture", "agy")
 
 # Variables that route a CLI to API-key or third-party billing. Codex subscription tasks
 # remove them from the child environment; Claude still blocks. Only names are reported.
@@ -35,8 +38,10 @@ BILLING_ENV: Dict[str, tuple] = {
                "ANTHROPIC_VERTEX_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID"),
     "codex": ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "AZURE_OPENAI_API_KEY"),
     "fixture": (),
+    "agy": ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_VERTEXAI"),
 }
-UNSETTABLE_ENV = tuple(sorted({name for names in BILLING_ENV.values() for name in names}))
+# agy blocks route collisions; it does not offer environment cleanup. Keep the old allowlist.
+UNSETTABLE_ENV = tuple(sorted({name for engine, names in BILLING_ENV.items() if engine != "agy" for name in names}))
 CODEX_BILLING_MODES = ("subscription", "api")
 
 # Markers of a calling Claude Code session; they must not leak into a child CLI.
@@ -49,6 +54,7 @@ _FORBIDDEN = {
     "codex": {"--dangerously-bypass-approvals-and-sandbox", "--approve-for-me", "--last", "--full-auto",
               "--dangerously-bypass-hook-trust", "--yolo"},
     "fixture": set(),
+    "agy": set(),  # assert_safe accepts only the exact, version-verified print invocation.
 }
 
 _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
@@ -60,6 +66,7 @@ _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
     "fixture": {"duration_s": (int, float), "exit_code": (int,), "result": (str,), "side_effect_file": (str,),
                 "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,),
                 "descendant_s": (int, float), "descendant_pid_file": (str,), "require_completion_marker": (bool,)},
+    "agy": {"model": (str,), "effort": (str,), "require_completion_marker": (bool,)},
 }
 for _spec in _OPTION_TYPES.values():
     _spec.update({"result_file": (str,), "require_business_status": (bool,), "required_artifacts": (list,)})
@@ -124,6 +131,159 @@ class Spec:
     cwd: str
     last_message_path: Optional[str] = None
     evidence: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AgyContract:
+    """Internal compatibility evidence, never a caller/config/env opt-in.
+
+    Installing a contract requires independent evidence that these probes and stdin print cannot
+    launch login/authorization or tools. Parsers must match the verified version's native output;
+    in particular classify_error sees only stderr, never model-authored answers. Tests inject a
+    synthetic contract in-process; its wire format is not a claim about the real agy CLI.
+    """
+    version: str
+    version_args: Tuple[str, ...]
+    models_args: Tuple[str, ...]
+    parse_version: Callable[[str], Optional[str]]
+    parse_models: Callable[[str], Optional[Iterable[str]]]
+    classify_error: Callable[[int, str], Optional[str]]
+    subscription_verified: bool = False
+
+
+# 1.5.11 is the acceptance target, not an accepted native contract yet. In particular Evan's
+# models observation does not prove safe unauthenticated behavior, stdin or billing isolation.
+# Keep this None until docs/acceptance.md's native gates have evidence. No runtime override.
+AGY_CONTRACT: Optional[AgyContract] = None
+AGY_BASELINE_VERSION = "1.5.11"
+AGY_PROBE_TIMEOUT_S = 20.0
+AGY_PROBE_MAX_BYTES = 65536
+AGY_BLOCKED_REASONS = frozenset({
+    "agy_auth_required", "agy_subscription_unavailable", "agy_quota_exhausted",
+    "agy_non_subscription_route", "agy_subscription_unverified",
+})
+AGY_MESSAGES = {
+    "cli_not_found": "本机未发现可执行 agy。当前仅已安装并登录 agy 的 MBP 可用。请在该机提交；relay 不安装、不连接远端。",
+    "agy_capability_unverified": "此 agy 版本的非交互能力尚未验收。未启动任务。",
+    "agy_auth_required": "本机 agy 未登录或登录已失效。任务已停止，未触发登录。",
+    "agy_subscription_unavailable": "当前 agy 订阅不能使用所请求的 Carbon 模型。",
+    "agy_model_unavailable": "所请求的完整 Carbon 模型不可用；未替换模型。",
+    "agy_quota_exhausted": "当前订阅额度或速率受限。任务已停止，未切换计费路径。",
+    "agy_non_subscription_route": "当前进程存在与订阅路径冲突的路由设置。只报告变量名。",
+}
+
+
+def _agy_failure(reason: str, **detail: Any) -> Preflight:
+    message = AGY_MESSAGES.get(reason, "目前无法确认本机 agy 订阅可用。未启动推理，也未尝试登录。")
+    return Preflight(False, reason, {**detail, "message": message})
+
+
+def _agy_error(returncode: int, stderr: str) -> Optional[str]:
+    if AGY_CONTRACT is None:
+        return None
+    try:
+        reason = AGY_CONTRACT.classify_error(returncode, stderr)
+    except Exception:
+        return None
+    # Never export native error text, URLs, identities or arbitrary classifier strings.
+    return reason if isinstance(reason, str) and (reason in AGY_BLOCKED_REASONS or reason == "agy_needs_input") else None
+
+
+def _agy_probe(binary: str, args: Tuple[str, ...], env: Dict[str, str], cwd: Optional[str]
+               ) -> Tuple[Optional[int], str, str, Optional[str]]:
+    """Bound both time and captured bytes; safe probes only, no shell or TTY, no raw diagnostics."""
+    proc = None
+    completed = False
+    try:
+        deadline = time.monotonic() + AGY_PROBE_TIMEOUT_S
+        proc = subprocess.Popen([binary, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=child_env(env), cwd=cwd, start_new_session=True)
+        captured = {"stdout": bytearray(), "stderr": bytearray()}
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
+            selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired("agy probe", AGY_PROBE_TIMEOUT_S)
+                for key, _ in selector.select(remaining):
+                    chunk = os.read(key.fileobj.fileno(), 8192)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    captured[key.data].extend(chunk)
+                    if sum(map(len, captured.values())) > AGY_PROBE_MAX_BYTES:
+                        raise ValueError("probe output limit")
+        rc = proc.wait(timeout=max(0.001, deadline - time.monotonic()))
+        stdout, stderr = captured["stdout"].decode("utf-8"), captured["stderr"].decode("utf-8")
+        completed = True
+        return rc, stdout, stderr, None
+    except subprocess.TimeoutExpired:
+        return None, "", "", "agy_probe_timeout"
+    except (OSError, ValueError):
+        return None, "", "", "agy_preflight_unverified"
+    finally:
+        if proc is not None:
+            # On a timeout/error the probe or its children may still own open pipes.
+            if not completed:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            proc.wait()
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+
+
+def _agy_preflight(env: Dict[str, str], cwd: Optional[str], options: Dict[str, Any]) -> Preflight:
+    binary = resolve_bin("agy", env)
+    if binary is None:
+        return _agy_failure("cli_not_found", engine="agy")
+    opts = validate_options("agy", options, cwd=cwd)
+    detail = {"agy_bin": binary, "input_mode": "stdin", "auth_path": "native_agy_subscription"}
+    present = [name for name in BILLING_ENV["agy"] if name in env]
+    if present:
+        return _agy_failure("agy_non_subscription_route", names=present, **detail)
+    contract = AGY_CONTRACT
+    if contract is None or contract.version != AGY_BASELINE_VERSION:
+        return _agy_failure("agy_capability_unverified", **detail)
+    rc, stdout, stderr, error = _agy_probe(binary, contract.version_args, env, cwd)
+    if error:
+        return _agy_failure(error, **detail)
+    reason = _agy_error(rc, stderr)
+    if reason:
+        return _agy_failure(reason, returncode=rc, **detail)
+    try:
+        version = contract.parse_version(stdout)
+    except Exception:
+        version = None
+    if rc != 0 or version != contract.version:
+        return _agy_failure("agy_capability_unverified", returncode=rc, **detail)
+    detail["agy_version"] = version
+    if not contract.subscription_verified:
+        return _agy_failure("agy_subscription_unverified", **detail)
+    rc, stdout, stderr, error = _agy_probe(binary, contract.models_args, env, cwd)
+    if error:
+        return _agy_failure(error, **detail)
+    reason = _agy_error(rc, stderr)
+    if reason:
+        return _agy_failure(reason, returncode=rc, **detail)
+    try:
+        models = contract.parse_models(stdout) if rc == 0 else None
+        if models is not None:
+            models = set(models)
+    except Exception:
+        models = None
+    if models is None:
+        return _agy_failure("agy_preflight_unverified", returncode=rc, **detail)
+    visible = [model for _, model, _ in policy.CARBON_TIERS["carbon"] if model in models]
+    detail.update(models=visible, returncode=rc)
+    if opts.get("model") and opts["model"] not in visible:
+        return _agy_failure("agy_model_unavailable", **detail)
+    if not visible:
+        return _agy_failure("agy_model_unavailable", **detail)
+    return Preflight(True, detail=detail)
 
 
 def validate_engine(engine: str) -> str:
@@ -202,7 +362,8 @@ def validate_unset_env(values: Any) -> List[str]:
 
 
 def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str] = None) -> Dict[str, Any]:
-    spec = {**_OPTION_TYPES[engine], "unset_env": (list,)}
+    validate_engine(engine)
+    spec = {**_OPTION_TYPES[engine], **({"unset_env": (list,)} if engine != "agy" else {})}
     clean: Dict[str, Any] = {}
     for key, value in sorted(options.items()):
         if key not in spec:
@@ -258,6 +419,10 @@ def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str]
             claude_guard.validate(clean)
     if "effort" in clean and clean["effort"] not in EFFORT_LEVELS:
         raise UsageError("effort must be low, medium, high, xhigh or max", allowed=list(EFFORT_LEVELS))
+    if engine == "agy" and ("model" in clean or "effort" in clean):
+        if (engine, clean.get("model"), clean.get("effort")) not in policy.CARBON_TIERS["carbon"]:
+            raise UsageError("agy requires an exact gemini-4-carbon-low|medium|high model and matching "
+                             "low|medium|high effort; no defaults, xhigh/max or Orchestrator")
     for key in ("side_effect_file", "descendant_pid_file"):
         if engine == "fixture" and key in clean and not os.path.isabs(clean[key]):
             raise UsageError(f"{key} must be an absolute path")
@@ -271,6 +436,16 @@ def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str]
 
 
 def resolve_bin(engine: str, env: Dict[str, str]) -> Optional[str]:
+    if engine == "agy":
+        def executable(value: str) -> Optional[str]:
+            path = Path(value)
+            return str(path.resolve()) if path.is_absolute() and path.is_file() and os.access(path, os.X_OK) else None
+
+        if "CLI_RELAY_AGY_BIN" in env:  # even an empty/bad explicit override must not fall back
+            return executable(env["CLI_RELAY_AGY_BIN"])
+        local = executable(str(_home(env) / ".local" / "bin" / "agy"))
+        found = local or shutil.which("agy", path=env.get("PATH", ""))
+        return executable(str(Path(found).absolute())) if found else None
     override = env.get({"claude": "CLI_RELAY_CLAUDE_BIN", "codex": "CLI_RELAY_CODEX_BIN"}[engine])
     if override:
         return override if os.access(override, os.X_OK) else None
@@ -615,7 +790,10 @@ def preflight(engine: str, env: Dict[str, str], cwd: Optional[str] = None, *,
               options: Optional[Dict[str, Any]] = None) -> Preflight:
     """Everything that decides which account serves the run is checked before the CLI starts:
     billing variables, the CLI's configuration layers that apply to ``cwd``, and the login."""
+    validate_engine(engine)
     opts = options or {}
+    if engine == "agy":  # before any Claude/Codex config, auth, environment cleanup or trace checks
+        return _agy_preflight(env, cwd, opts)
     if engine == "codex":
         opts = validate_options(engine, opts, cwd=cwd)
     billing = billing_env_evidence(engine, env, opts)
@@ -701,6 +879,8 @@ def validate_session_id(value: Any) -> str:
 
 def session_record(engine: str, env: Dict[str, str], session_id: str, *, fixture_state_dir: str) -> Optional[Path]:
     """The CLI's own record of the session on this machine, or None."""
+    if engine == "agy":
+        return None
     if engine == "claude":
         pattern = str(claude_config_dir(env) / "projects" / "*" / f"{glob.escape(session_id)}.jsonl")
         matches = sorted(glob.glob(pattern))
@@ -800,6 +980,8 @@ def session_preflight(engine: str, env: Dict[str, str], session_id: str, *, fixt
     """Before a turn is delivered to an existing session: the session exists on this machine, no live
     process outside the relay owns it, and a Codex thread was created by the built-in openai provider
     (its rollout records that once, so a foreign thread is checked before any turn is sent)."""
+    if engine == "agy":
+        return {"reason": "agy_session_unsupported"}
     if session_record(engine, env, session_id, fixture_state_dir=fixture_state_dir) is None:
         where = {"claude": str(claude_config_dir(env) / "projects" / "*" / f"{session_id}.jsonl"),
                  "codex": str(codex_home(env) / "sessions" / "*" / "*" / "*" / f"rollout-*{session_id}.jsonl"),
@@ -1074,7 +1256,14 @@ def permission_violation(engine: str, env: Dict[str, str], session_id: Optional[
 
 def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str, Any]] = None,
                 cwd: Optional[str] = None) -> None:
+    validate_engine(engine)
     args = list(argv)
+    if engine == "agy":
+        opts = validate_options(engine, options or {}, cwd=cwd)
+        if (not opts.get("model") or len(args) != 4 or args[1:] != ["--print", "--model", opts["model"]]
+                or not os.path.isabs(args[0]) or not Path(args[0]).is_file() or not os.access(args[0], os.X_OK)):
+            raise RuntimeError("refusing agy arguments outside the exact stdin print contract")
+        return
     bad = sorted(set(args) & _FORBIDDEN[engine])
     if engine in ("codex", "claude"):
         bad = sorted({arg for arg in args if arg.partition("=")[0] in _FORBIDDEN[engine]})
@@ -1163,6 +1352,7 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
 
 def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_dir: Path,
           fixture_state_dir: str, env: Dict[str, str]) -> Spec:
+    validate_engine(engine)
     cwd = payload["cwd"]
     opts = validate_options(engine, payload.get("options", {}), cwd=cwd)
     resume = attempt.get("resume_session_id")
@@ -1232,7 +1422,23 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
         if opts.get("effort"):
             argv += ["-c", f'model_reasoning_effort="{opts["effort"]}"']
         argv += [resume, "-"] if resume else ["-"]
-    else:
+    elif engine == "agy":
+        policy.validate_new({**payload, "engine": engine})
+        if resume or payload.get("target_session_id"):
+            raise RuntimeError("agy_session_unsupported")
+        binary = resolve_bin(engine, env)  # re-check immediately before constructing the spawn
+        if binary is None:
+            raise RuntimeError(AGY_MESSAGES["cli_not_found"])
+        if any(name in env for name in BILLING_ENV[engine]):
+            raise RuntimeError(AGY_MESSAGES["agy_non_subscription_route"])
+        if AGY_CONTRACT is None or AGY_CONTRACT.version != AGY_BASELINE_VERSION:
+            raise RuntimeError(AGY_MESSAGES["agy_capability_unverified"])
+        if not AGY_CONTRACT.subscription_verified:
+            raise RuntimeError("agy_subscription_unverified")
+        argv = [binary, "--print", "--model", opts["model"]]
+        evidence["agy"] = {"agy_version": AGY_CONTRACT.version, "agy_bin": binary,
+                           "input_mode": "stdin", "auth_path": "native_agy_subscription"}
+    elif engine == "fixture":
         argv = [sys.executable, "-m", "cli_relay.fixture", "--state-dir", fixture_state_dir]
         argv += ["--resume", resume] if resume else ["--session-id", attempt["native_session_id"]]
         argv += ["--duration", str(opts.get("duration_s", 0)), "--exit-code", str(opts.get("exit_code", 0))]
@@ -1339,6 +1545,8 @@ class StreamWatcher:
 
 
 def session_id_from_event(engine: str, ev: Dict[str, Any]) -> Optional[str]:
+    if engine == "agy":
+        return None
     if engine == "codex":
         for key in ("thread_id", "session_id", "conversation_id"):
             if isinstance(ev.get(key), str) and ev.get("type") in ("thread.started", "session.created",
@@ -1368,9 +1576,53 @@ def billing_violation(engine: str, ev: Dict[str, Any]) -> Optional[Dict[str, Any
     return None
 
 
+def _parse_agy_output(stdout_path: Path, stderr_path: Optional[Path], *, exit_known: bool,
+                      exit_code: Optional[int], exit_signal: Optional[int]) -> Dict[str, Any]:
+    parsed = {"native": None, "session_id": None, "init": None}
+    if not exit_known:
+        return parsed  # even complete-looking print text is not a native terminal event
+    reason, text = None, None
+    try:
+        text = stdout_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        pass
+    except (OSError, UnicodeError):
+        reason = "agy_output_unverified"
+    if stderr_path is not None:
+        try:
+            with stderr_path.open("rb") as stream:
+                raw = stream.read(AGY_PROBE_MAX_BYTES + 1)
+            if len(raw) <= AGY_PROBE_MAX_BYTES:
+                reason = _agy_error(exit_code, raw.decode("utf-8")) or reason
+            else:
+                reason = "agy_output_unverified"
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeError):
+            reason = "agy_output_unverified"
+    if reason is None:
+        if exit_code != 0 or exit_signal is not None:
+            reason = "agy_cli_failed"
+        elif not text or not text.strip():
+            reason = "agy_empty_output"
+        elif AGY_CONTRACT is None or AGY_CONTRACT.version != AGY_BASELINE_VERSION:
+            reason = "agy_output_unverified"
+        elif not AGY_CONTRACT.subscription_verified:
+            reason = "agy_subscription_unverified"
+    parsed["native"] = {"source": "agy_print", "ok": reason is None,
+                        "status": "completed" if reason is None else "failed",
+                        "result": text if text and text.strip() else None, "reason": reason}
+    return parsed
+
+
 def parse_output(engine: str, stdout_path: Path, last_message_path: Optional[Path] = None, *,
-                 allowed_bash_commands: Iterable[str] = ()) -> Dict[str, Any]:
+                 allowed_bash_commands: Iterable[str] = (), stderr_path: Optional[Path] = None,
+                 exit_known: bool = False, exit_code: Optional[int] = None,
+                 exit_signal: Optional[int] = None) -> Dict[str, Any]:
     """Summarise the CLI's own output. ``native`` is None when no final result was emitted."""
+    if engine == "agy":
+        return _parse_agy_output(stdout_path, stderr_path, exit_known=exit_known,
+                                exit_code=exit_code, exit_signal=exit_signal)
     init: Optional[Dict[str, Any]] = None
     session_id: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
@@ -1482,6 +1734,28 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
     unless the CLI's own final message ends with the complete marker line: the incomplete
     line, any other last line and no final message all mean the CLI did not report the task
     done. The marker never changes any other outcome."""
+    if engine == "agy":
+        native = parsed.get("native")
+        reason = (native or {}).get("reason")
+        outcome = classify(native, exit_code=exit_code, exit_signal=exit_signal, exit_known=exit_known,
+                           cancel_requested=cancel_requested)
+        if outcome != "cancelled":
+            if reason in AGY_BLOCKED_REASONS:
+                outcome = "blocked"
+            elif reason == "agy_needs_input":
+                outcome = "needs_input"
+            elif not exit_known:
+                outcome = "unknown"
+            elif exit_code != 0 or exit_signal is not None or native is None or not native.get("ok"):
+                outcome = "failed"
+        evidence = {"reason_code": reason} if reason else {}
+        if require_completion_marker is True:
+            check = {"marker": completion_marker((native or {}).get("result"))}
+            if outcome == "succeeded" and check["marker"] != "complete":
+                outcome = "needs_input"
+                check["downgraded_from"] = "succeeded"
+            evidence["completion_check"] = check
+        return outcome, evidence
     if guard is None and engine in ("claude", "fixture") and parsed.get("init"):
         guard = billing_violation(engine, {"type": "system", "subtype": "init", **parsed["init"]})
     if guard is not None:
@@ -1510,7 +1784,7 @@ def decide(engine: str, parsed: Dict[str, Any], *, env: Dict[str, str], session_
 
 def native_trace_exists(engine: str, session_id: Optional[str]) -> Optional[bool]:
     """Best-effort evidence that the CLI created its own session record (never used to decide a re-run)."""
-    if not session_id or engine == "fixture":
+    if not session_id or engine in ("fixture", "agy"):
         return None
     env = dict(os.environ)
     if engine == "claude":

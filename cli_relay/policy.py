@@ -15,6 +15,12 @@ TIERS = {
     ),
 }
 
+# Carbon is explicit opt-in and never a default or fallback for one of the original tiers.
+CARBON_TIERS = {
+    "carbon": tuple(("agy", f"gemini-4-carbon-{effort}", effort) for effort in ("low", "medium", "high")),
+}
+TASK_CLASSES = (*TIERS, *CARBON_TIERS)
+
 
 def tier(task_class: str, index: int = 0) -> tuple:
     """Return one allowed (engine, model, effort) combination for a task class."""
@@ -37,6 +43,9 @@ def validate_new(payload: Dict[str, Any]) -> None:
     engine = payload["engine"]
     if payload.get("resource_class", "standard") not in RESOURCE_CLASSES:
         raise UsageError("resource_class must be standard or computer_use; classify explicitly")
+    task_class = payload.get("task_class")
+    if task_class == "carbon" and engine != "agy":
+        raise UsageError("task_class=carbon requires engine=agy; fixture exemptions do not apply")
     if engine == "fixture":
         reason = payload.get("test_only_reason", "deterministic fixture engine; no provider calls")
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 256 or not reason.isprintable():
@@ -44,12 +53,14 @@ def validate_new(payload: Dict[str, Any]) -> None:
         return  # Explicit engine=fixture cannot invoke a provider, even in a production ledger.
     if "test_only_reason" in payload:
         raise UsageError("test-only exemptions are restricted to engine=fixture; production engines must use a tier")
-    task_class = payload.get("task_class")
-    if not isinstance(task_class, str) or task_class not in TIERS:
-        raise UsageError("new production submits require --task-class simple|complex|highest_quality", tiers=TIERS)
+    if not isinstance(task_class, str) or task_class not in TASK_CLASSES:
+        raise UsageError("new production submits require --task-class " + "|".join(TASK_CLASSES),
+                         tiers=TIERS, carbon_tiers=CARBON_TIERS)
+    if engine == "agy" and task_class != "carbon":
+        raise UsageError("engine=agy requires the explicit --task-class carbon")
     if "resource_class" not in payload:
         raise UsageError("new production submits require --resource-class standard|computer_use")
-    allowed = TIERS[task_class]
+    allowed = CARBON_TIERS[task_class] if task_class == "carbon" else TIERS[task_class]
     options = payload.get("options") or {}
     actual = (engine, options.get("model"), options.get("effort"))
     if actual not in allowed:

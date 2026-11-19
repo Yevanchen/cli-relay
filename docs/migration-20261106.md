@@ -19,6 +19,15 @@ and effort. Codex also needs an explicit sandbox. The relay validates; it does n
 The `highest_quality` class accepts either listed combination; Opus 5.5/max remains valid.
 Simple and complex Codex tiers are unchanged.
 
+The 2026-11-19 candidate adds a separate opt-in `carbon` class with engine `agy`, standard
+resources and exactly `gemini-4-carbon-low/low`, `gemini-4-carbon-medium/medium` or
+`gemini-4-carbon-high/high`. It does not extend or reorder the three tiers above (Fable stays
+xhigh). Fixture cannot claim the Carbon class. No schema change, payload/hash rewrite, ledger
+migration, installed-binary replacement or host configuration change is required.
+Native agy capability/Ultra subscription acceptance is pending; missing agy fails
+`cli_not_found`, a found but unverified CLI fails `agy_capability_unverified`. See
+[explicit usage and gates](usage.md#agy-carbon-subscription-text-tasks).
+
 Resources are `standard` or `computer_use`. Computer use requires the complex Codex tier and
 has no extra sandbox grant. Choose the minimum task permissions; file work normally uses
 `workspace-write`. No CLI defaults, auth, global environment or host configuration are changed.
