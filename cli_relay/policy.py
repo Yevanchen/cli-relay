@@ -12,6 +12,7 @@ TIERS = {
     "highest_quality": (
         ("claude", "claude-opus-5-5", "max"),
         ("claude", "claude-fable-5-2", "xhigh"),
+        ("claude", "claude-fable-5-2", "max"),
     ),
 }
 

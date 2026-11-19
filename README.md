@@ -77,7 +77,16 @@ Mini without agy fails `cli_not_found`; an installed but unverified CLI fails
 `agy_capability_unverified` before any probe or inference. No installation, login, API-key
 fallback or remote execution is attempted. See [Carbon usage and acceptance gates](docs/usage.md#agy-carbon-subscription-text-tasks).
 
-New production work requires explicit task/resource class and tier-matched model/effort.
+New production work requires explicit task/resource class and tier-matched model/effort:
+
+| Task class | Engine | Model | Effort |
+|---|---|---|---|
+| simple | codex | gpt-6.1-terra | high |
+| complex | codex | gpt-6.1-sol | max |
+| highest_quality | claude | claude-opus-5-5 | max |
+| highest_quality | claude | claude-fable-5-2 | xhigh |
+| highest_quality | claude | claude-fable-5-2 | max |
+
 All scopes in one relay home share a configurable, memory-aware budget: by default at most
 four active jobs when available memory is at least 1536 MiB, one below that threshold, or
 two if memory cannot be read. Computer use stays limited to one job.

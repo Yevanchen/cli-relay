@@ -43,26 +43,34 @@ class ProductionTiers(unittest.TestCase):
             with self.assertRaises(UsageError):
                 policy.validate_new(self.payload(tier, 'computer_use'))
 
-    def test_highest_quality_also_allows_fable_extra(self):
-        p = self.payload('highest_quality')
-        p['options']['model'] = 'claude-fable-5-2'
-        p['options']['effort'] = 'xhigh'
-        policy.validate_new(p)
-        settings = policy.settings(p['engine'], p)['effective_settings']
-        self.assertEqual((settings['engine'], settings['model'], settings['effort']),
-                         ('claude', 'claude-fable-5-2', 'xhigh'))
+    def test_highest_quality_fable_efforts_and_error_details(self):
+        for effort in ('max', 'xhigh'):
+            with self.subTest(effort=effort):
+                p = self.payload('highest_quality')
+                p['options'].update(model='claude-fable-5-2', effort=effort)
+                policy.validate_new(p)
+                settings = policy.settings(p['engine'], p)['effective_settings']
+                self.assertEqual((settings['engine'], settings['model'], settings['effort']),
+                                 ('claude', 'claude-fable-5-2', effort))
         self.assertEqual(policy.TIERS['highest_quality'][0], ('claude', 'claude-opus-5-5', 'max'))
-        for model, effort in (('claude-fable-5-2', 'max'), ('claude-opus-5-5', 'xhigh'),
+        for model, effort in (('claude-opus-5-5', 'xhigh'),
                               ('claude-fable-5-2', 'high'), ('claude-fable-5-1', 'xhigh')):
             bad = self.payload('highest_quality')
-            bad['options']['model'] = model
-            bad['options']['effort'] = effort
-            with self.subTest(model=model, effort=effort), self.assertRaises(UsageError):
+            bad['options'].update(model=model, effort=effort)
+            with self.subTest(model=model, effort=effort), self.assertRaises(UsageError) as error:
                 policy.validate_new(bad)
+            expected = error.exception.detail['expected']
+            for allowed_effort in ('max', 'xhigh'):
+                self.assertIn(dict(engine='claude', model='claude-fable-5-2', effort=allowed_effort), expected)
+        missing_class = self.payload('highest_quality')
+        missing_class.pop('task_class')
+        with self.assertRaises(UsageError) as error:
+            policy.validate_new(missing_class)
+        for effort in ('max', 'xhigh'):
+            self.assertIn(('claude', 'claude-fable-5-2', effort), error.exception.detail['tiers']['highest_quality'])
         for task_class in ('simple', 'complex'):
             other = self.payload(task_class)
-            other['options']['model'] = 'claude-fable-5-2'
-            other['options']['effort'] = 'xhigh'
+            other['options'].update(model='claude-fable-5-2', effort='xhigh')
             with self.subTest(task_class=task_class), self.assertRaises(UsageError):
                 policy.validate_new(other)
 
