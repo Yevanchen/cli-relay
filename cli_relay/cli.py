@@ -948,7 +948,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="dependency release condition (default: ok; requires --after)")
     s.add_argument("--queue", metavar="NAME", help="FIFO queue in this home and scope; one running task at a time")
     s.add_argument("--task-class", choices=policy.TASK_CLASSES,
-                   help="required for new production work; carbon explicitly selects agy (standard text tasks only)")
+                   help='required for new production work; specify engine/model/effort explicitly (no defaults). '
+                        'highest_quality: --engine agy --option model=gemini-4-neon-xhigh --option effort=xhigh; '
+                        'carbon: agy gemini-4-carbon-low|medium|high with matching effort. Both require standard resources')
     s.add_argument("--resource-class", choices=policy.RESOURCE_CLASSES,
                    help="explicit standard or computer_use; shared home memory gate and configurable hard cap (default 4), CU cap 1")
     s.add_argument("--test-only-reason", help="audited exemption reason; only engine=fixture can use this")

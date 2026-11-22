@@ -29,7 +29,7 @@ git clone https://github.com/Yevanchen/cli-relay && cd cli-relay
 pip install .            # or run in place: PYTHONPATH=. python3 -m cli_relay …
 cli-relay init           # ledger under $CLI_RELAY_HOME or ~/.cli-relay
 
-cli-relay submit --key fix-tests-42 --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
+cli-relay submit --key fix-tests-42 --engine codex --cwd ~/code/app --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"' \
   --prompt "Run the unit tests and summarise failures."
 
 cli-relay wait t-… --timeout 600    # a timeout only stops waiting; the task keeps running
@@ -43,7 +43,7 @@ With the notifier (v0.2):
 
 ```sh
 cli-relay migrate                   # upgrade an existing ledger; consistent backup first
-cli-relay submit --key k --engine claude --cwd ~/code/app --prompt "…" --notify-route bot --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"'
+cli-relay submit --key k --engine codex --cwd ~/code/app --prompt "…" --notify-route bot --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"'
 cli-relay notify run --interval 60  # periodic pass: retries, reminders, catch-up after a restart
 ```
 
@@ -65,17 +65,32 @@ the 30-minute ACK timeout, or its notification fails; it keeps the task's origin
 
 | Engine | Role |
 |---|---|
-| `claude` | Claude Code (`dontAsk`; tools follow your existing Claude settings) |
+| `claude` | Historical stored tasks only; new production submissions are rejected |
 | `codex` | Codex (explicit sandbox required for new production work) |
 | `fixture` | Local stand-in for tests |
-| `agy` | Explicit Carbon subscription text tasks; native compatibility acceptance is still pending |
+| `agy` | Neon xhigh for highest_quality; Carbon is explicit opt-in; native acceptance is pending |
 
-`agy` requires the separate `--task-class carbon`, `--resource-class standard`, and an exact
-`gemini-4-carbon-low|medium|high` model with matching effort. The original three tiers keep
-their existing mappings, including Fable 5.2/**xhigh**. No automatic Carbon routing.
+The three production tiers are `simple` = Codex `gpt-6.1-terra/high`, `complex` = Codex
+`gpt-6.1-sol/max` (including computer use), and `highest_quality` = agy
+`gemini-4-neon-xhigh/xhigh`. Claude Opus/Fable combinations are rejected for new work.
+Carbon remains a separate `--task-class carbon` opt-in: only `gemini-4-carbon-low/low`,
+`gemini-4-carbon-medium/medium` or `gemini-4-carbon-high/high`. Both agy classes require
+`--resource-class standard`. Neon and Carbon never substitute for each other.
+
+All fields remain explicit, consistent with Codex/Carbon: giving only
+`--task-class highest_quality`, or omitting its model or effort, is a usage error. The recommended
+highest_quality combination (after separate native acceptance) is:
+
+```sh
+cli-relay submit --key neon-text-01 --engine agy --task-class highest_quality \
+  --resource-class standard --cwd /absolute/path/to/task \
+  --option 'model="gemini-4-neon-xhigh"' --option 'effort="xhigh"' \
+  --prompt 'Return a short text analysis; do not use tools or edit files.'
+```
+
 Mini without agy fails `cli_not_found`; an installed but unverified CLI fails
 `agy_capability_unverified` before any probe or inference. No installation, login, API-key
-fallback or remote execution is attempted. See [Carbon usage and acceptance gates](docs/usage.md#agy-carbon-subscription-text-tasks).
+fallback or remote execution is attempted. See [Neon usage](docs/usage.md#agy-neon-highest-quality-text-tasks) and [native acceptance gates](docs/acceptance.md#2026-11-21-neon--highest_quality-candidate).
 
 New production work requires explicit task/resource class and tier-matched model/effort.
 All scopes in one relay home share a configurable, memory-aware budget: by default at most
@@ -109,16 +124,15 @@ Existing Claude settings and
 deny rules remain active. `bypassPermissions` is rejected in task options, argv and every
 settings layer, including user/project defaults. Codex defaults to `read-only`.
 
-Claude can opt into Edit and Write within specific task subdirectories and Bash command prefixes:
+Existing Claude tasks retain their permission options. New Claude production submissions
+are rejected; the following historical adapter options do not authorize a new task:
 
-```sh
-cli-relay submit --key reports --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
-  --prompt "Generate reports in out and run the Python checker." \
-  --allow-write-dir './out/**' --allow-write-dir './reports' \
-  --allow-bash python3 --allow-bash 'pip install --user'
+```json
+{"allowed_write_dirs":["./out/**","./reports"],"allowed_bash_commands":["python3","pip install --user"]}
 ```
 
-Both flags are repeatable. Directories are relative to the task `--cwd`, with an optional
+The historical `--allow-write-dir` and `--allow-bash` flags are repeatable.
+Directories are relative to the task `--cwd`, with an optional
 trailing `/**`; absolute paths inside that cwd are also accepted. They become rules such as
 `Edit(./out/**)` and `Write(./out/**)`. The whole cwd, `..` components, paths outside cwd,
 symlink escapes and other glob/rule syntax are rejected. Paths are checked again before each

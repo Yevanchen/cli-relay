@@ -73,15 +73,14 @@ flags. Effort overrides share the one generated settings object. First run, exac
 resume and fresh rerun rebuild the ceiling from the stored task options; child resumes are
 not supported. The attempt records the requested policy under `claude_subagent_guard`.
 
-## Usage
+## Historical task options
 
-```sh
-cli-relay submit --key parallel-report --engine claude --cwd ~/code/app \
-  --task-class highest_quality --resource-class standard \
-  --option 'model="claude-opus-5-5"' --option 'effort="max"' \
-  --option 'allowed_tools=["Task","Agent","TodoWrite"]' \
-  --allow-bash ls --allow-write-dir ./out \
-  --prompt 'Use two cli-relay-worker foreground agents concurrently, with run_in_background false. Have each list the directory and write its report into out.'
+New Claude production submissions are retired: highest_quality now accepts only agy
+`gemini-4-neon-xhigh/xhigh`. These adapter options remain for stored Claude tasks and fake
+regression tests; they do not authorize new Claude work:
+
+```json
+{"allowed_tools":["Task","Agent","TodoWrite"],"allowed_bash_commands":["ls"],"allowed_write_dirs":["./out"]}
 ```
 
 WebFetch/WebSearch remain separate exact-name opt-ins. A task that needs arbitrary Bash

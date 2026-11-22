@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Minimal real closed loops through the relay with an official CLI (manual, never in CI).
 
-For one engine (claude or codex) this runs, via the relay's own JSON CLI:
+For Codex this runs, via the relay's own JSON CLI (new Claude production work is retired;
+--engine claude exits NOT RUN without probing or submitting):
   0. doctor --engine --cwd: the subscription auth path must be confirmed, otherwise nothing runs;
   1. a tiny successful task;
   2. a cheap failing task (unknown model name) to check failure parsing;
@@ -143,6 +144,12 @@ def main() -> int:
     a = ap.parse_args()
     if a.sabotage_resume and a.engine != "fixture":
         ap.error("--sabotage-resume is only for --engine fixture")
+    if a.engine == "claude":
+        report = {"engine": "claude", "relay_commit": relay_commit(), "steps": [],
+                  "result": "NOT RUN (Claude production routing retired; highest_quality requires agy Neon xhigh)"}
+        a.out.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+        print(json.dumps({"engine": "claude", "result": report["result"]}))
+        return 3
     a.workdir.mkdir(parents=True, exist_ok=True)
     if a.engine == "codex" and not (a.workdir / ".git").exists():
         subprocess.run(["git", "init", "-q", str(a.workdir)], check=True)
@@ -176,9 +183,6 @@ def main() -> int:
         opts, ok_opts, fail_opts = ["--task-class", "complex", "--resource-class", "standard",
             "--option", 'model="gpt-6.1-sol"', "--option", 'effort="max"',
             "--option", 'sandbox="read-only"'], [], ["--option", 'model="cli-relay-no-such-model"']
-    elif a.engine == "claude":
-        opts, ok_opts, fail_opts = ["--task-class", "highest_quality", "--resource-class", "standard",
-            "--option", 'model="claude-opus-5-5"', "--option", 'effort="max"'], [], ["--option", 'model="cli-relay-no-such-model"']
     else:
         opts, ok_opts, fail_opts = [], ["--option", f'result="{PHRASE}"'], ["--option", "exit_code=1"]
     preassigned = a.engine in ("claude", "fixture")

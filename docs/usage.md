@@ -11,11 +11,11 @@ pip install .            # or run in place: PYTHONPATH=. python3 -m cli_relay ..
 cli-relay init           # ledger in $CLI_RELAY_HOME or ~/.cli-relay
 
 # submit under an idempotency key; the CLI runs detached from this shell
-cli-relay submit --key fix-tests-42 --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
+cli-relay submit --key fix-tests-42 --engine codex --cwd ~/code/app --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"' \
   --prompt "Run the unit tests and summarise failures."
 # {"accepted": true, "status": "created", "task_id": "t-…", "native_session_id": "…", "state": "accepted", …}
 
-cli-relay submit --key fix-tests-42 --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
+cli-relay submit --key fix-tests-42 --engine codex --cwd ~/code/app --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"' \
   --prompt "Run the unit tests and summarise failures."     # same key + payload: same task
 # {"status": "duplicate", "task_id": "t-…", "submit_count": 2, …}
 
@@ -25,13 +25,13 @@ cli-relay ack --consumer grok --task t-… --attempt 1 --event e-…
 cli-relay brief --consumer grok --text # read-only message lines and one batch ACK command
 cli-relay status t-…               # full record: attempts, identities, exit status, native result
 cli-relay resume t-… --prompt "Continue with the next failing test."   # exact native session
-cli-relay submit --key follow-up-1 --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
+cli-relay submit --key follow-up-1 --engine codex --cwd ~/code/app --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"' \
   --session 5b2f0c1e-… --prompt "Also update the changelog."   # next turn of an existing session
 cli-relay cancel t-…
 
 # v0.2: wake a consumer when tasks end (configuration in <home>/notifier.json, see docs/notifier.md)
 cli-relay migrate                  # once per existing v0.1 ledger: backup, then add the notifier tables
-cli-relay submit --key k --engine claude --cwd ~/code/app --prompt "…" --notify-route bot --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"'
+cli-relay submit --key k --engine codex --cwd ~/code/app --prompt "…" --notify-route bot --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"'
 cli-relay notify run --interval 60 # periodic pass (retries, reminders, catch-up after a restart)
 cli-relay notify status            # per event: transport state and consumer ACK
 ```
@@ -85,9 +85,9 @@ For example, submit the English task immediately after the Chinese task, without
 poller. The Chinese task must explicitly report business completion:
 
 ```sh
-cli-relay submit --scope friday --key what-is-dify-zh-10 --engine claude --cwd ~/code/dify --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
+cli-relay submit --scope friday --key what-is-dify-zh-10 --engine codex --cwd ~/code/dify --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"' \
   --prompt 'Write the Chinese article. End with status=ok only if fully complete; otherwise report status=partial with a separate stop_reason where needed.'
-cli-relay submit --scope friday --key what-is-dify-en-04 --engine claude --cwd ~/code/dify --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
+cli-relay submit --scope friday --key what-is-dify-en-04 --engine codex --cwd ~/code/dify --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"' \
   --after what-is-dify-zh-10 --queue articles \
   --prompt 'Write the English article from the completed Chinese article.'
 # A succeeded Chinese run reporting status=partial blocks the English task by default.
@@ -375,7 +375,7 @@ cli-relay --home /path/to/ledger route confirm github --verification-id v-… --
 cli-relay --home /path/to/ledger route set-default github  # optional, proven only
 cli-relay --home /path/to/ledger route set-fallback github friday # optional; friday must already be proven
 
-cli-relay --home /path/to/ledger submit --key issue-4 --engine claude --cwd ~/code/app --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
+cli-relay --home /path/to/ledger submit --key issue-4 --engine codex --cwd ~/code/app --task-class complex --resource-class standard --option 'model="gpt-6.1-sol"' --option 'effort="max"' --option 'sandbox="workspace-write"' \
   --prompt 'Implement the agreed change.' --notify-route github \
   --origin '{"bot":"github-bot","chat":"github-original-chat"}'
 
@@ -530,7 +530,7 @@ For Claude without cleanup, `billing_env_present` keeps its reason code and `nam
 details also contain `fix.submit_flags` (for example `--unset-env ANTHROPIC_API_KEY`),
 `fix.env_prefix` (`env -u ANTHROPIC_API_KEY`) and a `message` containing both fixes. The prefix goes
 before `cli-relay`; flags go on `submit`. The `env -u` prefix applies only to that invocation;
-use `--unset-env` to retain cleanup for future resumes. `doctor --engine claude` shows
+use `--unset-env` to retain cleanup for future resumes. `doctor --engine codex` shows
 the same hint when billing variables block it. Blocked terminal events
 include these billing preflight details too. The notification summary, which is all a command
 adapter receives, ends with the same copyable fix (`billing_env_present fix: submit with a new key
@@ -767,13 +767,9 @@ denials still mean `needs_input`; cancellation keeps its existing precedence. `s
 attempt evidence, terminal events and notification event entries carry, for example,
 `warnings: [{"code": "permission_denials", "tools": ["Monitor"]}]`. This warning includes only
 tool names; the separate `allowed_rule_denied` diagnostic can include matching Bash prefixes
-requested by the user as described above. `Monitor` is not added to the allowlist. To allow
-`WebSearch` or `WebFetch` for one task, name them:
-
-```sh
-cli-relay submit --key research-1 --engine claude --cwd ~/code/app --prompt "Compare the current options for X" --task-class highest_quality --resource-class standard --option 'model="claude-opus-5-5"' --option 'effort="max"' \
-  --option 'allowed_tools=["WebSearch","WebFetch"]'
-```
+requested by the user as described above. `Monitor` is not added to the allowlist. Historical Claude tasks can carry `allowed_tools=["WebSearch","WebFetch"]`.
+New Claude production submissions are rejected; these options remain documented for the
+stored-task adapter and do not provide a new production route.
 
 `allowed_tools` is a JSON list of exact tool names from a fixed allowlist: `Task`, `Agent`,
 `TodoWrite`, `WebSearch` and `WebFetch`. To opt into todo tracking, use
@@ -809,7 +805,7 @@ Without Task/Agent opt-in, the launcher explicitly disables native Task and Agen
   option. Submit/resume receipts, `status`/`wait` task records, new terminal/unknown event
   bodies and notifications report `allowed_tools` (`[]` by default). Like `sandbox`, it states
   the requested permissions, not proof that a tool ran.
-- `doctor` describes this policy in `claude_tool_policy`. `doctor --engine claude --cwd DIR`
+- `doctor` describes this policy in `claude_tool_policy`. `doctor --engine codex --cwd DIR`
   also reports, in `engine.network_tools`, what this machine's checked settings layers already
   say about these tools, before any task option. It reports tool names and booleans only, never
   other settings content:
@@ -830,7 +826,7 @@ Without Task/Agent opt-in, the launcher explicitly disables native Task and Agen
 New production submits require an explicit task/resource class, engine/model/effort and Codex
 sandbox. See the [routing table and migration rules](migration-20261106.md#new-production-requests).
 Use `simple` + Codex Terra/high, `complex` + Codex Sol/max (including computer use), or
-`highest_quality` + either Claude Opus 5.5/max or Claude Fable 5.2/xhigh (Extra High).
+`highest_quality` + agy `gemini-4-neon-xhigh/xhigh` (standard text tasks only).
 Unknown/deprecated models and mismatches are usage errors.
 Only `engine=fixture` has a test-only exemption. No defaults or global settings are changed.
 
@@ -838,22 +834,50 @@ Only `engine=fixture` has a test-only exemption. No defaults or global settings 
 adapter invocation settings with `verification=invocation_only`, not a provider-side observation.
 Legacy duplicates and resumes retain their payload and hash; new requests use the new contract.
 
+### agy Neon highest quality text tasks
+
+The default/recommended highest_quality dictionary entry is only
+`(agy, gemini-4-neon-xhigh, xhigh)`. As with Codex and Carbon, the CLI does not fill in
+missing fields: engine, model, effort and resource class must be supplied explicitly.
+It never inherits Claude defaults or repairs an incorrect caller-supplied model.
+
+Candidate command, **only after separate native acceptance**, in an independent PR checkout:
+
+```sh
+PYTHONPATH=. python3.14 -m cli_relay --home /absolute/new/acceptance-relay-home submit \
+  --key neon-text-01 --engine agy --task-class highest_quality --resource-class standard \
+  --cwd /absolute/new/acceptance-work \
+  --option 'model="gemini-4-neon-xhigh"' --option 'effort="xhigh"' \
+  --option require_completion_marker=true \
+  --prompt 'Return text only, use no tools and edit no files. End with CLI-RELAY-STATUS: complete.'
+```
+
+`AGY_CONTRACT` remains `None` in this PR. An installed native version is not accepted;
+missing agy still fails `cli_not_found`. The following shared adapter limits and failure
+rules apply to Neon and Carbon alike. Model absence, quota, subscription, login or
+compatibility failure stops the request with a fixed reason; no fallback or login begins.
+
 ### agy Carbon subscription text tasks
 
 Carbon is a separate, explicit request. `simple` remains Codex `gpt-6.1-terra/high`, `complex`
-remains Codex `gpt-6.1-sol/max`, and `highest_quality` remains Claude `claude-opus-5-5/max` or
-`claude-fable-5-2/xhigh`. Carbon is never a fallback for any of them.
+remains Codex `gpt-6.1-sol/max`, and `highest_quality` is agy `gemini-4-neon-xhigh/xhigh`.
+Carbon is never a fallback for any of them. Each agy class accepts only its own row(s):
 
 | task class | engine | model | effort | resource class |
 |---|---|---|---|---|
+| highest_quality | agy | gemini-4-neon-xhigh | xhigh | standard |
 | carbon | agy | gemini-4-carbon-low | low | standard |
 | carbon | agy | gemini-4-carbon-medium | medium | standard |
 | carbon | agy | gemini-4-carbon-high | high | standard |
 
-All fields are required. High is the highest Carbon tier. Missing suffixes, aliases,
-Orchestrator, `xhigh`/`max`, mismatched effort, other task classes, `computer_use`, sandbox,
+All fields are required. High is the highest Carbon tier: Carbon rejects Neon,
+Orchestrator, `xhigh` and `max`. Neon requires exactly `gemini-4-neon-xhigh` plus `xhigh`;
+Carbon IDs and Claude/Codex/Opus/Fable requests are rejected for highest_quality. Missing
+suffixes, aliases, mismatched effort, agy with simple/complex, `computer_use`, sandbox,
 Claude tools, raw argv, `--billing-mode` (including subscription) and test exemptions are usage
-errors (exit 2). `effort` is relay validation/display metadata; only the full model ID selects
+errors (exit 2). Cross-class refusals retain the original model in `detail.requested`.
+No model name or effort is corrected, lowered or substituted. `effort` is relay
+validation/display metadata; only the full model ID selects
 the native tier. No separate effort flag is sent to agy.
 
 Candidate usage, **after native acceptance on the already logged-in machine** (currently MBP):
@@ -877,7 +901,7 @@ PATH. The explicit override must be an absolute executable file; a bad or empty 
 fails without fallback. Build rechecks it. No alias or login shell is used.
 
 On Mini without agy, `doctor --engine agy --cwd DIR` fails (exit 6) with `cli_not_found` and a
-fixed message directing the user to the installed, logged-in MBP. Submit still returns
+fixed message that installed versions still need independent native acceptance. Submit still returns
 `accepted` (exit 0, an accounting receipt); the keeper closes it as `blocked`, with the reason
 in status/wait/events. Repeating the same key returns the same task without new probes or calls.
 The relay never installs, copies binaries/accounts, logs in, invokes magpie, switches providers
@@ -900,11 +924,12 @@ as `agy_non_subscription_route`. No value or referenced credential file is read 
 This initial name list alone does not prove absence of other native routes.
 
 Once a native contract is verified, probes are limited to 20 seconds and 64 KiB combined
-output per command. Only version, matching Carbon IDs, return codes and fixed reasons are
-exported. Confirmed native stderr errors can yield `agy_auth_required`,
+output per command. Only version, matching allowed Neon/Carbon IDs, return codes and fixed
+reasons are exported. Confirmed native stderr errors can yield `agy_auth_required`,
 `agy_subscription_unavailable`, `agy_quota_exhausted` or `agy_non_subscription_route`; model
 absence gives `agy_model_unavailable`. Unknown output/network failures give
-`agy_preflight_unverified`, timeouts `agy_probe_timeout`. None triggers login or retry.
+`agy_preflight_unverified`, timeouts `agy_probe_timeout`. None triggers login, retry, model
+substitution or a billing-route switch.
 Model directory visibility is not proof of inference, quota or Google's actual billing.
 
 Print stdout is UTF-8 text (the existing `stdout.jsonl` filename is retained). Normalized results
@@ -920,7 +945,7 @@ stays observed while processes may live, then `unknown` without rerun. `submit -
 refused as `agy_session_unsupported` (exit 6), ordinary resume gives `no_native_session`.
 Only `resume --fresh --confirm-rerun`, after proof that the previous process stopped, explicitly
 spends quota again. Shared capacity, scopes, queues and dependencies use the existing ledger.
-See [the pending native acceptance checklist](acceptance.md#2026-11-19-agy-carbon-candidate).
+See [the pending native acceptance checklist](acceptance.md#2026-11-21-neon--highest_quality-candidate).
 
 ### Business status
 
@@ -1080,7 +1105,7 @@ python3 -m unittest discover -s tests -t tests -v   # fixture engine, real OS pr
 python3 scripts/soak.py run --dir /tmp/soak --hours 0.03                   # scaled-down soak
 python3 scripts/soak.py start --dir ~/soak-cli-relay --hours 25            # the real 25 h soak
 python3 scripts/soak.py verdict --dir ~/soak-cli-relay                     # re-check a finished soak
-python3 scripts/real_cli_acceptance.py --engine claude --notify --home DIR --workdir DIR --out result.json
+python3 scripts/real_cli_acceptance.py --engine codex --notify --home DIR --workdir DIR --out result.json
 ```
 
 `soak.py run`, `soak.py verdict` and `real_cli_acceptance.py` exit with status 0 only on PASS.

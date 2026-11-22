@@ -43,25 +43,25 @@ class ProductionTiers(unittest.TestCase):
             with self.assertRaises(UsageError):
                 policy.validate_new(self.payload(tier, 'computer_use'))
 
-    def test_highest_quality_also_allows_fable_extra(self):
-        p = self.payload('highest_quality')
-        p['options']['model'] = 'claude-fable-5-2'
-        p['options']['effort'] = 'xhigh'
-        policy.validate_new(p)
-        settings = policy.settings(p['engine'], p)['effective_settings']
-        self.assertEqual((settings['engine'], settings['model'], settings['effort']),
-                         ('claude', 'claude-fable-5-2', 'xhigh'))
-        self.assertEqual(policy.TIERS['highest_quality'][0], ('claude', 'claude-opus-5-5', 'max'))
-        for model, effort in (('claude-fable-5-2', 'max'), ('claude-opus-5-5', 'xhigh'),
-                              ('claude-fable-5-2', 'high'), ('claude-fable-5-1', 'xhigh')):
+    def test_highest_quality_default_is_only_neon_and_rejects_old_tiers(self):
+        self.assertEqual(policy.tier('highest_quality'), ('agy', 'gemini-4-neon-xhigh', 'xhigh'))
+        self.assertEqual(len(policy.TIERS['highest_quality']), 1)
+        for engine, model, effort in (
+                ('claude', 'claude-opus-5-5', 'max'), ('claude', 'claude-opus-5-5', 'xhigh'),
+                ('claude', 'claude-fable-5-2', 'xhigh'), ('claude', 'claude-fable-5-2', 'max'),
+                ('codex', 'gpt-6.1-sol', 'max'), ('codex', 'gemini-4-neon-xhigh', 'xhigh'),
+                ('agy', 'gemini-4-neon-xhigh', 'high'), ('agy', 'gemini-4-neon-xhigh', 'max'),
+                ('agy', 'gemini-4-carbon-high', 'high')):
             bad = self.payload('highest_quality')
+            bad['engine'] = engine
             bad['options']['model'] = model
             bad['options']['effort'] = effort
-            with self.subTest(model=model, effort=effort), self.assertRaises(UsageError):
+            with self.subTest(engine=engine, model=model, effort=effort), self.assertRaises(UsageError):
                 policy.validate_new(bad)
         for task_class in ('simple', 'complex'):
             other = self.payload(task_class)
-            other['options']['model'] = 'claude-fable-5-2'
+            other['engine'] = 'agy'
+            other['options']['model'] = 'gemini-4-neon-xhigh'
             other['options']['effort'] = 'xhigh'
             with self.subTest(task_class=task_class), self.assertRaises(UsageError):
                 policy.validate_new(other)
@@ -167,7 +167,7 @@ class SharedCapacity(unittest.TestCase):
                            outcome='succeeded', native={'result':'status=ok'}, **extra)
 
     def test_cross_scope_simultaneous_starts_and_mixed_engines_total_two(self):
-        attempts = [self.submit(str(i), engine='codex' if i % 2 else 'claude') for i in range(8)]
+        attempts = [self.submit(str(i), engine='codex' if i % 2 else 'agy') for i in range(8)]
         barrier = threading.Barrier(len(attempts))
         def claim(att):
             db = Ledger(self.home)
@@ -191,7 +191,7 @@ class SharedCapacity(unittest.TestCase):
 
     def test_memory_allows_four_cross_scope_simultaneous_starts_with_hard_cap(self):
         with patch.dict(os.environ, {'CLI_RELAY_LOCAL_HARD_MAX': '4'}):
-            attempts = [self.submit(str(i), engine='codex' if i % 2 else 'claude') for i in range(8)]
+            attempts = [self.submit(str(i), engine='codex' if i % 2 else 'agy') for i in range(8)]
             barrier = threading.Barrier(len(attempts))
             def claim(att):
                 with contextlib.closing(Ledger(self.home)) as db:

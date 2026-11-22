@@ -6,25 +6,30 @@ The relay schema/version stays compatible; no historical ledger rewrite or new m
 
 ## New production requests
 
-Every new Codex/Claude submit needs `--task-class` and `--resource-class`, plus explicit model
+Every new production submit needs `--task-class` and `--resource-class`, plus explicit model
 and effort. Codex also needs an explicit sandbox. The relay validates; it does not classify prose.
 
 | task class | engine | model | effort |
 |---|---|---|---|
 | simple | codex | gpt-6.1-terra | high |
 | complex | codex | gpt-6.1-sol | max |
-| highest_quality | claude | claude-opus-5-5 | max |
-| highest_quality | claude | claude-fable-5-2 | xhigh |
+| highest_quality | agy | gemini-4-neon-xhigh | xhigh |
 
-The `highest_quality` class accepts either listed combination; Opus 5.5/max remains valid.
-Simple and complex Codex tiers are unchanged.
+The 2026-11-21 candidate replaces highest_quality's Claude Opus/Fable production mapping
+with exactly the Neon combination above. New Claude/Codex/Fable/Opus highest_quality
+requests are rejected rather than rewritten. Simple and complex Codex tiers are unchanged.
+The dictionary's recommended highest_quality entry is Neon/xhigh, but all fields are still
+required explicitly: no engine/model/effort defaults are inserted by the CLI.
 
 The 2026-11-19 candidate adds a separate opt-in `carbon` class with engine `agy`, standard
 resources and exactly `gemini-4-carbon-low/low`, `gemini-4-carbon-medium/medium` or
-`gemini-4-carbon-high/high`. It does not extend or reorder the three tiers above (Fable stays
-xhigh). Fixture cannot claim the Carbon class. No schema change, payload/hash rewrite, ledger
+`gemini-4-carbon-high/high`. Carbon remains separate from the three tiers above; neither
+Carbon nor Neon is a fallback for the other. Carbon rejects xhigh/max/Orchestrator and Neon;
+highest_quality rejects all Carbon IDs. Fixture cannot claim the Carbon class.
+No schema change, payload/hash rewrite, ledger
 migration, installed-binary replacement or host configuration change is required.
-Native agy capability/Ultra subscription acceptance is pending; missing agy fails
+Native agy capability/subscription acceptance is pending; `AGY_CONTRACT` remains `None`;
+missing agy fails
 `cli_not_found`, a found but unverified CLI fails `agy_capability_unverified`. See
 [explicit usage and gates](usage.md#agy-carbon-subscription-text-tasks).
 
@@ -41,7 +46,10 @@ on receipts/new terminal observations. Existing stored records are not backfille
 
 `engine=fixture` is the only tier exemption: it cannot call a provider. It records a reason and
 `verification=no_provider`. An optional `--test-only-reason` is accepted only for this engine.
-Fake provider CLI tests use real tier arguments; there is no production exemption flag.
+Codex and agy fake-provider tests use current tier arguments. Historical Claude adapter
+regressions load a test-only synthetic admission map in their isolated child processes;
+that support directory is outside the installed package and is absent from routing tests.
+There is no production exemption flag.
 
 Known keys preserve their original identity and hashes, including legacy payloads. A matching
 legacy duplicate is accepted; a changed payload still conflicts. New keys use the new policy.

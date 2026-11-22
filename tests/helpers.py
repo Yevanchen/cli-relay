@@ -67,6 +67,11 @@ def base_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     if os.environ.get("TMPDIR"):
         env["TMPDIR"] = os.environ["TMPDIR"]
     env.update(extra or {})
+    if env.get("CLI_RELAY_CLAUDE_BIN"):
+        # Legacy Claude adapter regressions use synthetic admission in child processes,
+        # like agy's synthetic contract. Production routing tests never load this path.
+        support = str(REPO / "tests" / "legacy_claude_fixture")
+        env["PYTHONPATH"] = support + os.pathsep + env["PYTHONPATH"]
     return env
 
 
@@ -163,7 +168,10 @@ class RelayTestCase(unittest.TestCase):
 
 
 def production_options(engine: str) -> Dict[str, Any]:
-    """Explicit §1.7 settings for deterministic fake CLIs; never an exemption."""
+    """Current Codex settings or historical Claude settings for deterministic fake CLIs.
+
+    The latter require the test-only synthetic admission map, never production support.
+    """
     return {"model": "gpt-6.1-sol" if engine == "codex" else "claude-opus-5-5", "effort": "max",
             **({"sandbox": "read-only"} if engine == "codex" else {})}
 
