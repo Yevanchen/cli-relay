@@ -227,7 +227,9 @@ class UnsetEnvRoundTrip(RelayTestCase):
     def test_billing_blocks_without_flag_and_event_and_doctor_include_copyable_fixes(self):
         for engine in ("claude",):
             names = list(engines.BILLING_ENV[engine])
-            env = base_env(dict.fromkeys(names, CANARY))
+            # Historical Claude admission is synthetic; no native CLI may be reached.
+            env = base_env({**dict.fromkeys(names, CANARY),
+                            "CLI_RELAY_CLAUDE_BIN": str(recording_cli(self.tmp, engine))})
             done = self.finish(self.cli(*self.args(engine, engine), env=env))
             self.assertEqual(done["task"]["state"], "blocked")
             doctor = self.cli("doctor", "--engine", engine, "--cwd", str(self.work), env=env, expect=6)
@@ -244,7 +246,8 @@ class UnsetEnvRoundTrip(RelayTestCase):
         names = list(engines.BILLING_ENV["claude"])
         flags = " ".join("--unset-env " + name for name in names)
         prefix = "env " + " ".join("-u " + name for name in names)
-        env = base_env(dict.fromkeys(names, CANARY))
+        env = base_env({**dict.fromkeys(names, CANARY),
+                        "CLI_RELAY_CLAUDE_BIN": str(recording_cli(self.tmp, "claude"))})
         done = self.finish(self.cli(*self.args("summary-fix", "claude"), env=env))
         self.assertEqual(done["task"]["state"], "blocked")
         summary = notification(done)["summary"]
