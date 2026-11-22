@@ -10,6 +10,59 @@ Three kinds of evidence are reported separately and never stand in for one anoth
 
 Status words: **PASS**, **FAIL**, **NOT RUN** (with the reason), **RUNNING**.
 
+## 2026-11-21 Neon / highest_quality candidate
+
+Source: `feat/agy-neon-highest-quality-20261121`, based on main
+`724dda29402cdc0931ca8fef8d82f63416cb1999` (PR #39). The exact head is recorded in the
+PR and task-local `out/result.json`. Implementation and isolated tests run on Evan's Mac mini
+(`85867a37-aebc-4093-aaaf-55d3c1e710b4`, user `evanmore`). No merge or deployment is part
+of this change. Production `current`, ledgers, notifier, secrets, LaunchAgents, registry and
+Codex/agy/magpie logins/configuration are not changed. No real agy inference runs on Mini.
+
+The three-tier dictionary keeps its order: simple = `(codex, gpt-6.1-terra, high)`, complex =
+`(codex, gpt-6.1-sol, max)` including computer use, highest_quality =
+`(agy, gemini-4-neon-xhigh, xhigh)` only. Carbon remains explicit opt-in with its three
+suffix/effort pairs below. New Claude Opus/Fable highest_quality requests are refused. Model
+and effort are never rewritten across classes or on failure. Consistent with the existing
+Codex/Carbon CLI, missing engine/model/effort is a usage error; the recommended dictionary
+entry is not an automatic CLI default. See the [complete Neon command](usage.md#agy-neon-highest-quality-text-tasks).
+If this PR merges, PR #38's Fable/Opus production mapping is superseded and #38 should not
+be merged. This task does not change, rebase, close or merge #38.
+
+`AGY_CONTRACT` remains **None**, with no runtime override. Fake 1.5.11 contracts are
+in-process test evidence only. Every Native 1.5.11 gate below remains **NOT RUN** in this PR:
+this task is implemented on Mini; native acceptance belongs to a subsequent MBP task using
+an **independent checkout of this PR branch**, never the production `current` installation.
+The MBP is `chenxiefandeMacBook Pro`, machineId `7ea98ea5-7114-4c4b-8120-91c2c6ae38f2`,
+user `chenxiefan`. Do not copy its binary or credentials to Mini, start login, use
+`magpie accounts add antigravity`, or change either machine's configuration.
+
+The earlier MBP doctor result `agy_capability_unverified` is historical and remains the
+expected result for an installed, unverified native version. It is not native acceptance
+and is not rerun on Mini. Mini's missing-executable check uses a new temporary relay home,
+an invalid/empty `CLI_RELAY_AGY_BIN` and isolated PATH; it is an **environment-isolation
+test**, neither native acceptance nor an MBP machine test. No real binary is moved or renamed.
+
+The helper's default is gated preflight only, with no model requests. In a future reviewed
+compatibility checkout, a verified safe model-directory probe records only exact allowed-ID
+presence (including `gemini-4-neon-xhigh`), not identity or a full directory dump. A missing
+contract leaves presence unknown and records NOT RUN without any probe.
+
+```sh
+# Future MBP independent checkout; new task-local directories only. No inference by default.
+python3.14 scripts/agy_acceptance.py --dir /absolute/new/mbp-neon-check --task-class highest_quality
+python3.14 scripts/agy_acceptance.py --dir /absolute/new/mbp-carbon-check --task-class carbon
+```
+
+Only after the native gates have independent evidence, a separate compatibility change has
+been reviewed, and the native contract/parsers are installed in that independent checkout may
+an explicitly authorized MBP task consider `--run-models`. The flag cannot bypass None.
+`--task-class carbon --run-models` selects only the three exact Carbon pairs;
+`--task-class highest_quality --run-models` selects only the exact Neon xhigh pair.
+Never test Neon by changing a Carbon request, or test Carbon by lowering a Neon request.
+Any missing model, quota, subscription, auth or capability failure stops with a fixed reason,
+without changing the model/billing route or initiating login. No such run occurs in this task.
+
 ## 2026-11-19 agy Carbon candidate
 
 Source: branch `feat/agy-carbon-subscription-20261119`, based on main
@@ -18,9 +71,10 @@ Source: branch `feat/agy-carbon-subscription-20261119`, based on main
 has not been merged or deployed. No MBP connection, native inference, login, credential read,
 installed cli-relay change, or Codex/agy/magpie configuration change was made.
 
-The original `simple`, `complex`, `highest_quality` dictionary and order are asserted exactly,
-including Fable 5.2/xhigh. Carbon is a separate agy/standard opt-in with three exact suffix/effort
-pairs. `AGY_CONTRACT=None` intentionally blocks every installed native version before probes.
+That historical candidate preserved the then-current three-tier dictionary, including
+Fable 5.2/xhigh; the 2026-11-21 candidate above replaces its highest_quality entry.
+Carbon remains a separate agy/standard opt-in with three exact suffix/effort pairs.
+`AGY_CONTRACT=None` intentionally blocks every installed native version before probes.
 The 1.5.11 synthetic contract used in tests is not evidence for real agy 1.5.11 compatibility.
 No public option, environment flag or acceptance-script flag can bypass that gate.
 
@@ -43,8 +97,9 @@ copy an account/binary, open a login flow, or change the expected custom Codex/m
 | Print input/output | verified exact print/model syntax, stdin consumption once (including leading `-`, Unicode and multi-line input), UTF-8 stdout/stderr and exit behavior | NOT RUN |
 | Tool/authorization behavior | standard single text task cannot launch authorization or execute unapproved built-in tools; an empty plugin list does not prove this | NOT RUN |
 | Subscription isolation | native subscription evidence and no implicit API/key/Vertex/proxy fallback; names-only environment checks are insufficient alone | NOT RUN |
-| Model directory | exact low/medium/high IDs on the current native login; no identity or directory dump retained | NOT RUN |
-| Three tiny native requests | each complete ID, exit 0 and nonempty text; high is the maximum, no xhigh/max/Orchestrator trials | NOT RUN |
+| Model directory | presence of exact `gemini-4-carbon-low`, `gemini-4-carbon-medium`, `gemini-4-carbon-high`, `gemini-4-neon-xhigh` on the current native login; no identity or full directory dump retained | NOT RUN (Mini implementation; future MBP independent PR checkout) |
+| Three tiny Carbon native requests | carbon class only: `gemini-4-carbon-low` + low, `gemini-4-carbon-medium` + medium, `gemini-4-carbon-high` + high; each exit 0 and nonempty text. High is Carbon's maximum; no xhigh/max/Orchestrator or Neon trials on this path | NOT RUN (future MBP task only) |
+| One tiny Neon native request | highest_quality only: exact `gemini-4-neon-xhigh` + xhigh; exit 0 and nonempty text. No Carbon model, alias, lower effort or substitution | NOT RUN (future MBP task only) |
 | Detached end-to-end relay | same user's native context, effective settings, terminal event, completion marker, business report and duplicate key | NOT RUN |
 | Cancellation/group | independent harmless task, only if its duration allows; record NOT RUN if too fast | NOT RUN |
 
@@ -53,13 +108,16 @@ compatibility change populate the internal contract and native parsers. Unknown 
 `agy_capability_unverified`; unproven billing isolation stays `agy_subscription_unverified`.
 Never substitute a successful logged-in request for unauthenticated failure safety.
 
-The separate helper does not alter `real_cli_acceptance.py`'s Claude/Codex exact-resume contract:
+The separate agy helper does not support native sessions. `real_cli_acceptance.py` retains
+Codex/fixture exact-resume checks; retired `--engine claude` now exits NOT RUN before any
+probe or submit:
 
 ```sh
 # Default: gated preflight and NOT RUN report only; --dir must not already exist.
 python3.14 scripts/agy_acceptance.py --dir /absolute/new/task-local-acceptance
-# Future MBP-only, after compatibility evidence has been reviewed; explicitly consumes quota.
-python3.14 scripts/agy_acceptance.py --dir /absolute/new/mbp-acceptance --run-models
+# Future MBP-only, after a separately reviewed native contract; explicitly consumes quota.
+python3.14 scripts/agy_acceptance.py --dir /absolute/new/mbp-carbon-acceptance --task-class carbon --run-models
+python3.14 scripts/agy_acceptance.py --dir /absolute/new/mbp-neon-acceptance --task-class highest_quality --run-models
 ```
 
 The helper writes `report.json` with source SHA, safe capability fields, fixed failure reasons,
@@ -67,7 +125,7 @@ PASS/FAIL/NOT RUN and per-model invocation/exit evidence. It never logs in, inst
 credentials, sets a notifier, sends a message or attempts native sessions. Missing/unverified
 capabilities exit 3 (NOT RUN); the real CLI `doctor` still uses exit 6. A timed-out acceptance
 wait requests cancellation explicitly and does not resend the prompt. Passing the short soak
-or fake tests is not Carbon subscription acceptance; no 25-hour native soak is claimed.
+or fake tests is not Neon/Carbon subscription acceptance; no 25-hour native soak is claimed.
 
 ## Code under test
 
@@ -87,7 +145,6 @@ or fake tests is not Carbon subscription acceptance; no 25-hour native soak is c
 ```sh
 python3 -m unittest discover -s tests -t tests -v                       # ~4 min, fixture engine and a local fake webhook
 python3 scripts/soak.py run --dir SOAK --hours 0.03                     # scaled-down soak, exit 0 only on PASS
-python3 scripts/real_cli_acceptance.py --engine claude --notify --home H --workdir W --out claude.json
 python3 scripts/real_cli_acceptance.py --engine codex  --notify --home H --workdir W --out codex.json
 python3 scripts/soak.py start --dir SOAK25 --hours 25                   # the real 25 h soak
 python3 scripts/soak.py verdict --dir SOAK25                            # evaluate it when finished

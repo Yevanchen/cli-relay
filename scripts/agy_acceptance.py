@@ -40,7 +40,10 @@ def relay(home, *args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dir', required=True, type=Path, help='new acceptance directory; existing paths refused')
-    parser.add_argument('--run-models', action='store_true', help='explicitly spend subscription quota on three tiny text tasks')
+    parser.add_argument('--task-class', choices=('carbon', 'highest_quality'), default='carbon',
+                        help='select Carbon low/medium/high or the single exact Neon xhigh request; never substitutes models')
+    parser.add_argument('--run-models', action='store_true',
+                        help='explicitly spend subscription quota on the selected class, only after native gates pass')
     args = parser.parse_args(argv)
     directory = args.dir.expanduser().resolve()
     try:
@@ -49,7 +52,8 @@ def main(argv=None):
         parser.error('--dir must be a new writable directory, never a production relay home')
     home, work = directory / 'relay-home', directory / 'work'
     work.mkdir()
-    report = {'engine': 'agy', 'started_at': timestamp(), 'source_sha': source_sha(),
+    combinations = policy.CARBON_TIERS['carbon'] if args.task_class == 'carbon' else policy.TIERS['highest_quality']
+    report = {'engine': 'agy', 'task_class': args.task_class, 'started_at': timestamp(), 'source_sha': source_sha(),
               'verification': 'invocation_only', 'steps': []}
 
     def finish(code):
@@ -60,19 +64,32 @@ def main(argv=None):
 
     try:
         pf = engines.preflight('agy', dict(os.environ), cwd=str(work))
-        report['preflight'] = {'ok': pf.ok, 'reason': pf.reason, **pf.detail}
+        # Only presence of these exact IDs is retained, never an identity or full directory dump.
+        visible = pf.detail.get('models')
+        report['model_presence'] = {model: (model in visible if visible is not None else None)
+                                    for _, model, _ in policy.AGY_COMBINATIONS}
+        report['preflight'] = {'ok': pf.ok, 'reason': pf.reason,
+                               **{key: value for key, value in pf.detail.items() if key != 'models'}}
         report['command_structure'] = 'doctor --engine agy --cwd <acceptance-work>'
         if not pf.ok or not args.run_models:
             reason = pf.reason or 'explicit --run-models required'
-            for _, model, _ in policy.CARBON_TIERS['carbon']:
-                report['steps'].append({'model': model, 'verdict': 'NOT RUN', 'reason': reason})
+            for _, model, effort in combinations:
+                report['steps'].append({'model': model, 'effort': effort, 'verdict': 'NOT RUN', 'reason': reason})
+            return finish(3)
+
+        if any(report['model_presence'][model] is not True for _, model, _ in combinations):
+            report['reason'] = 'agy_model_unavailable'
+            for _, model, effort in combinations:
+                report['steps'].append({'model': model, 'effort': effort, 'verdict': 'NOT RUN',
+                                        'reason': 'agy_model_unavailable'})
             return finish(3)
 
         rc, _ = relay(home, 'init')
         if rc != 0:
             return finish(1)
-        for _, model, effort in policy.CARBON_TIERS['carbon']:
-            command = ['submit', '--key', 'acceptance-' + effort, '--engine', 'agy', '--task-class', 'carbon',
+        for _, model, effort in combinations:
+            command = ['submit', '--key', 'acceptance-' + args.task_class + '-' + effort,
+                '--engine', 'agy', '--task-class', args.task_class,
                 '--resource-class', 'standard', '--cwd', str(work), '--option', 'model=' + json.dumps(model),
                 '--option', 'effort=' + json.dumps(effort), '--option', 'require_completion_marker=true',
                 '--prompt', '只回复短文本，不使用工具、不编辑文件。最后一行写 CLI-RELAY-STATUS: complete。']

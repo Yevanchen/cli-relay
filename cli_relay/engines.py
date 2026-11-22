@@ -163,11 +163,11 @@ AGY_BLOCKED_REASONS = frozenset({
     "agy_non_subscription_route", "agy_subscription_unverified",
 })
 AGY_MESSAGES = {
-    "cli_not_found": "本机未发现可执行 agy。当前仅已安装并登录 agy 的 MBP 可用。请在该机提交；relay 不安装、不连接远端。",
+    "cli_not_found": "本机未发现可执行 agy。relay 不安装、不连接远端；已安装版本仍需独立非交互验收。",
     "agy_capability_unverified": "此 agy 版本的非交互能力尚未验收。未启动任务。",
     "agy_auth_required": "本机 agy 未登录或登录已失效。任务已停止，未触发登录。",
-    "agy_subscription_unavailable": "当前 agy 订阅不能使用所请求的 Carbon 模型。",
-    "agy_model_unavailable": "所请求的完整 Carbon 模型不可用；未替换模型。",
+    "agy_subscription_unavailable": "当前 agy 订阅不能使用所请求的模型；未替换模型或切换计费路径。",
+    "agy_model_unavailable": "所请求的完整 agy 模型不可用；未替换模型或 effort。",
     "agy_quota_exhausted": "当前订阅额度或速率受限。任务已停止，未切换计费路径。",
     "agy_non_subscription_route": "当前进程存在与订阅路径冲突的路由设置。只报告变量名。",
 }
@@ -277,7 +277,7 @@ def _agy_preflight(env: Dict[str, str], cwd: Optional[str], options: Dict[str, A
         models = None
     if models is None:
         return _agy_failure("agy_preflight_unverified", returncode=rc, **detail)
-    visible = [model for _, model, _ in policy.CARBON_TIERS["carbon"] if model in models]
+    visible = [model for _, model, _ in policy.AGY_COMBINATIONS if model in models]
     detail.update(models=visible, returncode=rc)
     if opts.get("model") and opts["model"] not in visible:
         return _agy_failure("agy_model_unavailable", **detail)
@@ -420,9 +420,12 @@ def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str]
     if "effort" in clean and clean["effort"] not in EFFORT_LEVELS:
         raise UsageError("effort must be low, medium, high, xhigh or max", allowed=list(EFFORT_LEVELS))
     if engine == "agy" and ("model" in clean or "effort" in clean):
-        if (engine, clean.get("model"), clean.get("effort")) not in policy.CARBON_TIERS["carbon"]:
-            raise UsageError("agy requires an exact gemini-4-carbon-low|medium|high model and matching "
-                             "low|medium|high effort; no defaults, xhigh/max or Orchestrator")
+        if (engine, clean.get("model"), clean.get("effort")) not in policy.AGY_COMBINATIONS:
+            raise UsageError("agy requires gemini-4-neon-xhigh with xhigh effort for highest_quality, "
+                             "or an exact gemini-4-carbon-low|medium|high model with matching "
+                             "low|medium|high effort for carbon; no defaults, aliases, max or Orchestrator",
+                             requested={"engine": engine, "model": clean.get("model"),
+                                        "effort": clean.get("effort")})
     for key in ("side_effect_file", "descendant_pid_file"):
         if engine == "fixture" and key in clean and not os.path.isabs(clean[key]):
             raise UsageError(f"{key} must be an absolute path")

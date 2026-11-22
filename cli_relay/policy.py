@@ -9,10 +9,7 @@ from .errors import UsageError
 TIERS = {
     "simple": (("codex", "gpt-6.1-terra", "high"),),
     "complex": (("codex", "gpt-6.1-sol", "max"),),
-    "highest_quality": (
-        ("claude", "claude-opus-5-5", "max"),
-        ("claude", "claude-fable-5-2", "xhigh"),
-    ),
+    "highest_quality": (("agy", "gemini-4-neon-xhigh", "xhigh"),),
 }
 
 # Carbon is explicit opt-in and never a default or fallback for one of the original tiers.
@@ -20,6 +17,7 @@ CARBON_TIERS = {
     "carbon": tuple(("agy", f"gemini-4-carbon-{effort}", effort) for effort in ("low", "medium", "high")),
 }
 TASK_CLASSES = (*TIERS, *CARBON_TIERS)
+AGY_COMBINATIONS = (*TIERS["highest_quality"], *CARBON_TIERS["carbon"])
 
 
 def tier(task_class: str, index: int = 0) -> tuple:
@@ -56,8 +54,8 @@ def validate_new(payload: Dict[str, Any]) -> None:
     if not isinstance(task_class, str) or task_class not in TASK_CLASSES:
         raise UsageError("new production submits require --task-class " + "|".join(TASK_CLASSES),
                          tiers=TIERS, carbon_tiers=CARBON_TIERS)
-    if engine == "agy" and task_class != "carbon":
-        raise UsageError("engine=agy requires the explicit --task-class carbon")
+    if engine == "agy" and task_class not in ("carbon", "highest_quality"):
+        raise UsageError("engine=agy requires the explicit --task-class carbon or highest_quality")
     if "resource_class" not in payload:
         raise UsageError("new production submits require --resource-class standard|computer_use")
     allowed = CARBON_TIERS[task_class] if task_class == "carbon" else TIERS[task_class]
@@ -67,6 +65,7 @@ def validate_new(payload: Dict[str, Any]) -> None:
         raise UsageError("engine/model/effort must match the explicit task class; no defaults or deprecated models "
                          "(including gpt-6-astra). Use a listed combination for the tier exactly",
                          expected=[{"engine": e, "model": m, "effort": f} for e, m, f in allowed],
+                         requested={"engine": engine, "model": actual[1], "effort": actual[2]},
                          task_class=task_class)
     if payload["resource_class"] == "computer_use" and task_class != "complex":
         raise UsageError("computer_use requires task_class=complex, codex gpt-6.1-sol/max")

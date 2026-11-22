@@ -1,4 +1,4 @@
-"""Carbon opt-in and print adapter. Synthetic contracts only; no native CLI or credentials.
+"""Neon highest_quality, Carbon opt-in and print adapter. Synthetic contracts only.
 
 The fake contract is deliberately unlike an asserted agy output format. It is injected only
 inside these test processes; production has no switch to bypass the pending acceptance gates.
@@ -25,6 +25,7 @@ from cli_relay.ledger import Ledger, init_ledger
 
 
 MODELS = [model for _, model, _ in policy.CARBON_TIERS['carbon']]
+NEON = 'gemini-4-neon-xhigh'
 
 
 def fake_version(text):
@@ -69,7 +70,7 @@ if args == ['--version']:
         print('X' * 100000)
 elif args == ['models']:
     print(os.environ.get('AGY_FAKE_MODELS', json.dumps({'test_models':
-        ['gemini-4-carbon-' + e for e in ('low', 'medium', 'high')]})))
+        ['gemini-4-neon-xhigh'] + ['gemini-4-carbon-' + e for e in ('low', 'medium', 'high')]})))
     print(os.environ.get('AGY_FAKE_PROBE_STDERR', ''), file=sys.stderr)
     sys.exit(int(os.environ.get('AGY_FAKE_PROBE_EXIT', '0')))
 elif args and args[0] == '--print':
@@ -151,9 +152,12 @@ class AgyCase(unittest.TestCase):
         self.assertEqual(code, expect, data)
         return data
 
-    def submit(self, key='carbon', *, effort='high', prompt='synthetic prompt', options=None, extra=(), expect=0):
-        opts = {'model': f'gemini-4-carbon-{effort}', 'effort': effort, **(options or {})}
-        args = ['submit', '--key', key, '--engine', 'agy', '--task-class', 'carbon',
+    def submit(self, key='carbon', *, task_class='carbon', effort=None, prompt='synthetic prompt',
+               options=None, extra=(), expect=0):
+        effort = effort or ('xhigh' if task_class == 'highest_quality' else 'high')
+        model = NEON if task_class == 'highest_quality' else f'gemini-4-carbon-{effort}'
+        opts = {'model': model, 'effort': effort, **(options or {})}
+        args = ['submit', '--key', key, '--engine', 'agy', '--task-class', task_class,
                 '--resource-class', 'standard', '--cwd', str(self.work), '--prompt', prompt]
         for name, value in opts.items():
             args += ['--option', name + '=' + json.dumps(value)]
@@ -168,11 +172,11 @@ class AgyCase(unittest.TestCase):
 
 
 class CarbonPolicy(AgyCase):
-    def test_original_tiers_values_and_order_are_unchanged(self):
+    def test_three_tiers_order_and_new_neon_default(self):
         self.assertEqual(list(policy.TIERS.items()), [
             ('simple', (('codex', 'gpt-6.1-terra', 'high'),)),
             ('complex', (('codex', 'gpt-6.1-sol', 'max'),)),
-            ('highest_quality', (('claude', 'claude-opus-5-5', 'max'), ('claude', 'claude-fable-5-2', 'xhigh')))])
+            ('highest_quality', (('agy', NEON, 'xhigh'),))])
         self.assertEqual(policy.TASK_CLASSES, ('simple', 'complex', 'highest_quality', 'carbon'))
 
     def test_exact_three_carbon_combinations_and_settings(self):
@@ -236,6 +240,51 @@ class CarbonPolicy(AgyCase):
         self.assertIn('carbon', text.getvalue())
         self.assertFalse(self.calls())
 
+    def test_cross_class_requests_preserve_model_in_refusal_and_never_spawn(self):
+        for task_class, model, effort in [('carbon', NEON, 'xhigh'),
+                                          ('highest_quality', MODELS[2], 'high')]:
+            with self.subTest(task_class=task_class):
+                refused = self.submit(task_class=task_class, options={'model': model, 'effort': effort}, expect=2)
+                self.assertEqual(refused['detail']['requested'], {'engine': 'agy', 'model': model, 'effort': effort})
+                self.assertEqual(refused['detail']['task_class'], task_class)
+        self.assertFalse(self.db.open_attempts())
+        self.assertFalse(self.calls())
+
+    def test_highest_quality_requires_explicit_fields_and_help_gives_neon_command(self):
+        valid = ['submit', '--key', 'neon', '--engine', 'agy', '--task-class', 'highest_quality',
+                 '--resource-class', 'standard', '--cwd', str(self.work), '--prompt', 'p',
+                 '--option', 'model="gemini-4-neon-xhigh"', '--option', 'effort="xhigh"']
+        for flag, value in [('--engine', 'agy'), ('--option', 'model="gemini-4-neon-xhigh"'),
+                            ('--option', 'effort="xhigh"')]:
+            args = list(valid)
+            index = args.index(value)
+            del args[index - 1:index + 1]
+            self.command(*args, expect=2)
+        text = io.StringIO()
+        with contextlib.redirect_stdout(text), self.assertRaises(SystemExit):
+            cli.build_parser().parse_args(['submit', '--help'])
+        self.assertIn('gemini-4-neon-xhigh', text.getvalue())
+        self.assertIn('effort=xhigh', text.getvalue())
+        self.assertFalse(self.calls())
+
+    def test_cli_rejects_old_engines_neon_efforts_and_agy_simple_complex(self):
+        for engine, model, effort, task_class in [
+                ('claude', 'claude-opus-5-5', 'max', 'highest_quality'),
+                ('claude', 'claude-fable-5-2', 'xhigh', 'highest_quality'),
+                ('claude', 'claude-fable-5-2', 'max', 'highest_quality'),
+                ('codex', 'gpt-6.1-sol', 'max', 'highest_quality'),
+                *[('agy', NEON, effort, 'highest_quality') for effort in ('low', 'medium', 'high', 'max')],
+                *[('agy', NEON, 'xhigh', task_class) for task_class in ('simple', 'complex')]]:
+            with self.subTest(engine=engine, model=model, effort=effort, task_class=task_class):
+                args = ['submit', '--key', 'invalid', '--engine', engine, '--task-class', task_class,
+                        '--resource-class', 'standard', '--cwd', str(self.work), '--prompt', 'p',
+                        '--option', 'model=' + json.dumps(model), '--option', 'effort=' + json.dumps(effort)]
+                if engine == 'codex':
+                    args += ['--option', 'sandbox="read-only"']
+                self.assertEqual(self.command(*args, expect=2)['error'], 'usage')
+        self.assertFalse(self.db.open_attempts())
+        self.assertFalse(self.calls())
+
 
 class AgyPreflight(AgyCase):
     def test_discovery_order_absolute_paths_and_bad_override_no_fallback(self):
@@ -295,7 +344,7 @@ class AgyPreflight(AgyCase):
             pf = self.preflight()
             doctor = self.command('doctor', '--engine', 'agy', '--cwd', str(self.work))
         self.assertTrue(pf.ok, pf)
-        self.assertEqual(pf.detail['models'], MODELS)
+        self.assertEqual(pf.detail['models'], [NEON, *MODELS])
         self.assertEqual(doctor['engine']['agy_version'], '1.5.11')
         self.assertTrue(all(c['argv'] in (['--version'], ['models']) and not c['tty'] for c in self.calls()))
         self.assertFalse(self.print_calls())
@@ -424,6 +473,52 @@ class AgyPrint(AgyCase):
 
 
 class AgyIntegration(AgyCase):
+    def test_neon_exact_settings_argv_receipt_event_and_duplicate(self):
+        sub = self.submit('neon', task_class='highest_quality', options={'require_completion_marker': True})
+        done = self.settle(sub['task_id'], 'succeeded')
+        settings = sub['effective_settings']
+        self.assertEqual((settings['engine'], settings['model'], settings['effort'], settings['task_class']),
+                         ('agy', NEON, 'xhigh', 'highest_quality'))
+        self.assertEqual(done['task']['effective_settings'], settings)
+        self.assertEqual(done['events'][0]['body']['effective_settings'], settings)
+        self.assertEqual(self.print_calls()[0]['argv'], ['--print', '--model', NEON])
+        calls = self.calls()
+        self.assertEqual(self.submit('neon', task_class='highest_quality',
+                                    options={'require_completion_marker': True})['status'], 'duplicate')
+        self.assertEqual(self.calls(), calls)
+
+    def test_neon_missing_from_carbon_only_catalog_blocks_without_replacement(self):
+        self.env['AGY_FAKE_MODELS'] = json.dumps({'test_models': MODELS})
+        sub = self.submit('neon-missing', task_class='highest_quality')
+        done = self.settle(sub['task_id'], 'blocked')
+        self.assertEqual(done['attempts'][0]['evidence']['preflight']['reason'], 'agy_model_unavailable')
+        self.assertEqual(done['task']['options']['model'], NEON)
+        self.assertEqual(done['task']['effective_settings']['effort'], 'xhigh')
+        self.assertEqual(done['events'][0]['body']['effective_settings']['model'], NEON)
+        self.assertFalse(self.print_calls())
+
+    def test_neon_auth_quota_subscription_and_runtime_failure_never_fall_back(self):
+        for reason in ('auth_required', 'quota_exhausted', 'subscription_unavailable'):
+            with self.subTest(reason=reason):
+                self.env.update(AGY_FAKE_STDERR='TEST-AGY-ERROR ' + reason, AGY_FAKE_EXIT='1')
+                sub = self.submit('neon-' + reason, task_class='highest_quality')
+                done = self.settle(sub['task_id'], 'blocked')
+                self.assertEqual(done['events'][0]['body']['reason_code'], 'agy_' + reason)
+                self.assertEqual(done['task']['effective_settings']['model'], NEON)
+        self.env.update(AGY_FAKE_STDERR='unknown failure', AGY_FAKE_EXIT='7')
+        sub = self.submit('neon-failed', task_class='highest_quality')
+        self.assertEqual(self.settle(sub['task_id'], 'failed')['task']['options']['model'], NEON)
+        self.assertEqual([call['argv'] for call in self.print_calls()], [['--print', '--model', NEON]] * 4)
+
+    def test_no_contract_doctor_never_executes_even_fake_installed_binary(self):
+        self.assertIsNone(engines.AGY_CONTRACT)
+        proc = subprocess.run([sys.executable, '-m', 'cli_relay', '--home', str(self.home),
+                               'doctor', '--engine', 'agy', '--cwd', str(self.work)],
+                              env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 6)
+        self.assertEqual(json.loads(proc.stdout)['engine']['reason'], 'agy_capability_unverified')
+        self.assertFalse(self.calls())
+
     def test_shared_capacity_with_fixture_and_queued_carbon_releases_same_attempt(self):
         self.env['CLI_RELAY_LOCAL_HARD_MAX'] = '1'
         _, fixture, _ = self.db.submit(scope='other', key='capacity-holder', native_session_id=None,
@@ -612,6 +707,24 @@ class AgyIntegration(AgyCase):
         self.assertFalse(self.calls())
         second = subprocess.run(args, env=self.env, capture_output=True, text=True, timeout=20)
         self.assertEqual(second.returncode, 2)
+
+    def test_acceptance_neon_presence_only_and_no_inference_by_default(self):
+        from scripts import agy_acceptance
+        directory = self.root / 'neon-acceptance'
+        self.env['AGY_FAKE_MODELS'] = json.dumps({'test_models': [NEON, 'SYNTHETIC-IDENTITY']})
+        with patch.dict(os.environ, self.env, clear=True), patch.object(engines, 'AGY_CONTRACT', FAKE_CONTRACT), \
+                patch.object(agy_acceptance, 'relay', side_effect=AssertionError('must not submit')), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(agy_acceptance.main(['--dir', str(directory),
+                                                  '--task-class', 'highest_quality']), 3)
+        text = (directory / 'report.json').read_text()
+        report = json.loads(text)
+        self.assertEqual(report['model_presence'], {NEON: True, **dict.fromkeys(MODELS, False)})
+        self.assertEqual(report['steps'], [{'model': NEON, 'effort': 'xhigh', 'verdict': 'NOT RUN',
+                                           'reason': 'explicit --run-models required'}])
+        self.assertNotIn('SYNTHETIC-IDENTITY', text)
+        self.assertNotIn('models', report['preflight'])
+        self.assertFalse(self.print_calls())
 
 
 
