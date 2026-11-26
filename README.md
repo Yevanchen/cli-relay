@@ -68,13 +68,16 @@ the 30-minute ACK timeout, or its notification fails; it keeps the task's origin
 | `claude` | Historical stored tasks only; new production submissions are rejected |
 | `codex` | Codex (explicit sandbox required for new production work) |
 | `fixture` | Local stand-in for tests |
-| `agy` | Neon xhigh for highest_quality; Carbon is explicit opt-in; native acceptance is pending |
+| `agy` | Neon high for daily, Neon xhigh for highest_quality; Carbon is explicit opt-in; native acceptance is pending |
 
-The three production tiers are `simple` = Codex `gpt-6.1-terra/high`, `complex` = Codex
-`gpt-6.1-sol/max` (including computer use), and `highest_quality` = agy
+The production tiers are `simple` = Codex `gpt-6.2-sol/medium` with explicit
+`--option ultrafast_mode=true`, `daily` = agy `gemini-4-neon-high/high`,
+`complex` = Codex `gpt-6.1-sol/max` (including computer use), and `highest_quality` = agy
 `gemini-4-neon-xhigh/xhigh`. Claude Opus/Fable combinations are rejected for new work.
+Codex pins ultrafast on for simple and off otherwise on first run and resume, without editing
+user configuration. Complex/computer_use reject any caller-supplied ultrafast option.
 Carbon remains a separate `--task-class carbon` opt-in: only `gemini-4-carbon-low/low`,
-`gemini-4-carbon-medium/medium` or `gemini-4-carbon-high/high`. Both agy classes require
+`gemini-4-carbon-medium/medium` or `gemini-4-carbon-high/high`. All agy classes require
 `--resource-class standard`. Neon and Carbon never substitute for each other.
 
 All fields remain explicit, consistent with Codex/Carbon: giving only

@@ -79,7 +79,9 @@ class TaskLocalOptions(unittest.TestCase):
     def test_default_effort_is_not_changed_when_task_omits_it(self) -> None:
         self.assertNotIn("--effort", self.build("claude", {}).argv)
         self.assertNotIn("--settings", self.build("claude", {}).argv)
-        self.assertNotIn("-c", self.build("codex", {}).argv)
+        argv = self.build("codex", {}).argv
+        self.assertEqual([argv[i + 1] for i, arg in enumerate(argv) if arg == '-c'],
+                         ['features.ultrafast_mode=false'])
 
     def test_generated_argv_guard_does_not_allow_unsafe_options(self) -> None:
         for mode in ("bypassPermissions", "acceptEdits", "auto", "manual", "plan"):

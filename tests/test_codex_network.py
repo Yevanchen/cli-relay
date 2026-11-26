@@ -89,13 +89,14 @@ class NetworkOptionsAndArgv(unittest.TestCase):
                                               "--approve-for-me", "--add-dir", "--profile", "-p"})
                 if resume:
                     self.assertEqual(argv[1:5], ["exec", "--sandbox", WW, "resume"])
-                    self.assertEqual(config_overrides(argv), [f'sandbox_mode="{WW}"', ON])
+                    self.assertEqual(config_overrides(argv), [f'sandbox_mode="{WW}"', ON, 'features.ultrafast_mode=false'])
                     self.assertEqual(argv[-2:], [THREAD, "-"])
                 else:
-                    self.assertEqual(config_overrides(argv), [ON])
+                    self.assertEqual(config_overrides(argv), [ON, 'features.ultrafast_mode=false'])
                     self.assertEqual(argv[-1], "-")
         argv = self.build({**OPT_IN, "model": "gpt-6-astra", "effort": "max"}, THREAD)
-        self.assertEqual(config_overrides(argv), [f'sandbox_mode="{WW}"', ON, 'model_reasoning_effort="max"'])
+        self.assertEqual(config_overrides(argv), [f'sandbox_mode="{WW}"', ON, 'model_reasoning_effort="max"',
+                                                'features.ultrafast_mode=false'])
 
     def test_argv_recheck_accepts_only_the_setting_built_from_the_options(self) -> None:
         def spellings(value):
@@ -385,7 +386,8 @@ class NetworkRoundTrip(RelayTestCase):
         new, again = self.calls()
         self.assertEqual(network_settings(new), [ON])
         self.assertEqual(again[:4], ["exec", "--sandbox", WW, "resume"])
-        self.assertEqual(config_overrides(again), [f'sandbox_mode="{WW}"', ON, 'model_reasoning_effort="max"'])
+        self.assertEqual(config_overrides(again), [f'sandbox_mode="{WW}"', ON, 'model_reasoning_effort="max"',
+                                                 'features.ultrafast_mode=false'])
         self.assertEqual(again[-2:], [thread, "-"])
 
     def test_a_recorded_turn_with_network_but_no_opt_in_is_blocked(self) -> None:

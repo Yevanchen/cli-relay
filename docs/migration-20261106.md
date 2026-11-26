@@ -11,19 +11,28 @@ and effort. Codex also needs an explicit sandbox. The relay validates; it does n
 
 | task class | engine | model | effort |
 |---|---|---|---|
-| simple | codex | gpt-6.1-terra | high |
+| simple | codex | gpt-6.2-sol | medium |
 | complex | codex | gpt-6.1-sol | max |
 | highest_quality | agy | gemini-4-neon-xhigh | xhigh |
+| daily | agy | gemini-4-neon-high | high |
+
+The 2026-11-26 routing change requires `--option ultrafast_mode=true` for simple. The
+Codex argv pins `-c features.ultrafast_mode=true` for simple and `false` otherwise, including
+exact resume; it never writes user configuration. Complex, including computer_use, retains
+Sol/max and rejects any caller-supplied ultrafast option. Daily requires standard resources
+and its exact Neon high/high pair; highest_quality rejects Neon high and daily rejects
+Neon xhigh/Carbon. No model or effort defaults are inserted.
 
 The 2026-11-21 candidate replaces highest_quality's Claude Opus/Fable production mapping
 with exactly the Neon combination above. New Claude/Codex/Fable/Opus highest_quality
-requests are rejected rather than rewritten. Simple and complex Codex tiers are unchanged.
+requests are rejected rather than rewritten. The simple tier is subsequently updated above;
+the complex Codex model and effort are unchanged.
 The dictionary's recommended highest_quality entry is Neon/xhigh, but all fields are still
 required explicitly: no engine/model/effort defaults are inserted by the CLI.
 
 The 2026-11-19 candidate adds a separate opt-in `carbon` class with engine `agy`, standard
 resources and exactly `gemini-4-carbon-low/low`, `gemini-4-carbon-medium/medium` or
-`gemini-4-carbon-high/high`. Carbon remains separate from the three tiers above; neither
+`gemini-4-carbon-high/high`. Carbon remains separate from the tiers above; neither
 Carbon nor Neon is a fallback for the other. Carbon rejects xhigh/max/Orchestrator and Neon;
 highest_quality rejects all Carbon IDs. Fixture cannot claim the Carbon class.
 No schema change, payload/hash rewrite, ledger
@@ -39,7 +48,8 @@ has no extra sandbox grant. Choose the minimum task permissions; file work norma
 Unknown/deprecated models (including Astra), missing settings and effort mismatches are usage errors.
 The operator must verify installed provider support; the allowlist implements routing §1.7.
 
-`effective_settings` records the explicit engine/model/effort/task/resource values passed to the
+`effective_settings` records the explicit engine/model/effort/task/resource values and Codex
+`ultrafast_mode` boolean passed to the
 adapter, with `verification=invocation_only`. It is not proof of the provider's served model or
 internal effort. Legacy incomplete settings are reported with `production_settings_unverified`
 on receipts/new terminal observations. Existing stored records are not backfilled.

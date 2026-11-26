@@ -10,6 +10,39 @@ Three kinds of evidence are reported separately and never stand in for one anoth
 
 Status words: **PASS**, **FAIL**, **NOT RUN** (with the reason), **RUNNING**.
 
+## 2026-11-26 simple ultrafast / daily routing
+
+Based on main `1d7a2db1a996eed3e9f24b55293ee8c1cddf5ad5` (PR #40 merged).
+Simple is now exactly `(codex, gpt-6.2-sol, medium)` with the required typed task option
+`ultrafast_mode=true`. Codex pins the feature in argv on first run and resume, off for other
+Codex tasks; complex/computer_use retain Sol/max and reject the option. Daily adds exactly
+`(agy, gemini-4-neon-high, high)` with standard resources. Highest_quality Neon xhigh and
+Carbon's explicit opt-in pairs are unchanged. No new Claude production route is added.
+The older dated sections below preserve their historical routing and test scope.
+
+This routing change does not install a native contract or change `AGY_BASELINE_VERSION`:
+`AGY_CONTRACT` stays **None**, and the target stays **1.5.11**. In `_agy_preflight`, a missing
+contract or one whose version differs from that baseline returns `agy_capability_unverified`
+before version/model probes. `build` independently refuses the same unverified state. An
+installed 1.5.14 binary or visible Neon IDs does not satisfy any native gate below. Every
+pending native gate remains **NOT RUN**; no Neon/Carbon production task is submitted here.
+
+Daily also supports the helper's gated default, without model calls:
+
+```sh
+python3.14 scripts/agy_acceptance.py --dir /absolute/new/mbp-daily-check --task-class daily
+```
+
+Follow-up belongs on the MBP in an independent checkout and new task-local directories/home,
+never production `current` or its ledger. First collect independent no-login, stdin/output,
+tool/authorization and subscription-route isolation evidence. Then review a separate native
+contract/parser PR. Only afterward consider explicitly authorized `--run-models` acceptance;
+daily selects Neon high/high only, highest_quality selects Neon xhigh/xhigh only.
+If accepting 1.5.14 instead of 1.5.11, that separate PR must update `AGY_BASELINE_VERSION`,
+the evidence-backed contract version/probe arguments/parsers, version-pinned tests/fixtures
+and this checklist's version/results together. Re-run every native gate on 1.5.14; do not
+rename a baseline or reuse synthetic 1.5.11 evidence as proof.
+
 ## 2026-11-21 Neon / highest_quality candidate
 
 Source: `feat/agy-neon-highest-quality-20261121`, based on main
@@ -97,9 +130,10 @@ copy an account/binary, open a login flow, or change the expected custom Codex/m
 | Print input/output | verified exact print/model syntax, stdin consumption once (including leading `-`, Unicode and multi-line input), UTF-8 stdout/stderr and exit behavior | NOT RUN |
 | Tool/authorization behavior | standard single text task cannot launch authorization or execute unapproved built-in tools; an empty plugin list does not prove this | NOT RUN |
 | Subscription isolation | native subscription evidence and no implicit API/key/Vertex/proxy fallback; names-only environment checks are insufficient alone | NOT RUN |
-| Model directory | presence of exact `gemini-4-carbon-low`, `gemini-4-carbon-medium`, `gemini-4-carbon-high`, `gemini-4-neon-xhigh` on the current native login; no identity or full directory dump retained | NOT RUN (Mini implementation; future MBP independent PR checkout) |
+| Model directory | presence of exact `gemini-4-carbon-low`, `gemini-4-carbon-medium`, `gemini-4-carbon-high`, `gemini-4-neon-high`, `gemini-4-neon-xhigh` on the current native login; no identity or full directory dump retained | NOT RUN (future MBP independent PR checkout) |
 | Three tiny Carbon native requests | carbon class only: `gemini-4-carbon-low` + low, `gemini-4-carbon-medium` + medium, `gemini-4-carbon-high` + high; each exit 0 and nonempty text. High is Carbon's maximum; no xhigh/max/Orchestrator or Neon trials on this path | NOT RUN (future MBP task only) |
 | One tiny Neon native request | highest_quality only: exact `gemini-4-neon-xhigh` + xhigh; exit 0 and nonempty text. No Carbon model, alias, lower effort or substitution | NOT RUN (future MBP task only) |
+| One tiny daily Neon native request | daily only: exact `gemini-4-neon-high` + high; exit 0 and nonempty text. No Carbon/xhigh substitution | NOT RUN (future MBP task only) |
 | Detached end-to-end relay | same user's native context, effective settings, terminal event, completion marker, business report and duplicate key | NOT RUN |
 | Cancellation/group | independent harmless task, only if its duration allows; record NOT RUN if too fast | NOT RUN |
 

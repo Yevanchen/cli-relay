@@ -949,8 +949,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--queue", metavar="NAME", help="FIFO queue in this home and scope; one running task at a time")
     s.add_argument("--task-class", choices=policy.TASK_CLASSES,
                    help='required for new production work; specify engine/model/effort explicitly (no defaults). '
+                        'simple: --engine codex --option model=gpt-6.2-sol --option effort=medium '
+                        '--option ultrafast_mode=true; complex/computer_use: codex gpt-6.1-sol/max, ultrafast off. '
+                        'daily: --engine agy --option model=gemini-4-neon-high --option effort=high; '
                         'highest_quality: --engine agy --option model=gemini-4-neon-xhigh --option effort=xhigh; '
-                        'carbon: agy gemini-4-carbon-low|medium|high with matching effort. Both require standard resources')
+                        'carbon: explicit opt-in agy gemini-4-carbon-low|medium|high with matching effort. '
+                        'All agy classes require standard resources')
     s.add_argument("--resource-class", choices=policy.RESOURCE_CLASSES,
                    help="explicit standard or computer_use; shared home memory gate and configurable hard cap (default 4), CU cap 1")
     s.add_argument("--test-only-reason", help="audited exemption reason; only engine=fixture can use this")
