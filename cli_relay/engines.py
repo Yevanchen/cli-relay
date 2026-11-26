@@ -61,7 +61,7 @@ _OPTION_TYPES: Dict[str, Dict[str, tuple]] = {
     "claude": {"model": (str,), "effort": (str,), "allowed_tools": (list,),
                "allowed_write_dirs": (list,), "allowed_bash_commands": (list,), "require_completion_marker": (bool,)},
     "codex": {"model": (str,), "effort": (str,), "sandbox": (str,), "allow_full_access": (bool,),
-              "allow_network": (bool,), "network_access": (bool,),
+              "allow_network": (bool,), "network_access": (bool,), "ultrafast_mode": (bool,),
               "skip_git_repo_check": (bool,), "require_completion_marker": (bool,), "billing_mode": (str,)},
     "fixture": {"duration_s": (int, float), "exit_code": (int,), "result": (str,), "side_effect_file": (str,),
                 "no_result": (bool,), "api_key_source": (str,), "permission_mode": (str,),
@@ -381,6 +381,9 @@ def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str]
             raise UsageError("network_access and allow_network must agree")
         clean["allow_network"] = clean.pop("network_access")
     if engine == "codex":
+        if "ultrafast_mode" in clean and (clean["ultrafast_mode"] is not True or
+                (engine, clean.get("model"), clean.get("effort")) != policy.tier("simple")):
+            raise UsageError("ultrafast_mode=true requires the exact simple Codex model/effort combination")
         if "billing_mode" in clean and clean["billing_mode"] not in CODEX_BILLING_MODES:
             raise UsageError("codex billing_mode must be subscription or api", allowed=list(CODEX_BILLING_MODES))
         sandboxes = (*CODEX_SANDBOXES, CODEX_FULL_ACCESS)
@@ -422,6 +425,7 @@ def validate_options(engine: str, options: Dict[str, Any], *, cwd: Optional[str]
     if engine == "agy" and ("model" in clean or "effort" in clean):
         if (engine, clean.get("model"), clean.get("effort")) not in policy.AGY_COMBINATIONS:
             raise UsageError("agy requires gemini-4-neon-xhigh with xhigh effort for highest_quality, "
+                             "gemini-4-neon-high with high effort for daily, "
                              "or an exact gemini-4-carbon-low|medium|high model with matching "
                              "low|medium|high effort for carbon; no defaults, aliases, max or Orchestrator",
                              requested={"engine": engine, "model": clean.get("model"),
@@ -1278,6 +1282,14 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
     if full_access_enabled(engine, {"options": options}):
         sandboxes.add(CODEX_FULL_ACCESS)
     network = codex_network_override(engine, {"options": options})
+    ultrafast = "features.ultrafast_mode=false"
+    ultrafast_seen = []
+    if engine == "codex" and options and "ultrafast_mode" in options:
+        try:
+            validate_options(engine, options, cwd=cwd)
+        except UsageError as exc:
+            raise RuntimeError("refusing unvalidated codex ultrafast mode") from exc
+        ultrafast = "features.ultrafast_mode=true"
     if engine == "claude":
         if options and any(key in options for key in ("allowed_tools", "allowed_write_dirs", "allowed_bash_commands")):
             try:
@@ -1316,6 +1328,8 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
             raise RuntimeError("refusing an unapproved codex sandbox; danger-full-access requires "
                                "sandbox=danger-full-access and allow_full_access=true on the task")
         if engine == "codex":
+            if arg.partition("=")[0] in ("--enable", "--disable"):
+                raise RuntimeError("refusing codex feature flags; use the validated task config override")
             if arg in ("-c", "--config"):
                 override = args[i + 1] if i + 1 < len(args) else ""
             elif arg.startswith("--config="):
@@ -1325,11 +1339,15 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
         if override is not None:
             allowed = {f'sandbox_mode="{s}"' for s in sandboxes}
             allowed.update(f'model_reasoning_effort="{e}"' for e in EFFORT_LEVELS)
+            allowed.add(ultrafast)
             if network:  # only the value built from the task's validated options, never another one
                 allowed.add(network)
-            if override.replace(" ", "") not in allowed:
+            normalized = override.replace(" ", "")
+            if normalized not in allowed:
                 raise RuntimeError("refusing a codex config override other than an approved sandbox, a validated "
-                                   "effort or the task's own workspace network setting")
+                                   "effort, ultrafast mode or the task's own workspace network setting")
+            if normalized.startswith("features.ultrafast_mode="):
+                ultrafast_seen.append(normalized)
         if engine == "claude" and arg.startswith("--settings="):
             raise RuntimeError("refusing unvalidated claude settings")
         if engine == "claude" and arg == "--settings":
@@ -1351,6 +1369,8 @@ def assert_safe(engine: str, argv: Iterable[str], *, options: Optional[Dict[str,
             if (not tools or arg not in CLAUDE_ALLOWED_TOOLS_FLAGS or args[i + 1:i + 2] != [tools]
                     or any(not a.startswith("--") for a in args[i + 2:i + 3])):
                 raise RuntimeError("refusing claude allowed tools other than the task's validated allowed_tools")
+    if engine == "codex" and (ultrafast_seen or ultrafast.endswith("=true")) and ultrafast_seen != [ultrafast]:
+        raise RuntimeError("refusing codex without exactly the task's own ultrafast mode override")
 
 
 def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_dir: Path,
@@ -1424,6 +1444,8 @@ def build(engine: str, *, payload: Dict[str, Any], attempt: Dict[str, Any], run_
             argv += ["-m", opts["model"]]
         if opts.get("effort"):
             argv += ["-c", f'model_reasoning_effort="{opts["effort"]}"']
+        # Pin both values on first run and resume; global features never select the task's mode.
+        argv += ["-c", "features.ultrafast_mode=" + str(opts.get("ultrafast_mode", False)).lower()]
         argv += [resume, "-"] if resume else ["-"]
     elif engine == "agy":
         policy.validate_new({**payload, "engine": engine})

@@ -87,7 +87,9 @@ text/tool and subscription contract remains unverified. This candidate has no ve
 contract or runtime bypass. Names-only API/Vertex route detection is an additional guard, not
 proof of Google's billing. After independent verification, bounded probes and exact native
 stderr classifiers may classify auth, subscription and quota failures; model prose never does.
-The original engine guards and all three production tiers retain their existing semantics.
+The original engine guards remain in place. The current routing table, including simple's
+task-local ultrafast override and daily's exact Neon high pair, is in
+[`usage.md`](usage.md#production-tiers-and-effective-settings).
 
 Git observations are separate attempt evidence, never an outcome gate or request-payload input.
 For a detected work tree, `git` contains `head_before`, `head_after` and the final `dirty` flag;

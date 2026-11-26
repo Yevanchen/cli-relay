@@ -7,9 +7,10 @@ from .errors import UsageError
 
 # Each class maps to one or more exact (engine, model, effort) combinations.
 TIERS = {
-    "simple": (("codex", "gpt-6.1-terra", "high"),),
+    "simple": (("codex", "gpt-6.2-sol", "medium"),),
     "complex": (("codex", "gpt-6.1-sol", "max"),),
     "highest_quality": (("agy", "gemini-4-neon-xhigh", "xhigh"),),
+    "daily": (("agy", "gemini-4-neon-high", "high"),),
 }
 
 # Carbon is explicit opt-in and never a default or fallback for one of the original tiers.
@@ -17,7 +18,7 @@ CARBON_TIERS = {
     "carbon": tuple(("agy", f"gemini-4-carbon-{effort}", effort) for effort in ("low", "medium", "high")),
 }
 TASK_CLASSES = (*TIERS, *CARBON_TIERS)
-AGY_COMBINATIONS = (*TIERS["highest_quality"], *CARBON_TIERS["carbon"])
+AGY_COMBINATIONS = (*TIERS["highest_quality"], *TIERS["daily"], *CARBON_TIERS["carbon"])
 
 
 def tier(task_class: str, index: int = 0) -> tuple:
@@ -54,8 +55,8 @@ def validate_new(payload: Dict[str, Any]) -> None:
     if not isinstance(task_class, str) or task_class not in TASK_CLASSES:
         raise UsageError("new production submits require --task-class " + "|".join(TASK_CLASSES),
                          tiers=TIERS, carbon_tiers=CARBON_TIERS)
-    if engine == "agy" and task_class not in ("carbon", "highest_quality"):
-        raise UsageError("engine=agy requires the explicit --task-class carbon or highest_quality")
+    if engine == "agy" and task_class not in ("carbon", "highest_quality", "daily"):
+        raise UsageError("engine=agy requires the explicit --task-class carbon, highest_quality or daily")
     if "resource_class" not in payload:
         raise UsageError("new production submits require --resource-class standard|computer_use")
     allowed = CARBON_TIERS[task_class] if task_class == "carbon" else TIERS[task_class]
@@ -69,6 +70,10 @@ def validate_new(payload: Dict[str, Any]) -> None:
                          task_class=task_class)
     if payload["resource_class"] == "computer_use" and task_class != "complex":
         raise UsageError("computer_use requires task_class=complex, codex gpt-6.1-sol/max")
+    if task_class == "simple" and options.get("ultrafast_mode") is not True:
+        raise UsageError("simple requires --option ultrafast_mode=true; no global feature defaults")
+    if task_class != "simple" and "ultrafast_mode" in options:
+        raise UsageError("ultrafast_mode is restricted to task_class=simple; complex and computer_use keep it off")
     if engine == "codex" and "sandbox" not in options:
         raise UsageError('new Codex submits require an explicit sandbox (normally sandbox="workspace-write")')
     if engine == "codex" and options.get("sandbox") not in ("read-only", "workspace-write", "danger-full-access"):
@@ -86,6 +91,7 @@ def settings(engine: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         "resource_class": payload.get("resource_class", "standard" if fixture else None),
         "source": "fixture" if fixture else "explicit_task_options",
         "verification": "no_provider" if fixture else "invocation_only",
+        **({"ultrafast_mode": options.get("ultrafast_mode") is True} if engine == "codex" else {}),
         **({"test_only_reason": payload.get("test_only_reason", "deterministic fixture engine; no provider calls")}
            if fixture else {})}}
 

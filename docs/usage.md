@@ -825,14 +825,62 @@ Without Task/Agent opt-in, the launcher explicitly disables native Task and Agen
 
 New production submits require an explicit task/resource class, engine/model/effort and Codex
 sandbox. See the [routing table and migration rules](migration-20261106.md#new-production-requests).
-Use `simple` + Codex Terra/high, `complex` + Codex Sol/max (including computer use), or
-`highest_quality` + agy `gemini-4-neon-xhigh/xhigh` (standard text tasks only).
+Use `simple` + Codex `gpt-6.2-sol/medium` with explicit `ultrafast_mode=true`,
+`daily` + agy `gemini-4-neon-high/high`, `complex` + Codex `gpt-6.1-sol/max`
+(including computer use), or `highest_quality` + agy `gemini-4-neon-xhigh/xhigh`.
+All agy classes are standard text tasks only.
 Unknown/deprecated models and mismatches are usage errors.
 Only `engine=fixture` has a test-only exemption. No defaults or global settings are changed.
 
 `effective_settings` appears in submit/status/events/brief/notification records. It records
 adapter invocation settings with `verification=invocation_only`, not a provider-side observation.
+For Codex it also records `ultrafast_mode`: true for simple and false otherwise.
 Legacy duplicates and resumes retain their payload and hash; new requests use the new contract.
+
+Simple requires the typed option `--option ultrafast_mode=true`; missing/false/string values
+are usage errors. First run and exact resume both pin `-c features.ultrafast_mode=true`.
+Other Codex work pins `-c features.ultrafast_mode=false`, even if the user's global feature
+is enabled. Complex and computer_use reject any caller-supplied ultrafast option, including
+false. No `codex features enable/disable` or configuration-file write is used.
+
+```sh
+cli-relay submit --key simple-01 --engine codex --task-class simple --resource-class standard \
+  --cwd /absolute/path/to/task --option 'model="gpt-6.2-sol"' --option 'effort="medium"' \
+  --option 'sandbox="workspace-write"' --option ultrafast_mode=true \
+  --prompt 'Complete the specified small task.'
+```
+
+Computer use keeps the existing complex Sol/max route (the standard complex path uses the
+same model/effort, with `--resource-class standard`):
+
+```sh
+cli-relay submit --key computer-use-01 --engine codex --task-class complex --resource-class computer_use \
+  --cwd /absolute/path/to/task --option 'model="gpt-6.1-sol"' --option 'effort="max"' \
+  --option 'sandbox="workspace-write"' --prompt 'Complete the specified computer-use task.'
+```
+
+### agy Neon daily text tasks
+
+Daily accepts only `(agy, gemini-4-neon-high, high)` with standard resources. It rejects
+Neon xhigh and every Carbon ID; highest_quality rejects Neon high. Missing fields and
+mismatches fail without correction or fallback. Native acceptance is still pending:
+`AGY_CONTRACT=None` blocks Neon production even though the routing allowlist accepts daily.
+
+Candidate command, **only after separate native acceptance**, in an independent PR checkout:
+
+```sh
+PYTHONPATH=. python3.14 -m cli_relay --home /absolute/new/acceptance-relay-home submit \
+  --key neon-daily-01 --engine agy --task-class daily --resource-class standard \
+  --cwd /absolute/new/acceptance-work \
+  --option 'model="gemini-4-neon-high"' --option 'effort="high"' \
+  --option require_completion_marker=true \
+  --prompt 'Return text only, use no tools and edit no files. End with CLI-RELAY-STATUS: complete.'
+```
+
+The helper supports a **preflight-only** check in a new task-local directory:
+`python3.14 scripts/agy_acceptance.py --dir /absolute/new/daily-check --task-class daily`.
+With no contract this returns NOT RUN before any native probe or model call. Do not use
+`--run-models` until the separate native gates and contract review are complete and a run is authorized.
 
 ### agy Neon highest quality text tasks
 
@@ -859,19 +907,22 @@ compatibility failure stops the request with a fixed reason; no fallback or logi
 
 ### agy Carbon subscription text tasks
 
-Carbon is a separate, explicit request. `simple` remains Codex `gpt-6.1-terra/high`, `complex`
-remains Codex `gpt-6.1-sol/max`, and `highest_quality` is agy `gemini-4-neon-xhigh/xhigh`.
+Carbon is a separate, explicit request. `simple` is Codex `gpt-6.2-sol/medium` with ultrafast,
+`complex` remains Codex `gpt-6.1-sol/max`, `daily` is agy `gemini-4-neon-high/high`,
+and `highest_quality` is agy `gemini-4-neon-xhigh/xhigh`.
 Carbon is never a fallback for any of them. Each agy class accepts only its own row(s):
 
 | task class | engine | model | effort | resource class |
 |---|---|---|---|---|
+| daily | agy | gemini-4-neon-high | high | standard |
 | highest_quality | agy | gemini-4-neon-xhigh | xhigh | standard |
 | carbon | agy | gemini-4-carbon-low | low | standard |
 | carbon | agy | gemini-4-carbon-medium | medium | standard |
 | carbon | agy | gemini-4-carbon-high | high | standard |
 
 All fields are required. High is the highest Carbon tier: Carbon rejects Neon,
-Orchestrator, `xhigh` and `max`. Neon requires exactly `gemini-4-neon-xhigh` plus `xhigh`;
+Orchestrator, `xhigh` and `max`. Neon daily requires exactly `gemini-4-neon-high` plus high;
+Neon highest_quality requires exactly `gemini-4-neon-xhigh` plus `xhigh`;
 Carbon IDs and Claude/Codex/Opus/Fable requests are rejected for highest_quality. Missing
 suffixes, aliases, mismatched effort, agy with simple/complex, `computer_use`, sandbox,
 Claude tools, raw argv, `--billing-mode` (including subscription) and test exemptions are usage

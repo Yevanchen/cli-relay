@@ -40,8 +40,8 @@ def relay(home, *args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dir', required=True, type=Path, help='new acceptance directory; existing paths refused')
-    parser.add_argument('--task-class', choices=('carbon', 'highest_quality'), default='carbon',
-                        help='select Carbon low/medium/high or the single exact Neon xhigh request; never substitutes models')
+    parser.add_argument('--task-class', choices=('carbon', 'highest_quality', 'daily'), default='carbon',
+                        help='select Carbon low/medium/high, Neon xhigh (highest_quality) or Neon high (daily); never substitutes models')
     parser.add_argument('--run-models', action='store_true',
                         help='explicitly spend subscription quota on the selected class, only after native gates pass')
     args = parser.parse_args(argv)
@@ -52,7 +52,7 @@ def main(argv=None):
         parser.error('--dir must be a new writable directory, never a production relay home')
     home, work = directory / 'relay-home', directory / 'work'
     work.mkdir()
-    combinations = policy.CARBON_TIERS['carbon'] if args.task_class == 'carbon' else policy.TIERS['highest_quality']
+    combinations = policy.CARBON_TIERS['carbon'] if args.task_class == 'carbon' else policy.TIERS[args.task_class]
     report = {'engine': 'agy', 'task_class': args.task_class, 'started_at': timestamp(), 'source_sha': source_sha(),
               'verification': 'invocation_only', 'steps': []}
 

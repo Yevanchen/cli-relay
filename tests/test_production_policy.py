@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import helpers
-from cli_relay import cli, concurrency, policy
+from cli_relay import cli, concurrency, engines, policy
 from cli_relay.errors import UsageError
 from cli_relay.ledger import Ledger, init_ledger, payload_hash
 
@@ -29,9 +29,12 @@ class ProductionTiers(unittest.TestCase):
         engine, model, effort = policy.tier(task_class)
         return dict(engine=engine, cwd=self.tmp.name, prompt='fixture', task_class=task_class,
                     resource_class=resource_class, options=dict(model=model, effort=effort,
-                    **({'sandbox': 'workspace-write'} if engine == 'codex' else {})))
+                    **({'sandbox': 'workspace-write'} if engine == 'codex' else {}),
+                    **({'ultrafast_mode': True} if task_class == 'simple' else {})))
 
-    def test_exact_three_tiers_and_cu(self):
+    def test_exact_tiers_and_cu(self):
+        self.assertEqual(policy.tier('simple'), ('codex', 'gpt-6.2-sol', 'medium'))
+        self.assertEqual(policy.tier('daily'), ('agy', 'gemini-4-neon-high', 'high'))
         for tier in policy.TIERS:
             p = self.payload(tier)
             policy.validate_new(p)
@@ -39,9 +42,82 @@ class ProductionTiers(unittest.TestCase):
             self.assertEqual((settings['engine'], settings['model'], settings['effort']), policy.tier(tier))
             self.assertEqual(settings['verification'], 'invocation_only')
         policy.validate_new(self.payload(resource_class='computer_use'))
-        for tier in ('simple', 'highest_quality'):
+        for tier in ('simple', 'highest_quality', 'daily'):
             with self.assertRaises(UsageError):
                 policy.validate_new(self.payload(tier, 'computer_use'))
+
+    def test_ultrafast_requires_explicit_true_and_is_rejected_outside_simple(self):
+        for value in (None, False, 'true', 1, 0):
+            p = self.payload('simple')
+            if value is None:
+                del p['options']['ultrafast_mode']
+            else:
+                p['options']['ultrafast_mode'] = value
+            with self.subTest(value=value), self.assertRaises(UsageError):
+                policy.validate_new(p)
+        for resource in ('standard', 'computer_use'):
+            for value in (True, False):
+                p = self.payload('complex', resource)
+                p['options']['ultrafast_mode'] = value
+                with self.subTest(resource=resource, value=value), self.assertRaises(UsageError):
+                    policy.validate_new(p)
+        for model, effort in (('gpt-6.1-terra', 'high'), ('gpt-6.2-sol', 'high'), ('gpt-6.1-sol', 'max')):
+            p = self.payload('simple')
+            p['options'].update(model=model, effort=effort)
+            with self.subTest(model=model, effort=effort), self.assertRaises(UsageError):
+                policy.validate_new(p)
+
+    def test_ultrafast_is_typed_and_adapter_cannot_enable_it_for_other_models(self):
+        valid = self.payload('simple')['options']
+        self.assertEqual(engines.validate_options('codex', valid), valid)
+        for value in (False, 'true', 1, None, []):
+            with self.subTest(value=value), self.assertRaises(UsageError):
+                engines.validate_options('codex', {**valid, 'ultrafast_mode': value})
+        for task_class in ('complex', 'daily', 'highest_quality'):
+            p = self.payload(task_class)
+            with self.subTest(task_class=task_class), self.assertRaises(UsageError):
+                engines.validate_options(p['engine'], {**p['options'], 'ultrafast_mode': True})
+        for engine in ('fixture', 'claude'):
+            with self.subTest(engine=engine), self.assertRaises(UsageError):
+                engines.validate_options(engine, {'ultrafast_mode': True})
+
+    def test_first_and_resumed_codex_pin_ultrafast_without_changing_config(self):
+        config = Path(self.tmp.name) / 'config.toml'
+        for task_class, resource in (('simple', 'standard'), ('complex', 'standard'), ('complex', 'computer_use')):
+            p = self.payload(task_class, resource)
+            enabled = task_class == 'simple'
+            saved = '[features]\nultrafast_mode = ' + str(not enabled).lower() + '\n'
+            config.write_text(saved)
+            expected = 'features.ultrafast_mode=' + str(enabled).lower()
+            for resume in (None, '22222222-2222-4222-8222-222222222222'):
+                with self.subTest(task_class=task_class, resource=resource, resume=resume):
+                    argv = engines.build('codex', payload=p, attempt={'resume_session_id': resume},
+                        run_dir=Path(self.tmp.name), fixture_state_dir=self.tmp.name,
+                        env={'CLI_RELAY_CODEX_BIN': '/bin/echo', 'CODEX_HOME': self.tmp.name}).argv
+                    self.assertEqual([arg for arg in argv if 'features.ultrafast_mode=' in arg], [expected])
+                    self.assertEqual(argv[argv.index(expected) - 1], '-c')
+                    self.assertEqual(argv[argv.index('-m') + 1], p['options']['model'])
+                    self.assertIn('model_reasoning_effort="' + p['options']['effort'] + '"', argv)
+                    self.assertEqual(policy.settings('codex', p)['effective_settings']['ultrafast_mode'], enabled)
+                    self.assertEqual(config.read_text(), saved)
+                    self.assertEqual(argv[-2:] if resume else argv[-1:], [resume, '-'] if resume else ['-'])
+
+    def test_ultrafast_argv_guard_rejects_injection_missing_and_conflicting_overrides(self):
+        options = self.payload('simple')['options']
+        on, off = 'features.ultrafast_mode=true', 'features.ultrafast_mode=false'
+        base = ['codex', 'exec']
+        for flags in (['-c', on], ['--config', on], ['--config=' + on], ['-c' + on]):
+            engines.assert_safe('codex', base + flags, options=options)
+            for other in (None, {}, self.payload()['options'], {**options, 'ultrafast_mode': False},
+                          {**options, 'model': 'gpt-6.1-sol', 'effort': 'max'}):
+                with self.subTest(flags=flags, options=other), self.assertRaises(RuntimeError):
+                    engines.assert_safe('codex', base + flags, options=other)
+        for flags in ([], ['-c', off], ['-c', on, '-c', off], ['-c', on, '-c', on],
+                      ['--enable', 'ultrafast_mode'], ['--enable=ultrafast_mode'],
+                      ['-c', on, '--disable', 'ultrafast_mode'], ['-c', 'features.other=true']):
+            with self.subTest(flags=flags), self.assertRaises(RuntimeError):
+                engines.assert_safe('codex', base + flags, options=options)
+        engines.assert_safe('codex', base + ['-c', off], options=self.payload()['options'])
 
     def test_highest_quality_default_is_only_neon_and_rejects_old_tiers(self):
         self.assertEqual(policy.tier('highest_quality'), ('agy', 'gemini-4-neon-xhigh', 'xhigh'))
@@ -124,11 +200,35 @@ class ProductionTiers(unittest.TestCase):
         receipt = json.loads(out.getvalue())
         effective = receipt['effective_settings']
         self.assertEqual(effective['resource_class'], 'computer_use')
+        self.assertIs(effective['ultrafast_mode'], False)
         self.ledger.finish(receipt['attempt_id'], from_states=('pending',), outcome='succeeded', native={'result':'status=ok'})
         view = cli.task_view(self.ledger, receipt['task_id'], probe=False)
         self.assertEqual(view['task']['effective_settings'], effective)
         self.assertEqual(view['events'][0]['body']['effective_settings'], effective)
         self.assertEqual(json.loads(self.ledger.get_task(receipt['task_id'])['payload_json'])['options']['sandbox'], 'workspace-write')
+
+    def test_simple_receipt_status_event_and_duplicate_retain_ultrafast(self):
+        args = ['--home', str(self.home), 'submit', '--key', 'simple', '--engine', 'codex', '--cwd', self.tmp.name,
+                '--prompt', 'synthetic', '--task-class', 'simple', '--resource-class', 'standard',
+                '--option', 'model="gpt-6.2-sol"', '--option', 'effort="medium"',
+                '--option', 'sandbox="workspace-write"', '--option', 'ultrafast_mode=true']
+        receipts = []
+        for _ in range(2):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), patch.object(cli, 'spawn_keeper'), patch.object(cli, 'Ledger', return_value=self.ledger):
+                self.assertEqual(cli.main(args), 0)
+            receipts.append(json.loads(out.getvalue()))
+        self.assertEqual(receipts[1]['status'], 'duplicate')
+        receipt = receipts[0]
+        settings = receipt['effective_settings']
+        self.assertIs(settings['ultrafast_mode'], True)
+        self.assertEqual(receipts[1]['effective_settings'], settings)
+        self.ledger.finish(receipt['attempt_id'], from_states=('pending',), outcome='succeeded', native={'result': 'status=ok'})
+        view = cli.task_view(self.ledger, receipt['task_id'], probe=False)
+        self.assertEqual(view['task']['effective_settings'], settings)
+        self.assertEqual(view['events'][0]['body']['effective_settings'], settings)
+        stored = json.loads(self.ledger.get_task(receipt['task_id'])['payload_json'])
+        self.assertIs(stored['options']['ultrafast_mode'], True)
 
 
 class SharedCapacity(unittest.TestCase):
